@@ -14,5 +14,10 @@
     <string>/Users/<OLLAMA_USER>/mac-studio-server/logs/gpu-memory.err</string>
     <key>StandardOutPath</key>
     <string>/Users/<OLLAMA_USER>/mac-studio-server/logs/gpu-memory.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>OLLAMA_GPU_PERCENT</key>
+        <string><GPU_PERCENT></string>
+    </dict>
 </dict>
 </plist> 

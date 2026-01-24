@@ -51,7 +51,7 @@ if [ -n "$GPU_PERCENT" ]; then
     chmod +x "$BASE_DIR/scripts/set-gpu-memory.sh"
 
     # Replace user in GPU memory plist file
-    sed "s|<OLLAMA_USER>|$USER|g" "$BASE_DIR/config/com.ollama.gpumemory.plist" > "/tmp/com.ollama.gpumemory.plist"
+    sed -e "s|<OLLAMA_USER>|$USER|g" -e "s/<GPU_PERCENT>/$GPU_PERCENT/" "$BASE_DIR/config/com.ollama.gpumemory.plist" > "/tmp/com.ollama.gpumemory.plist"
     sudo cp "/tmp/com.ollama.gpumemory.plist" /Library/LaunchDaemons/
     rm "/tmp/com.ollama.gpumemory.plist"
 
