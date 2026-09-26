@@ -1,0 +1,97 @@
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  tests:
+    # macOS arm64: BSD userland, launchd, pfctl and plutil are all real here.
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: brew install shellcheck
+
+      # GitHub sets CI=true on every runner, so each step picks its phase
+      # explicitly instead of relying on CI to gate phase B.
+      - name: Static, pure-function and render tests
+        run: MSS_TEST_PHASE=A sh tests/run.sh
+
+      - name: System tests (launchd, stub servers)
+        run: MSS_TEST_PHASE=B sh tests/run.sh
+
+      - name: pf syntax check on rendered rules
+        run: |
+          mkdir -p /tmp/mss-pf
+          sha=$(shasum -a 256 /etc/hosts | awk '{print $1}')
+          env MSS_BACKENDS=ds4 OLLAMA_USER=runner \
+            DS4_BIN=/usr/bin/true DS4_MODEL=/etc/hosts DS4_MODEL_SHA256="$sha" \
+            DS4_HOST=192.0.2.10 DS4_ALLOW_FROM='192.0.2.99 198.51.100.0/24' \
+            MSS_IFCONFIG="$PWD/tests/stubs/ifconfig-lan" \
+            sh scripts/install-backends.sh --render-only /tmp/mss-pf
+          sudo /sbin/pfctl -n -f /tmp/mss-pf/pf.conf
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          sudo launchctl print system/com.mac-studio-server.ds4 || true
+          sudo sh -c 'tail -n 50 /var/log/mac-studio-server/*.log /var/log/mac-studio-server/guard.jsonl' || true
+
+  real-llama-server:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install llama.cpp
+        run: brew install llama.cpp
+
+      - name: Download tiny test model (pinned)
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/tiny.gguf" \
+            "https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf"
+          # Pinned: a changed upstream artifact fails here, visibly.
+          echo "270cba1bd5109f42d03350f60406024560464db173c0e387d91f0426d3bd256d  $RUNNER_TEMP/tiny.gguf" \
+            | shasum -a 256 -c
+
+      - name: Install with API key on loopback and verify
+        env:
+          CI: true
+        run: |
+          set -e
+          bin="$(command -v llama-server)"
+          model="$RUNNER_TEMP/tiny.gguf"
+          sha=270cba1bd5109f42d03350f60406024560464db173c0e387d91f0426d3bd256d
+          keyfile="$RUNNER_TEMP/test.api-key"
+          # umask only for the key file: sudo inherits the caller's umask.
+          ( umask 077; printf 'test-key-1234567890' > "$keyfile" )
+          sudo env MSS_BACKENDS=llamacpp OLLAMA_USER=runner \
+            LLAMACPP_BIN="$bin" LLAMACPP_MODEL="$model" LLAMACPP_MODEL_SHA256="$sha" \
+            LLAMACPP_HOST=127.0.0.1 LLAMACPP_PORT=18080 \
+            LLAMACPP_API_KEY_FILE="$keyfile" \
+            sh scripts/install-backends.sh
+          for i in $(seq 1 90); do
+            curl -sf http://127.0.0.1:18080/health >/dev/null && break
+            sleep 2
+          done
+          curl -sf http://127.0.0.1:18080/health >/dev/null
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/v1/models)
+          [ "$code" = 401 ] || { echo "no-key /v1/models gave $code, expected 401"; exit 1; }
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer test-key-1234567890" http://127.0.0.1:18080/v1/models)
+          [ "$code" = 200 ] || { echo "keyed /v1/models gave $code, expected 200"; exit 1; }
+          if ps aux | grep -v grep | grep -q 'test-key-1234567890'; then
+            echo "API key visible in process list"; exit 1
+          fi
+          sudo sh scripts/uninstall.sh --all
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          sudo launchctl print system/com.mac-studio-server.llamacpp || true
+          sudo cat /usr/local/etc/mac-studio-server/backends.conf || true
+          sudo tail -n 80 /var/log/mac-studio-server/llamacpp.log || true
+          sudo tail -n 20 /var/log/mac-studio-server/guard.jsonl || true

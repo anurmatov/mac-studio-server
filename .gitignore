@@ -17,3 +17,6 @@ Thumbs.db
 
 # Other files
 community/
+# Model artifacts and API keys (issue #9)
+*.gguf
+*.api-key

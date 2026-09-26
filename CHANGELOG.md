@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.0] - 2026-09-26
+
+### Added
+- Optional inference backends beside Ollama: llama.cpp llama-server and DwarfStar ds4-server, selected via MSS_BACKENDS
+- Firewalled LAN access for optional backends with address allowlists
+- Memory guard that stops the optional backend, never Ollama, when memory runs low
+- Status and uninstall scripts
+- OLLAMA_BIND to choose the Ollama bind address
+
+### Changed
+- Installation checks every setting and the model checksum before changing the system
+
 ## [1.2.0] - 2025-03-04
 
 ### Added

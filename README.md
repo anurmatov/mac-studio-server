@@ -12,6 +12,7 @@ This configuration is optimized for running Mac Studio as a dedicated Ollama ser
 
 ## Latest Updates
 
+- **[v1.3.0]** Added optional llama.cpp and DwarfStar inference backends beside Ollama
 - **[v1.2.0]** Added Docker autostart support for container applications (with [Colima](https://github.com/abiosoft/colima))
 - **[v1.1.0]** Added GPU Memory Optimization - configure Metal to use more RAM for models
 - **[v1.0.0]** Initial release with system optimizations and Ollama configuration
@@ -95,8 +96,9 @@ vim config/com.ollama.service.plist
 # Stop the current service
 sudo launchctl unload /Library/LaunchDaemons/com.ollama.service.plist
 
-# Copy the updated configuration
-sudo cp config/com.ollama.service.plist /Library/LaunchDaemons/
+# Render the placeholders and install the updated configuration
+sed -e "s|<OLLAMA_USER>|$(whoami)|g" -e "s|<OLLAMA_BIND>|0.0.0.0|g" \
+    config/com.ollama.service.plist | sudo tee /Library/LaunchDaemons/com.ollama.service.plist >/dev/null
 
 # Set proper permissions
 sudo chown root:wheel /Library/LaunchDaemons/com.ollama.service.plist
@@ -225,6 +227,30 @@ colima status
 ```
 
 If you don't need Docker containers, you can skip this feature entirely.
+
+### Inference Backends (Optional)
+
+Besides Ollama, you can run one more inference server as a headless service: llama.cpp `llama-server` for any GGUF model, or DwarfStar `ds4-server`. Ollama stays the default, and with `MSS_BACKENDS` unset the installation is the same as before. The model file is checked against its sha256 at install and on every start.
+
+To add a backend, set the selection and its variables before installation:
+```bash
+export MSS_BACKENDS="ollama,llamacpp"  # or ollama,ds4 / llamacpp / ds4
+export LLAMACPP_BIN="$(command -v llama-server)"
+export LLAMACPP_MODEL="/path/to/model.gguf"
+export LLAMACPP_MODEL_SHA256="<sha256>"
+./scripts/install.sh
+```
+
+To check, recover or remove it:
+```bash
+./scripts/status.sh                                       # health of the selected backends
+sudo /usr/local/libexec/mac-studio-server/mss-enable.sh   # restart after a memory-guard stop
+sudo ./scripts/uninstall.sh --backend llamacpp            # or --all
+```
+
+Optional backends listen on 127.0.0.1 by default. A LAN address needs an allowlist enforced by the macOS firewall (pf); llama.cpp may use an API key file instead. A memory guard stops the optional backend, never Ollama, when the Mac runs short of memory.
+
+See [docs/backends.md](docs/backends.md) for the security defaults, variables, migration and the tested DwarfStar setup.
 
 ## Versioning
 

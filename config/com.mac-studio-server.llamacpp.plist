@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mac-studio-server.llamacpp</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/libexec/mac-studio-server/llamacpp-start.sh</string>
+    </array>
+    <key>UserName</key>
+    <string><OLLAMA_USER></string>
+    <key>GroupName</key>
+    <string>staff</string>
+    <key>WorkingDirectory</key>
+    <string>/var/log/mac-studio-server</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>StandardOutPath</key>
+    <string>/var/log/mac-studio-server/llamacpp.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/mac-studio-server/llamacpp.log</string>
+</dict>
+</plist>

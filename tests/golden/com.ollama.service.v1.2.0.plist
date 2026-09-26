@@ -13,14 +13,14 @@
     <dict>
         <!-- System Environment -->
         <key>HOME</key>
-        <string>/Users/<OLLAMA_USER></string>
+        <string>/Users/mssgolden</string>
         <key>PATH</key>
         <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <!-- Ollama Configuration -->
         <key>OLLAMA_HOST</key>
-        <string><OLLAMA_BIND>:11434</string>
+        <string>0.0.0.0:11434</string>
         <key>OLLAMA_MODELS</key>
-        <string>/Users/<OLLAMA_USER>/.ollama/models</string>
+        <string>/Users/mssgolden/.ollama/models</string>
         <key>OLLAMA_NUM_PARALLEL</key>
         <string>8</string>
         <key>OLLAMA_KEEP_ALIVE</key>
@@ -38,14 +38,14 @@
     <true/>
     <!-- Run as your user -->
     <key>UserName</key>
-    <string><OLLAMA_USER></string>
+    <string>mssgolden</string>
     <key>GroupName</key>
     <string>staff</string>
     <key>StandardErrorPath</key>
-    <string>/Users/<OLLAMA_USER>/mac-studio-server/logs/ollama.err</string>
+    <string>/Users/mssgolden/mac-studio-server/logs/ollama.err</string>
     <key>StandardOutPath</key>
-    <string>/Users/<OLLAMA_USER>/mac-studio-server/logs/ollama.log</string>
+    <string>/Users/mssgolden/mac-studio-server/logs/ollama.log</string>
     <key>WorkingDirectory</key>
-    <string>/Users/<OLLAMA_USER>/.ollama</string>
+    <string>/Users/mssgolden/.ollama</string>
 </dict>
 </plist> 
