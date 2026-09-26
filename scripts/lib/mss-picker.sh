@@ -2,7 +2,7 @@
 # mss-picker.sh — interactive backend picker for scripts/install.sh (#12).
 #
 # Sourced by install.sh after mss-common.sh. bash 3.2 compatible (macOS ships
-# it): no associative arrays, no case-conversion expansions, no mapfile.
+# it): no bash 4 builtins or expansions (the CI step lists them).
 # Prompts go to stderr, answers come from stdin. Every answer goes through the
 # same validators the installer uses; nothing is written until the summary is
 # confirmed.

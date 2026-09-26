@@ -9,12 +9,24 @@ jobs:
   tests:
     # macOS arm64: BSD userland, launchd, pfctl and plutil are all real here.
     runs-on: macos-14
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
+        with:
+          # render parity (A1) compares against the 1.3.0 merge commit
+          fetch-depth: 0
 
       - name: Install shellcheck
         run: brew install shellcheck
+
+      - name: Require expect and bash 3.2
+        run: |
+          test -x /usr/bin/expect || { echo "ERROR: /usr/bin/expect is missing; the picker tests need it"; exit 1; }
+          /bin/bash --version | head -1
+          /bin/bash --version | head -1 | grep -q 'version 3\.2' || { echo "ERROR: /bin/bash is not 3.2"; exit 1; }
+          if grep -nE 'declare -A|mapfile|readarray|,,\}|\^\^\}' scripts/install.sh scripts/lib/*.sh; then
+            echo "ERROR: bash 4 feature found"; exit 1
+          fi
 
       # GitHub sets CI=true on every runner, so each step picks its phase
       # explicitly instead of relying on CI to gate phase B.
