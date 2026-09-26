@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- Model hashing works in SSH sessions that set an unsupported locale such as C.UTF-8
+
 ## [1.5.0] - 2026-09-26
 
 ### Added

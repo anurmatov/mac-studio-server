@@ -43,6 +43,10 @@ case ${1:-} in
         ;;
 esac
 [ $# -eq 0 ] || usage
+# tests/run.sh points non-root lookups under a sysroot (#21); a root pass must
+# only ever see the real system.
+[ -z "${MSS_TEST_SYSROOT:-}" ] || [ "$(id -u)" -ne 0 ] \
+    || mss_die "MSS_TEST_SYSROOT is for tests/run.sh only and is refused as root"
 
 # ── inputs (env) ───────────────────────────────────────────────────────────────
 MSS_BACKENDS=${MSS_BACKENDS:-ollama}
@@ -86,7 +90,7 @@ LOG_DIR="/var/log/mac-studio-server"
 PLIST_DIR="/Library/LaunchDaemons"
 CONF="$ETC_DIR/backends.conf"
 PF_FILE="$ETC_DIR/pf.conf"
-STAMP_DIR=$DB_DIR
+STAMP_DIR=${MSS_TEST_SYSROOT:-}$DB_DIR
 [ -z "$RENDER_ONLY" ] || STAMP_DIR=$RENDER_ONLY
 
 if [ -z "$RENDER_ONLY" ] && [ "$CHECK_ONLY" = 0 ] && [ "$(id -u)" -ne 0 ]; then
@@ -104,9 +108,14 @@ case $MSS_DEFER_MODEL in ''|yes) ;; *) mss_die "MSS_DEFER_MODEL must be yes or u
 mss_validate_uint MSS_PROGRESS_SECONDS "$MSS_PROGRESS_SECONDS" 1 60 || exit 1
 
 # The optional backend already installed (backends.conf is world-readable).
+# A root pass reads the installed conf. Without root (--render-only or
+# --check-only) MSS_CONF may point elsewhere, as for the picker; every real
+# install checks again as root.
+_installed_conf=$CONF
+[ "$(id -u)" -eq 0 ] || _installed_conf=$(mss_conf_path)
 _installed_opt=""
-if [ -r "$CONF" ]; then
-    _installed_opt=$(awk -F= 'index($0,"MSS_GUARD_BACKEND=")==1{print substr($0,length("MSS_GUARD_BACKEND=")+1)}' "$CONF")
+if [ -r "$_installed_conf" ]; then
+    _installed_opt=$(awk -F= 'index($0,"MSS_GUARD_BACKEND=")==1{print substr($0,length("MSS_GUARD_BACKEND=")+1)}' "$_installed_conf")
 fi
 
 # MSS_REPLACE_BACKEND lets the switch check see through the backend that is
@@ -178,7 +187,7 @@ hash_file() {
     _hb=$1; _hp=$2; _hs=$3
     _ht=$(mktemp -d "${TMPDIR:-/tmp}/mss-hash.XXXXXX") || return 1
     if ! mkfifo "$_ht/fifo"; then rm -rf "$_ht"; return 1; fi
-    shasum -a 256 < "$_ht/fifo" > "$_ht/sum" &
+    mss_shasum256 < "$_ht/fifo" > "$_ht/sum" &
     _hsum=$!
     dd if="$_hp" of="$_ht/fifo" bs=16777216 2>"$_ht/dd.log" &
     _hdd=$!
