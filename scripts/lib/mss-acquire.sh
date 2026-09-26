@@ -137,6 +137,7 @@ mss_acquire_download() {
     [ "$have" = "$size" ] || { mss_error "downloaded $have bytes, expected $size; $part is kept"; return 1; }
     if [ -e "$dest" ] || [ -L "$dest" ]; then mss_error "$dest appeared during the download; not replaced"; return 1; fi
     mv "$part" "$dest" || return 1
+    # shellcheck disable=SC2034  # read by mss_sha_mismatch_rename (mss-run.sh)
     MSS_DOWNLOADED=$dest
     echo "downloaded $dest" >&2
 }
