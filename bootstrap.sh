@@ -111,7 +111,8 @@ main() {
     done
 
     # B1: prompts come from the terminal; without one, say how to install by hand.
-    if ! { : </dev/tty; } 2>/dev/null; then
+    # `true`, not `:`: a failed redirect on a special builtin would exit the shell.
+    if ! { true </dev/tty; } 2>/dev/null; then
         echo "no terminal: git clone $MSSB_REMOTE && cd mac-studio-server && ./scripts/install.sh" >&2
         exit 1
     fi

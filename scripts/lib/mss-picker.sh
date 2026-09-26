@@ -379,7 +379,8 @@ mss_pick_model_menu() {
         line="$name model: 1) $starter $(mss_human_size "$(mss_catalog_get "$b" "$starter" size)") (starter) 2) more"
         n=2; more_n=2
     else
-        line="$name model (no small one exists):"
+        # "model" is left out so the line stays within 100 characters (S4).
+        line="$name (no small one exists):"
         for id in $(mss_catalog_ids "$b" more); do
             n=$((n + 1)); ids="$ids $id"
             line="$line $n) $id $(mss_human_size "$(mss_catalog_get "$b" "$id" size)")"
