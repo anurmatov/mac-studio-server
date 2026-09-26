@@ -20,14 +20,18 @@ BOOT_MARKER="/var/run/com.mac-studio-server.boot.ok"
 
 refuse() { echo "REFUSE: $1"; exit 78; }
 
-BIN=$(mss_conf_get DS4_BIN || refuse "conf missing DS4_BIN")
-MODEL=$(mss_conf_get DS4_MODEL || refuse "conf missing DS4_MODEL")
-HOST=$(mss_conf_get DS4_HOST || echo 127.0.0.1)
-PORT=$(mss_conf_get DS4_PORT || echo 8000)
-CTX=$(mss_conf_get DS4_CTX || echo 65536)
-SESSIONS=$(mss_conf_get DS4_BATCHED_SESSIONS || echo "")
-ARGS=$(mss_conf_get DS4_ARGS || echo "")
-WIRED_LIMIT=$(mss_conf_get MSS_WIRED_LIMIT_MB || echo "")
+# refuse must run in this shell: inside $(...) it would only exit the subshell.
+[ -r "$(mss_conf_path)" ] || refuse "conf missing ($(mss_conf_path))"
+BIN=$(mss_conf_get DS4_BIN)
+[ -n "$BIN" ] || refuse "conf missing DS4_BIN"
+MODEL=$(mss_conf_get DS4_MODEL)
+[ -n "$MODEL" ] || refuse "conf missing DS4_MODEL"
+HOST=$(mss_conf_get DS4_HOST); HOST=${HOST:-127.0.0.1}
+PORT=$(mss_conf_get DS4_PORT); PORT=${PORT:-8000}
+CTX=$(mss_conf_get DS4_CTX); CTX=${CTX:-65536}
+SESSIONS=$(mss_conf_get DS4_BATCHED_SESSIONS)
+ARGS=$(mss_conf_get DS4_ARGS)
+WIRED_LIMIT=$(mss_conf_get MSS_WIRED_LIMIT_MB)
 
 # 1. Verified model, unchanged since install.
 [ -r "$STAMP" ] || refuse "model not verified (stamp missing)"

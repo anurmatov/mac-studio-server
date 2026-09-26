@@ -94,14 +94,24 @@ rejected before any system change.
   once at install (per-hop `readlink`, no GNU extensions), the model sha256 is
   verified, and every start re-checks size/inode/mtime against the stamp. A
   changed or missing model refuses with `REFUSE:` and exit 78.
-- **LAN binds are firewalled.** A non-loopback backend renders pf sub-anchor
-  `com.apple/250.mac-studio-server` rules (loopback + your allowlist, then
-  block). A root boot daemon enables pf, loads the anchor and verifies pf is
-  enabled, referenced and fully loaded before writing a boot marker; the
-  wrapper refuses to bind LAN without this boot's marker.
+- **Ollama keeps its v1.2.0 bind.** It stays on `0.0.0.0:11434` by default,
+  so existing installs do not change; the installer warns while it is
+  LAN-bound. `OLLAMA_BIND=127.0.0.1` makes it loopback-only.
+- **LAN binds are firewalled.** A non-loopback backend with an allowlist
+  renders pf sub-anchor `com.apple/250.mac-studio-server` rules (loopback +
+  your allowlist, then block). A root boot daemon enables pf, loads the anchor
+  and verifies pf is enabled, referenced and fully loaded before writing a boot
+  marker; the wrapper refuses to bind LAN without this boot's marker. ds4 always
+  needs an allowlist on a LAN address. llama.cpp may use an API key file
+  instead; then there is no pf policy and the key is the sole protection.
 - **Extra args are allowlisted.** `LLAMACPP_EXTRA_ARGS` / `DS4_EXTRA_ARGS`
   accept only reviewed performance flags; anything that serves files, loads
-  extra artifacts or persists state is rejected.
+  extra artifacts or persists state is rejected. ds4's `--mtp*` flags are not
+  accepted in 1.3.0.
+- **Inputs are validated, not escaped.** Paths must be absolute with no spaces
+  or special characters, numbers must be integers, and a value containing a
+  newline is refused. The service user defaults to the user who ran `sudo` and
+  is never `root`.
 - **A memory guard protects the host and Ollama.** It samples free memory,
   swap and the optional backend's RSS, and after repeated violations boots the
   optional backend out and keeps it down until `mss-enable.sh`. It never stops
@@ -126,6 +136,13 @@ export DS4_MODEL=/path/to/model.gguf
 export DS4_MODEL_SHA256=<sha256>
 ./scripts/install.sh
 ```
+
+`install.sh` first runs `scripts/install-backends.sh --check-only`, which
+validates every variable and hashes the model without writing anything, and
+only then touches Ollama. On a first install the model is therefore hashed
+twice (the check, then the root installer); a re-install with an unchanged
+model skips both. `OLLAMA_GPU_PERCENT` installs `com.ollama.gpumemory` whatever
+the selection, and an optional backend waits for that wired limit at start.
 
 ### Status / enable / uninstall
 
@@ -177,8 +194,9 @@ vim config/com.ollama.service.plist
 # Stop the current service
 sudo launchctl unload /Library/LaunchDaemons/com.ollama.service.plist
 
-# Copy the updated configuration
-sudo cp config/com.ollama.service.plist /Library/LaunchDaemons/
+# Render the placeholders and install the updated configuration
+sed -e "s|<OLLAMA_USER>|$(whoami)|g" -e "s|<OLLAMA_BIND>|0.0.0.0|g" \
+    config/com.ollama.service.plist | sudo tee /Library/LaunchDaemons/com.ollama.service.plist >/dev/null
 
 # Set proper permissions
 sudo chown root:wheel /Library/LaunchDaemons/com.ollama.service.plist

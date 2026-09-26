@@ -89,10 +89,10 @@ if [ -n "$_opt" ]; then
     # anchor rule count equals the rendered MSS_PF_RULE_COUNT.
     _host=$(conf_get "$(echo "$_opt" | tr '[:lower:]' '[:upper:]')_HOST")
     _host=${_host:-127.0.0.1}
-    if ! mss_is_loopback_host "$_host"; then
+    _count=$(conf_get MSS_PF_RULE_COUNT); _count=${_count:-0}
+    if ! mss_is_loopback_host "$_host" && [ "$_count" != 0 ]; then
         echo "pf:"
         if [ "$(id -u)" -eq 0 ]; then
-            _count=$(conf_get MSS_PF_RULE_COUNT)
             if "$MSS_PFCTL" -s info 2>/dev/null | grep -q 'Status: Enabled'; then
                 healthy pf "enabled"
             else

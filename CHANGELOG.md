@@ -15,15 +15,17 @@ All notable changes to this project will be documented in this file.
 - Shared memory guard for the optional backend (never Ollama): free/swap/RSS
   sampling to `guard.jsonl`, trip after consecutive violations, root-only
   recovery via `mss-enable.sh`, copy-truncate log rotation
-- `scripts/install-backends.sh` (with `--render-only` for tests),
+- `scripts/install-backends.sh` (with `--check-only`, used by `install.sh`
+  before any system change, and `--render-only` for tests),
   `scripts/status.sh`, `scripts/uninstall.sh`, `scripts/lib/mss-common.sh`
 - macOS arm64 CI: shellcheck, render/golden tests, launchd system tests with
   stub servers, and a real `llama-server` job
 - `OLLAMA_BIND` for the Ollama plist; default render stays identical to 1.2.0
 
 ### Changed
-- `scripts/install.sh` validates `MSS_BACKENDS` before any system change and
-  delegates optional backends to the root installer
+- `scripts/install.sh` validates `MSS_BACKENDS` and runs the full optional
+  backend check (model hash included) before any system change, then delegates
+  optional backends to the root installer; the Ollama steps are unchanged
 
 ## [1.2.0] - 2025-03-04
 

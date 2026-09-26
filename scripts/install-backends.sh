@@ -1,34 +1,48 @@
 #!/bin/sh
 # install-backends.sh — root part of the mac-studio-server 1.3.0 installer (#9).
 #
-#   sudo env <vars> scripts/install-backends.sh [--render-only DIR]
+#   sudo env <vars> scripts/install-backends.sh [--check-only | --render-only DIR]
 #
-# Validates EVERYTHING first: a bad variable must abort before any system
-# change. Then renders backends.conf, pf.conf and plists, installs files with
-# the ownership table from the issue, and bootstraps boot -> backend -> guard.
+# Validates EVERYTHING first, including the model sha256: a bad variable or
+# model must abort before any system change. Then writes the model stamp,
+# renders backends.conf, pf.conf and plists, installs files with the ownership
+# table from the issue, and bootstraps boot -> backend -> guard.
 #
-# --render-only DIR writes the rendered files (and the model stamp) into DIR
-# without root, launchd or pf — used by tests. In that mode MSS_PFCTL may point
-# at a stub; production always renders /sbin/pfctl unless explicitly overridden.
+# --check-only runs only the validation (and hash) and writes nothing; install.sh
+# calls it before touching Ollama. --render-only DIR writes the rendered files
+# (and the model stamp) into DIR without root, launchd or pf — used by tests. In
+# that mode MSS_PFCTL may point at a stub; production always renders /sbin/pfctl
+# unless explicitly overridden.
 
 set -u
+# sudo inherits the caller's umask; with 077, mkdir -p would create a missing
+# /usr/local/libexec or /usr/local/etc that the service user cannot traverse.
+umask 022
 
 REPO_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 . "$REPO_DIR/scripts/lib/mss-common.sh"
 
-usage() { echo "usage: install-backends.sh [--render-only DIR]" >&2; exit 2; }
+usage() { echo "usage: install-backends.sh [--check-only | --render-only DIR]" >&2; exit 2; }
 
 RENDER_ONLY=""
-if [ "${1:-}" = "--render-only" ]; then
-    [ -n "${2:-}" ] || usage
-    RENDER_ONLY=$2
-    shift 2
-fi
+CHECK_ONLY=0
+case ${1:-} in
+    --render-only)
+        [ -n "${2:-}" ] || usage
+        RENDER_ONLY=$2
+        shift 2
+        ;;
+    --check-only)
+        CHECK_ONLY=1
+        shift
+        ;;
+esac
 [ $# -eq 0 ] || usage
 
 # ── inputs (env) ───────────────────────────────────────────────────────────────
 MSS_BACKENDS=${MSS_BACKENDS:-ollama}
-MSS_SERVICE_USER=${OLLAMA_USER:-$(id -un)}
+# Under a direct `sudo`, id -un is root; the invoking user is the default.
+MSS_SERVICE_USER=${OLLAMA_USER:-${SUDO_USER:-$(id -un)}}
 OLLAMA_BIND=${OLLAMA_BIND:-0.0.0.0}
 LLAMACPP_BIN=${LLAMACPP_BIN:-}
 LLAMACPP_MODEL=${LLAMACPP_MODEL:-}
@@ -64,16 +78,22 @@ PLIST_DIR="/Library/LaunchDaemons"
 CONF="$ETC_DIR/backends.conf"
 PF_FILE="$ETC_DIR/pf.conf"
 STAMP_DIR=$DB_DIR
+[ -z "$RENDER_ONLY" ] || STAMP_DIR=$RENDER_ONLY
 
-if [ -z "$RENDER_ONLY" ] && [ "$(id -u)" -ne 0 ]; then
-    mss_die "install-backends.sh must run as root (or use --render-only)"
+if [ -z "$RENDER_ONLY" ] && [ "$CHECK_ONLY" = 0 ] && [ "$(id -u)" -ne 0 ]; then
+    mss_die "install-backends.sh must run as root (or use --check-only / --render-only)"
 fi
 
 # ── phase 1: validation (no system changes before this completes) ─────────────
 mss_validate_selection "$MSS_BACKENDS" || exit 1
+mss_validate_user OLLAMA_USER "$MSS_SERVICE_USER" || exit 1
+if [ -z "$RENDER_ONLY" ]; then
+    id -u "$MSS_SERVICE_USER" >/dev/null 2>&1 || mss_die "OLLAMA_USER: user '$MSS_SERVICE_USER' does not exist"
+fi
+mss_validate_path_chars MSS_PFCTL "$MSS_PFCTL" || exit 1
 
+mss_validate_ipv4 "$OLLAMA_BIND" || mss_die "OLLAMA_BIND: '$OLLAMA_BIND' must be a single IPv4 address"
 if mss_backend_selected ollama; then
-    mss_validate_ipv4 "$OLLAMA_BIND" || mss_die "OLLAMA_BIND: '$OLLAMA_BIND' must be a single IPv4 address"
     mss_is_loopback_host "$OLLAMA_BIND" || \
         echo "WARNING: Ollama is LAN-bound on $OLLAMA_BIND — ensure your network is trusted." >&2
 fi
@@ -81,10 +101,34 @@ fi
 _has_optional=0
 _optional=""
 
+# A listener is fine only when it is this backend's own running job (re-install).
 validate_port_free() {
-    _port=$1 _var=$2
-    _pids=$(lsof -nP -iTCP:"$_port" -sTCP:LISTEN -t 2>/dev/null)
-    [ -z "$_pids" ] || mss_die "$_var: port $_port is already bound by pid(s) $(echo $_pids | tr '\n' ' ')"
+    _port=$1 _var=$2 _label=$3
+    _pids=$(lsof -nP -iTCP:"$_port" -sTCP:LISTEN -t 2>/dev/null | sort -u)
+    [ -n "$_pids" ] || return 0
+    _own=$(launchctl print "system/$_label" 2>/dev/null | sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\).*/\1/p' | head -n 1)
+    [ -n "$_own" ] && [ "$_pids" = "$_own" ] && return 0
+    mss_die "$_var: port $_port is already bound by pid(s) $(printf '%s' "$_pids" | tr '\n' ' ')"
+}
+
+# verify_model <backend> <resolved model> <expected sha>: prints the stamp line
+# "path size inode mtime sha". Skips the re-hash only when the existing stamp
+# matches the path, stat and expected sha. Writes nothing.
+verify_model() {
+    _vb=$1; _vpath=$2; _vwant=$(printf '%s' "$3" | tr '[:upper:]' '[:lower:]')
+    _vstat=$(stat -f '%z %i %m' "$_vpath" 2>/dev/null) || { mss_error "stat failed: $_vpath"; return 1; }
+    _vstamp="$STAMP_DIR/$_vb.model.verified"
+    _vsha=""
+    if [ -r "$_vstamp" ] && read -r _sp _ss _si _sm _sh < "$_vstamp" \
+        && [ "$_sp" = "$_vpath" ] && [ "$_ss $_si $_sm" = "$_vstat" ] && [ "$_sh" = "$_vwant" ]; then
+        echo "stamp unchanged for $_vb (skipping re-hash)" >&2
+        _vsha=$_sh
+    else
+        echo "hashing $_vpath ..." >&2
+        _vsha=$(shasum -a 256 "$_vpath" | awk '{print $1}')
+        [ "$_vsha" = "$_vwant" ] || { mss_error "$_vb model sha256 mismatch (expected $_vwant, got $_vsha)"; return 1; }
+    fi
+    printf '%s %s %s\n' "$_vpath" "$_vstat" "$_vsha"
 }
 
 validate_optional_backend() {
@@ -110,6 +154,7 @@ validate_optional_backend() {
     esac
 
     _resolved_bin=$(mss_resolve_path "$_bin") || exit 1
+    mss_validate_path_chars "${_upper}_BIN (resolved)" "$_resolved_bin" || exit 1
     [ -f "$_resolved_bin" ] || mss_die "${_upper}_BIN: not a regular file: $_resolved_bin"
     [ -x "$_resolved_bin" ] || mss_die "${_upper}_BIN: not executable: $_resolved_bin"
     case $_b in
@@ -118,6 +163,7 @@ validate_optional_backend() {
     esac
 
     _resolved_model=$(mss_resolve_path "$_model") || exit 1
+    mss_validate_path_chars "${_upper}_MODEL (resolved)" "$_resolved_model" || exit 1
     [ -f "$_resolved_model" ] || mss_die "${_upper}_MODEL: not a regular file: $_resolved_model"
     case $_b in
         llamacpp) LLAMACPP_MODEL_RESOLVED=$_resolved_model ;;
@@ -151,7 +197,29 @@ validate_optional_backend() {
         ds4) DS4_ARGS=$_parsed ;;
     esac
 
-    validate_port_free "$_port" "${_upper}_PORT"
+    # Numeric and path inputs that reach backends.conf or a plist.
+    case $_b in
+        llamacpp)
+            [ -z "$LLAMACPP_CTX" ] || mss_validate_uint LLAMACPP_CTX "$LLAMACPP_CTX" 1 || exit 1
+            [ -z "$LLAMACPP_PARALLEL" ] || mss_validate_uint LLAMACPP_PARALLEL "$LLAMACPP_PARALLEL" 1 || exit 1
+            if [ -n "$LLAMACPP_API_KEY_FILE" ]; then
+                mss_validate_path_chars LLAMACPP_API_KEY_FILE "$LLAMACPP_API_KEY_FILE" || exit 1
+            fi
+            ;;
+        ds4)
+            mss_validate_uint DS4_CTX "$DS4_CTX" 1 || exit 1
+            [ -z "$DS4_BATCHED_SESSIONS" ] || mss_validate_uint DS4_BATCHED_SESSIONS "$DS4_BATCHED_SESSIONS" 0 || exit 1
+            if [ -n "$DS4_WORKDIR" ]; then
+                DS4_WORKDIR_RESOLVED=$(mss_resolve_path "$DS4_WORKDIR") || exit 1
+                [ -d "$DS4_WORKDIR_RESOLVED" ] || mss_die "DS4_WORKDIR: not a directory: $DS4_WORKDIR_RESOLVED"
+            else
+                DS4_WORKDIR_RESOLVED=$(dirname "$_resolved_bin")
+            fi
+            mss_validate_path_chars DS4_WORKDIR "$DS4_WORKDIR_RESOLVED" || exit 1
+            ;;
+    esac
+
+    validate_port_free "$_port" "${_upper}_PORT" "com.mac-studio-server.$_b"
 }
 
 if mss_backend_selected llamacpp; then
@@ -173,10 +241,10 @@ if mss_backend_selected ollama && [ "$_has_optional" = 1 ]; then
 fi
 
 # Guard threshold sanity.
-echo "$MSS_GUARD_STREAK" | grep -Eq '^[0-9]+$' && [ "$MSS_GUARD_STREAK" -ge 1 ] || mss_die "MSS_GUARD_STREAK must be a positive integer"
-echo "$MSS_GUARD_FREE_PCT" | grep -Eq '^[0-9]+$' && [ "$MSS_GUARD_FREE_PCT" -ge 1 ] && [ "$MSS_GUARD_FREE_PCT" -le 99 ] || mss_die "MSS_GUARD_FREE_PCT must be 1..99"
-echo "$MSS_GUARD_SWAP_HEADROOM_MB" | grep -Eq '^[0-9]+$' || mss_die "MSS_GUARD_SWAP_HEADROOM_MB must be an integer"
-echo "$MSS_LOG_MAX_MB" | grep -Eq '^[0-9]+$' && [ "$MSS_LOG_MAX_MB" -ge 1 ] || mss_die "MSS_LOG_MAX_MB must be a positive integer"
+mss_validate_uint MSS_GUARD_STREAK "$MSS_GUARD_STREAK" 1 || exit 1
+mss_validate_uint MSS_GUARD_FREE_PCT "$MSS_GUARD_FREE_PCT" 1 99 || exit 1
+mss_validate_uint MSS_GUARD_SWAP_HEADROOM_MB "$MSS_GUARD_SWAP_HEADROOM_MB" 0 || exit 1
+mss_validate_uint MSS_LOG_MAX_MB "$MSS_LOG_MAX_MB" 1 || exit 1
 
 # Re-install with a different optional backend: refuse (D7).
 _installed_opt=""
@@ -189,10 +257,28 @@ fi
 
 # Wired limit: same integer formula and evaluation order as set-gpu-memory.sh.
 MSS_WIRED_LIMIT_MB=""
-if [ -n "${OLLAMA_GPU_PERCENT:-}" ]; then
-    echo "$OLLAMA_GPU_PERCENT" | grep -Eq '^[0-9]+$' && [ "$OLLAMA_GPU_PERCENT" -ge 1 ] && [ "$OLLAMA_GPU_PERCENT" -le 100 ] \
-        || mss_die "OLLAMA_GPU_PERCENT must be 1..100"
+if [ -n "${OLLAMA_GPU_PERCENT:-}" ] && [ "$_has_optional" = 1 ]; then
+    mss_validate_uint OLLAMA_GPU_PERCENT "$OLLAMA_GPU_PERCENT" 1 100 || exit 1
     MSS_WIRED_LIMIT_MB=$(mss_wired_limit_mb "$OLLAMA_GPU_PERCENT")
+    mss_validate_uint "wired limit (from hw.memsize)" "$MSS_WIRED_LIMIT_MB" 1 || exit 1
+    # The backend waits for this limit; something must apply it at every boot.
+    # scripts/install.sh installs com.ollama.gpumemory before calling us.
+    if [ -z "$RENDER_ONLY" ] && [ "$CHECK_ONLY" = 0 ] && [ ! -f "$PLIST_DIR/com.ollama.gpumemory.plist" ]; then
+        mss_die "OLLAMA_GPU_PERCENT is set but com.ollama.gpumemory is not installed; run scripts/install.sh, or unset OLLAMA_GPU_PERCENT"
+    fi
+fi
+
+# The model hash is the only slow check, so it runs last.
+if mss_backend_selected llamacpp; then
+    LLAMACPP_STAMP_LINE=$(verify_model llamacpp "$LLAMACPP_MODEL_RESOLVED" "$LLAMACPP_MODEL_SHA256") || exit 1
+fi
+if mss_backend_selected ds4; then
+    DS4_STAMP_LINE=$(verify_model ds4 "$DS4_MODEL_RESOLVED" "$DS4_MODEL_SHA256") || exit 1
+fi
+
+if [ "$CHECK_ONLY" = 1 ]; then
+    echo "install-backends: check passed (backends: $MSS_BACKENDS)"
+    exit 0
 fi
 
 # ── phase 2: render ────────────────────────────────────────────────────────────
@@ -211,7 +297,9 @@ if [ -n "$_optional" ]; then
         llamacpp) _oh=$LLAMACPP_HOST; _op=$LLAMACPP_PORT; _oa=$LLAMACPP_ALLOW_FROM ;;
         ds4)      _oh=$DS4_HOST; _op=$DS4_PORT; _oa=$DS4_ALLOW_FROM ;;
     esac
-    if ! mss_is_loopback_host "$_oh"; then
+    # pf applies only with an allowlist. llama.cpp on a LAN address with only an
+    # API key has no pf policy: the key is its sole protection (D2).
+    if ! mss_is_loopback_host "$_oh" && [ -n "$_oa" ]; then
         PF_RULES="pass in quick on lo0 proto tcp to any port $_op"
         for _e in $_oa; do
             PF_RULES="$PF_RULES
@@ -219,11 +307,16 @@ pass in quick proto tcp from $_e to any port $_op"
         done
         PF_RULES="$PF_RULES
 block in quick proto tcp to any port $_op"
-        PF_SPECS="$_op:$_oa"
+        # shellcheck disable=SC2086  # allowlist is whitespace-separated
+        PF_SPECS="$_op:$(printf '%s ' $_oa | sed 's/ $//' | tr ' ' ',')"
     fi
 fi
-# shellcheck disable=SC2086  # PF_SPECS is one "port:entries" word per LAN-bound port
+# shellcheck disable=SC2086  # PF_SPECS is one "port:entry,entry" word per LAN-bound port
 PF_RULE_COUNT=$(mss_pf_rule_count $PF_SPECS)
+# The count the boot check compares against must equal the rules written.
+_rendered=0
+[ -z "$PF_RULES" ] || _rendered=$(printf '%s\n' "$PF_RULES" | grep -c .)
+[ "$_rendered" -eq "$PF_RULE_COUNT" ] || mss_die "internal: pf rule count $PF_RULE_COUNT != rendered $_rendered"
 HAS_PF_POLICY=0; [ -n "$PF_RULES" ] && HAS_PF_POLICY=1
 
 render_placeholders() {
@@ -235,12 +328,29 @@ render_placeholders() {
 }
 
 # ── phase 3: write outputs ─────────────────────────────────────────────────────
+# The model stamp comes first: the sha is already verified, and a conf is never
+# written that points at a model without a matching stamp.
+write_stamp() {
+    _stamp="$STAMP_DIR/$1.model.verified"
+    printf '%s\n' "$2" > "$_stamp.tmp"
+    if [ -z "$RENDER_ONLY" ]; then chown root:wheel "$_stamp.tmp"; fi
+    chmod 0644 "$_stamp.tmp"
+    mv "$_stamp.tmp" "$_stamp"
+}
 if [ -z "$RENDER_ONLY" ]; then
-    mkdir -p "$LIBEXEC_DIR" "$ETC_DIR" "$DB_DIR" "$LOG_DIR"
-    chown root:wheel "$LIBEXEC_DIR" "$ETC_DIR" "$DB_DIR" "$LOG_DIR"
-    chmod 0755 "$LIBEXEC_DIR" "$ETC_DIR" "$DB_DIR" "$LOG_DIR"
+    mkdir -p "$DB_DIR"
+    chown root:wheel "$DB_DIR"
+    chmod 0755 "$DB_DIR"
 else
     mkdir -p "$RENDER_ONLY"
+fi
+if mss_backend_selected llamacpp; then write_stamp llamacpp "$LLAMACPP_STAMP_LINE"; fi
+if mss_backend_selected ds4; then write_stamp ds4 "$DS4_STAMP_LINE"; fi
+
+if [ -z "$RENDER_ONLY" ]; then
+    mkdir -p "$LIBEXEC_DIR" "$ETC_DIR" "$LOG_DIR"
+    chown root:wheel "$LIBEXEC_DIR" "$ETC_DIR" "$LOG_DIR"
+    chmod 0755 "$LIBEXEC_DIR" "$ETC_DIR" "$LOG_DIR"
 fi
 
 # scripts
@@ -256,7 +366,7 @@ done
 # conf
 _WORKDIR=""
 if [ "$_optional" = ds4 ]; then
-    _WORKDIR=${DS4_WORKDIR:-$(dirname "$DS4_BIN_RESOLVED")}
+    _WORKDIR=$DS4_WORKDIR_RESOLVED
 fi
 {
     echo "MSS_BACKENDS=$MSS_BACKENDS"
@@ -305,30 +415,6 @@ mv "$CONF.tmp" "$CONF"
 chmod 0644 "$PF_FILE.tmp"
 if [ -z "$RENDER_ONLY" ]; then chown root:wheel "$PF_FILE.tmp"; fi
 mv "$PF_FILE.tmp" "$PF_FILE"
-
-# model stamp (skip the re-hash when the existing stamp matches stat)
-stamp_backend() {
-    _b=$1; _resolved=$2; _expected=$3
-    _stamp="$STAMP_DIR/$_b.model.verified"
-    _stat=$(stat -f '%z %i %m' "$_resolved" 2>/dev/null) || mss_die "stat failed: $_resolved"
-    if [ -r "$_stamp" ]; then
-        read -r _sp _ss _si _sm _sh < "$_stamp" || _sp=""
-        if [ "$_sp" = "$_resolved" ] && [ "$_ss $_si $_sm" = "$_stat" ]; then
-            echo "stamp unchanged for $_b (skipping re-hash)"
-            return 0
-        fi
-    fi
-    echo "hashing $_resolved ..."
-    _actual=$(shasum -a 256 "$_resolved" | awk '{print $1}')
-    [ "$_actual" = "$(echo "$_expected" | tr '[:upper:]' '[:lower:]')" ] \
-        || mss_die "$_b model sha256 mismatch (expected $_expected, got $_actual)"
-    printf '%s %s %s\n' "$_resolved" "$_stat" "$_actual" > "$_stamp.tmp"
-    if [ -z "$RENDER_ONLY" ]; then chown root:wheel "$_stamp.tmp"; fi
-    chmod 0644 "$_stamp.tmp"
-    mv "$_stamp.tmp" "$_stamp"
-}
-if mss_backend_selected llamacpp; then stamp_backend llamacpp "$LLAMACPP_MODEL_RESOLVED" "$LLAMACPP_MODEL_SHA256"; fi
-if mss_backend_selected ds4; then stamp_backend ds4 "$DS4_MODEL_RESOLVED" "$DS4_MODEL_SHA256"; fi
 
 # plists
 install_plist() {

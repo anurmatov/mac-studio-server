@@ -9,6 +9,17 @@
 mss_error() { echo "ERROR: $*" >&2; }
 mss_die()   { mss_error "$@"; exit 1; }
 
+# mss_match <value> <ERE>: the whole value must be one line matching ERE.
+# grep matches line by line, so a value carrying a newline could otherwise pass
+# on its first line and inject a second line into backends.conf.
+_mss_nl='
+'
+_mss_cr=$(printf '\r')
+mss_match() {
+    case ${1:-} in *"$_mss_nl"*|*"$_mss_cr"*) return 1 ;; esac
+    printf '%s\n' "${1:-}" | grep -Eq "$2"
+}
+
 # ── backend selection ──────────────────────────────────────────────────────────
 # Valid: ollama, llamacpp, ds4, ollama,llamacpp, ollama,ds4. Rejects unknown
 # names, duplicates, empty, "llamacpp,ds4" and all three.
@@ -38,19 +49,21 @@ mss_validate_selection() {
 mss_backend_selected() { case ",${MSS_BACKENDS:-ollama}," in *",$1,"*) return 0 ;; esac; return 1; }
 
 # ── IPv4 / CIDR / host ─────────────────────────────────────────────────────────
+# Dotted quad, each octet 0..255 with no leading zeros (010 is ambiguous).
 mss_validate_ipv4() {
-    echo "${1:-}" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' || return 1
-    echo "${1:-}" | awk -F. '$1<=255 && $2<=255 && $3<=255 && $4<=255 { exit 0 } { exit 1 }'
+    mss_match "${1:-}" '^(0|[1-9][0-9]{0,2})(\.(0|[1-9][0-9]{0,2})){3}$' || return 1
+    printf '%s\n' "$1" | awk -F. '$1<=255 && $2<=255 && $3<=255 && $4<=255 { exit 0 } { exit 1 }'
 }
 
+# An IPv4 address or CIDR. The prefix is 1..32: /0 would allow everything.
 mss_validate_cidr_entry() {
     _e=${1:-}
     case $_e in
         */*)
             mss_validate_ipv4 "${_e%/*}" || return 1
-            echo "$_e" | grep -Eq '^[0-9]{1,2}$' || return 1
             _len=${_e##*/}
-            [ "$_len" -ge 0 ] && [ "$_len" -le 32 ]
+            mss_match "$_len" '^[1-9][0-9]?$' || return 1
+            [ "$_len" -le 32 ]
             ;;
         *) mss_validate_ipv4 "$_e" ;;
     esac
@@ -86,21 +99,48 @@ mss_is_loopback_host() {
 mss_validate_host() {
     _var=$1; _host=${2:-}
     [ -n "$_host" ] || { mss_error "$_var is empty"; return 1; }
+    case $_host in *:*) mss_error "$_var: IPv6 is not supported"; return 1 ;; esac
     mss_validate_ipv4 "$_host" || { mss_error "$_var: '$_host' must be a single IPv4 address"; return 1; }
-    echo "$_host" | grep -q ':' && { mss_error "$_var: IPv6 is not supported"; return 1; }
     return 0
 }
 
-# ── ports ──────────────────────────────────────────────────────────────────────
+# ── ports and integers ─────────────────────────────────────────────────────────
 mss_validate_port() {
     _var=$1; _port=${2:-}
-    echo "$_port" | grep -Eq '^[0-9]+$' || { mss_error "$_var: '$_port' is not a number"; return 1; }
+    mss_match "$_port" '^[0-9]+$' || { mss_error "$_var: '$_port' is not a number"; return 1; }
     [ "$_port" -ge 1 ] && [ "$_port" -le 65535 ] || { mss_error "$_var: '$_port' out of range"; return 1; }
+}
+
+# mss_validate_uint <var> <value> <min> [max]: decimal integer in range.
+mss_validate_uint() {
+    _var=$1; _v=${2:-}; _min=$3; _max=${4:-}
+    mss_match "$_v" '^[0-9]{1,9}$' || { mss_error "$_var: '$_v' is not a non-negative integer"; return 1; }
+    [ "$_v" -ge "$_min" ] || { mss_error "$_var: '$_v' is below $_min"; return 1; }
+    [ -z "$_max" ] || [ "$_v" -le "$_max" ] || { mss_error "$_var: '$_v' is above $_max"; return 1; }
+    return 0
+}
+
+# ── users and paths ────────────────────────────────────────────────────────────
+# Service user: a plain macOS short name, never root.
+mss_validate_user() {
+    _var=$1; _u=${2:-}
+    mss_match "$_u" '^[A-Za-z_][A-Za-z0-9_.-]{0,31}$' || { mss_error "$_var: '$_u' is not a valid user name"; return 1; }
+    [ "$_u" != root ] || { mss_error "$_var: the service user must not be root (set OLLAMA_USER)"; return 1; }
+    return 0
+}
+
+# Absolute path with no whitespace or shell/sed/plist metacharacters. Paths are
+# written into backends.conf, the space-separated model stamp and sed-rendered
+# plists, so anything outside this set is refused rather than escaped.
+mss_validate_path_chars() {
+    _var=$1; _path=${2:-}
+    mss_match "$_path" '^/[A-Za-z0-9._/+@:,=-]*$' \
+        || { mss_error "$_var: '$_path' must be an absolute path without spaces or special characters"; return 1; }
 }
 
 # ── sha256 / key file ──────────────────────────────────────────────────────────
 mss_validate_sha256() {
-    echo "${2:-}" | grep -Eq '^[0-9a-fA-F]{64}$' || { mss_error "$1: not a 64-hex sha256"; return 1; }
+    mss_match "${2:-}" '^[0-9a-fA-F]{64}$' || { mss_error "$1: not a 64-hex sha256"; return 1; }
 }
 
 mss_validate_key_file() {
@@ -165,8 +205,7 @@ mss_flag_kind() {
         esac
     elif [ "$_backend" = ds4 ]; then
         case $_flag in
-            --threads|--power|--mixed-prefill-quantum|--mtp-draft) echo value; return ;;
-            --mtp|--mtp-exact-sampling) echo novalue; return ;;
+            --threads|--power|--mixed-prefill-quantum) echo value; return ;;
         esac
     fi
     echo ""
@@ -188,7 +227,7 @@ mss_flag_pattern() {
         esac
     elif [ "$_backend" = ds4 ]; then
         case $_flag in
-            --threads|--mixed-prefill-quantum|--mtp-draft) echo '^[0-9]+$'; return ;;
+            --threads|--mixed-prefill-quantum) echo '^[0-9]+$'; return ;;
             --power) echo '^[0-9]+$'; return ;;
         esac
     fi
@@ -248,14 +287,13 @@ mss_validate_extra_args() {
         if [ "$_kind" = value ]; then
             if [ -n "$_inline" ]; then
                 _value=$_inline
-                case $_flag in --*) ;; esac
             else
                 shift
                 [ $# -gt 0 ] || { mss_error "$_var: flag '$_canonical' needs a value"; return 1; }
                 _value=$1
             fi
             _pattern=$(mss_flag_pattern "$_backend" "$_canonical")
-            printf '%s\n' "$_value" | grep -Eq "$_pattern" || { mss_error "$_var: value '$_value' for $_canonical does not match $_pattern"; return 1; }
+            mss_match "$_value" "$_pattern" || { mss_error "$_var: value '$_value' for $_canonical does not match $_pattern"; return 1; }
             if [ "$_canonical" = "--power" ]; then
                 [ "$_value" -ge 1 ] && [ "$_value" -le 100 ] || { mss_error "$_var: --power must be 1..100"; return 1; }
             fi
@@ -283,15 +321,18 @@ mss_conf_get() {
 }
 
 # ── pf rule count ──────────────────────────────────────────────────────────────
-# 2 + allowlist entries per LAN-bound port (lo0 pass, block, one pass per entry).
+# mss_pf_rule_count "<port>:<entry>,<entry>" ...: 2 + allowlist entries per
+# LAN-bound port (lo0 pass, block, one pass per entry). Entries are
+# comma-joined so one port stays one argument.
 mss_pf_rule_count() {
     _count=0
     for _spec in "$@"; do
         _entries=${_spec#*:}
         _n=0
-        if [ -n "$_entries" ]; then
-            for _e in $_entries; do _n=$((_n + 1)); done
-        fi
+        _oldifs=$IFS
+        IFS=,
+        for _e in $_entries; do [ -n "$_e" ] && _n=$((_n + 1)); done
+        IFS=$_oldifs
         _count=$((_count + 2 + _n))
     done
     echo "$_count"

@@ -35,12 +35,21 @@ _v=$(mss_conf_get MSS_GUARD_SWAP_HEADROOM_MB || echo "") && [ -n "$_v" ] && SWAP
 _v=$(mss_conf_get MSS_LOG_MAX_MB || echo "")      && [ -n "$_v" ] && LOG_MAX_MB=$_v
 MAX_BYTES=$(( LOG_MAX_MB * 1024 * 1024 ))
 
+# json_escape: one JSON string body. Backslash and quote are escaped, tabs and
+# newlines become \t and \n, other control characters are dropped.
+json_escape() {
+    printf '%s' "$1" | tr -d '\000-\010\013-\037' | awk '
+        { gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\t/, "\\t") }
+        NR > 1 { printf "\\n" }
+        { printf "%s", $0 }'
+}
+
 log_event() {
     # log_event <event> [detail] — key order fixed by the guard data contract.
     _ev=$1; _detail=${2:-}
     _ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     if [ -n "$_detail" ]; then
-        printf '{"ts":"%s","event":"%s","backend":"%s","detail":"%s"}\n' "$_ts" "$_ev" "$_backend" "$_detail" >> "$GUARD_LOG"
+        printf '{"ts":"%s","event":"%s","backend":"%s","detail":"%s"}\n' "$_ts" "$_ev" "$_backend" "$(json_escape "$_detail")" >> "$GUARD_LOG"
     else
         printf '{"ts":"%s","event":"%s","backend":"%s"}\n' "$_ts" "$_ev" "$_backend" >> "$GUARD_LOG"
     fi
@@ -55,11 +64,14 @@ backend_pid() {
 }
 
 rotate_log() {
-    # copy-truncate keeps the inode; launchd holds the backend log fd open.
-    _file=$1
+    # rotate_log <file> [force]: copy-truncate keeps the inode, because launchd
+    # holds the backend log fd open. Without force, only above MSS_LOG_MAX_MB.
+    _file=$1; _force=${2:-}
     [ -f "$_file" ] || return 0
-    _size=$(stat -f %z "$_file" 2>/dev/null || echo 0)
-    [ "$_size" -gt "$MAX_BYTES" ] || return 0
+    if [ "$_force" != force ]; then
+        _size=$(stat -f %z "$_file" 2>/dev/null || echo 0)
+        [ "$_size" -gt "$MAX_BYTES" ] || return 0
+    fi
     rm -f "$_file.3"
     [ -f "$_file.2" ] && mv "$_file.2" "$_file.3"
     [ -f "$_file.1" ] && mv "$_file.1" "$_file.2"
@@ -86,17 +98,16 @@ mss_guard_evaluate() {
     [ -r "$_file" ] || { echo none; return 0; }
     _lines=$(grep -E '"event":"(sample|sample_error)"' "$_file" | tail -n "$STREAK")
     [ -n "$_lines" ] || { echo none; return 0; }
-    _count=0
-    for _l in $_lines; do _count=$((_count + 1)); done
+    _count=$(printf '%s\n' "$_lines" | wc -l | tr -d ' ')
     [ "$_count" -ge "$STREAK" ] || { echo none; return 0; }
 
     _free_all=1
     _swap_all=1
-    # shellcheck disable=SC2086  # guard.jsonl lines carry no whitespace
-    for _line in $_lines; do
+    _broken=0
+    # One JSON object per line; details may contain spaces, so read whole lines.
+    while IFS= read -r _line; do
         case $_line in
-            *'"event":"sample_error"'*) echo none; return 0 ;;
-            *'"pid":null'*)             echo none; return 0 ;;
+            *'"event":"sample_error"'*|*'"pid":null'*) _broken=1; break ;;
         esac
         _f=$(printf '%s' "$_line" | sed -n 's/.*"free_pct":\([0-9][0-9]*\).*/\1/p')
         if [ -n "$_f" ] && [ "$_f" -lt "$FREE_PCT" ]; then :; else _free_all=0; fi
@@ -109,8 +120,11 @@ mss_guard_evaluate() {
                 if [ -n "$_s" ] && [ -n "$_b" ] && [ "$_s" -gt "$_limit" ]; then :; else _swap_all=0; fi
                 ;;
         esac
-    done
-    if [ "$_free_all" = 1 ]; then echo trip:free
+    done <<EOF_LINES
+$_lines
+EOF_LINES
+    if [ "$_broken" = 1 ]; then echo none
+    elif [ "$_free_all" = 1 ]; then echo trip:free
     elif [ "$_swap_all" = 1 ]; then echo trip:swap
     else echo none
     fi
@@ -139,8 +153,8 @@ case "${1:-}" in
         ;;
     --rotate-now)
         [ "$(id -u)" -eq 0 ] || mss_die "--rotate-now must run as root"
-        rotate_log "$LOG_DIR/$_backend.log"
-        rotate_log "$GUARD_LOG"
+        rotate_log "$LOG_DIR/$_backend.log" force
+        rotate_log "$GUARD_LOG" force
         log_event "rotate" "rotate-now"
         exit 0
         ;;
@@ -161,9 +175,18 @@ swap_mb=$(printf '%s\n' "$swap_raw" | awk '{for (i=1; i<=NF; i++) if ($i=="used"
 pid=$(backend_pid || echo "")
 rss_mb=0
 
-if [ -z "$free_pct" ] || [ -z "$swap_mb" ] || [ -z "$pid" ]; then
-    detail="free=${free_raw:-unreadable} swap=${swap_raw:-unreadable} pid=${pid:-none}"
-    log_event "sample_error" "$detail"
+if [ -z "$free_pct" ] || [ -z "$swap_mb" ]; then
+    [ -n "$free_pct" ] || log_event "sample_error" "memory_pressure -Q unparseable: $(printf '%s' "$free_raw" | head -c 200)"
+    [ -n "$swap_mb" ] || log_event "sample_error" "vm.swapusage unparseable: $(printf '%s' "$swap_raw" | head -c 200)"
+    exit 0
+fi
+
+# Backend not running: a pid:null sample (it breaks any streak), no baseline.
+if [ -z "$pid" ]; then
+    printf '{"ts":"%s","event":"sample","backend":"%s","pid":null,"free_pct":%s,"swap_used_mb":%s,"swap_baseline_mb":null,"rss_mb":0}\n' \
+        "$now" "$_backend" "$free_pct" "$swap_mb" >> "$GUARD_LOG"
+    rotate_log "$LOG_DIR/$_backend.log"
+    rotate_log "$GUARD_LOG"
     exit 0
 fi
 

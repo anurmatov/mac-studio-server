@@ -20,15 +20,19 @@ BOOT_MARKER="/var/run/com.mac-studio-server.boot.ok"
 
 refuse() { echo "REFUSE: $1"; exit 78; }
 
-BIN=$(mss_conf_get LLAMACPP_BIN || refuse "conf missing LLAMACPP_BIN")
-MODEL=$(mss_conf_get LLAMACPP_MODEL || refuse "conf missing LLAMACPP_MODEL")
-HOST=$(mss_conf_get LLAMACPP_HOST || echo 127.0.0.1)
-PORT=$(mss_conf_get LLAMACPP_PORT || echo 8080)
-API_KEY_FILE=$(mss_conf_get LLAMACPP_API_KEY_FILE || echo "")
-CTX=$(mss_conf_get LLAMACPP_CTX || echo "")
-PARALLEL=$(mss_conf_get LLAMACPP_PARALLEL || echo "")
-ARGS=$(mss_conf_get LLAMACPP_ARGS || echo "")
-WIRED_LIMIT=$(mss_conf_get MSS_WIRED_LIMIT_MB || echo "")
+# refuse must run in this shell: inside $(...) it would only exit the subshell.
+[ -r "$(mss_conf_path)" ] || refuse "conf missing ($(mss_conf_path))"
+BIN=$(mss_conf_get LLAMACPP_BIN)
+[ -n "$BIN" ] || refuse "conf missing LLAMACPP_BIN"
+MODEL=$(mss_conf_get LLAMACPP_MODEL)
+[ -n "$MODEL" ] || refuse "conf missing LLAMACPP_MODEL"
+HOST=$(mss_conf_get LLAMACPP_HOST); HOST=${HOST:-127.0.0.1}
+PORT=$(mss_conf_get LLAMACPP_PORT); PORT=${PORT:-8080}
+API_KEY_FILE=$(mss_conf_get LLAMACPP_API_KEY_FILE)
+CTX=$(mss_conf_get LLAMACPP_CTX)
+PARALLEL=$(mss_conf_get LLAMACPP_PARALLEL)
+ARGS=$(mss_conf_get LLAMACPP_ARGS)
+WIRED_LIMIT=$(mss_conf_get MSS_WIRED_LIMIT_MB)
 
 # 1. The model is the exact file verified at install (size inode mtime). No
 #    re-hash of a 100+ GiB artifact at every start.
@@ -50,8 +54,10 @@ fi
 # 4. Guard trip.
 [ ! -e "$TRIP_MARKER" ] || refuse "guard tripped (sudo /usr/local/libexec/mac-studio-server/mss-enable.sh)"
 
-# 5. pf marker from this boot (LAN-bound only).
-if ! mss_is_loopback_host "$HOST"; then
+# 5. pf marker from this boot, whenever a LAN bind has a pf policy. A LAN bind
+#    without an allowlist is only accepted at install with an API key.
+PF_RULE_COUNT=$(mss_conf_get MSS_PF_RULE_COUNT); PF_RULE_COUNT=${PF_RULE_COUNT:-0}
+if ! mss_is_loopback_host "$HOST" && { [ "$PF_RULE_COUNT" != 0 ] || [ -z "$API_KEY_FILE" ]; }; then
     _boot=$(sysctl -n kern.boottime 2>/dev/null || echo unavailable)
     _waited=0
     while ! { [ -r "$BOOT_MARKER" ] && [ "$(cat "$BOOT_MARKER" 2>/dev/null)" = "$_boot" ]; }; do
