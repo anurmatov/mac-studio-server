@@ -69,11 +69,11 @@ export DS4_MODEL_SHA256=<sha256>
 ./scripts/install.sh
 ```
 
-`install.sh` first runs `scripts/install-backends.sh --check-only`, which
-validates every variable and hashes the model without writing anything, and
-only then touches Ollama. On a first install the model is therefore hashed
-twice (the check, then the root installer); a re-install with an unchanged
-model skips both. `OLLAMA_GPU_PERCENT` installs `com.ollama.gpumemory` whatever
+`install.sh` first runs `scripts/install-backends.sh --check-only` under
+`sudo`, which validates every variable and hashes the model before anything
+else changes. On a match it keeps a root-owned verification stamp, so the
+install that follows does not hash again, and a re-install with an unchanged
+model skips the hash entirely. `OLLAMA_GPU_PERCENT` installs `com.ollama.gpumemory` whatever
 the selection, and an optional backend waits for that wired limit at start.
 
 ## Interactive install and backends.env (1.4.0)
@@ -85,7 +85,7 @@ the selection, and an optional backend waits for that wired limit at start.
 | `--configure` / `--configure-only` without a terminal | exit 2 |
 | `--configure` / `--configure-only` as root | exit 1: run it as your user, it calls `sudo` itself |
 | `--configure` | picker, save, check, install |
-| `--configure-only` | picker, save, check under `sudo`; nothing is installed |
+| `--configure-only` | picker, save, check under `sudo`; nothing is installed, may leave a verification stamp |
 | no flag, and no terminal or `MSS_BACKENDS` set | 1.3.0 behaviour: environment only, `backends.env` is not read |
 | no flag, terminal, as root | exit 1 |
 | no flag, terminal, `backends.env` exists | use it without asking |
@@ -115,6 +115,35 @@ before anything is removed), then runs `sudo scripts/uninstall.sh --backend
 `--configure-only` never removes anything: it checks the new selection against
 the installed one and says that `install.sh --configure` will offer the switch.
 A plain `install.sh` with a saved file never switches.
+
+## One-line install, model.sh and acquisition variables (1.5.0)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/anurmatov/mac-studio-server/v1.5.0/bootstrap.sh | sh
+./scripts/model.sh                                        # menu: starter, more, own file/URL
+./scripts/model.sh --catalog qwen3-4b                     # or --path FILE --sha256 HEX
+./scripts/model.sh --url https://… --sha256 HEX [--dest FILE]
+```
+
+The one-liner trusts GitHub and this repo's protected release tags; it checks the clone matches what it downloaded.
+
+`bootstrap.sh` clones `~/mac-studio-server` (`MSS_DIR`) at the release tag, or at a full
+40-hex commit with `sh -s -- --ref <sha>`, then runs `install.sh` on the terminal.
+`model.sh` needs a terminal and a `backends.env` with llama.cpp or ds4; it never touches Ollama.
+Models come from `config/models.catalog` (pinned revisions and sha256), download to
+`~/models/<file>.part` and resume on a re-run.
+
+| variable | where | effect |
+|---|---|---|
+| `MSS_DEFER_MODEL=yes` | `backends.env` | install llama.cpp or ds4 without a model; no backend job until `model.sh` |
+| `OLLAMA_BIN` | `backends.env` | Ollama binary in the plist (default `/usr/local/bin/ollama`) |
+| `MSS_TUNE_MACOS=yes/no` | `backends.env` | headless tweaks; unset runs them with Ollama, as in 1.4.0 |
+| `DS4_BUILD_DIR` | environment only | build ds4-server at the pinned commit there (not with `DS4_BIN`) |
+| `LLAMACPP_BREW_INSTALL=yes` | environment only | `brew install llama.cpp` when `LLAMACPP_BIN` is unset |
+| `LLAMACPP_MODEL_URL`, `DS4_MODEL_URL` | environment only | `catalog:<id>`, or an `https://` URL with `*_MODEL_SHA256` |
+| `MSS_PROGRESS_SECONDS` | environment | hashing progress interval, 1–60 (default 10) |
+
+Environment-only variables are never saved: a saved re-run never downloads or builds.
 
 ## Status / enable / uninstall
 

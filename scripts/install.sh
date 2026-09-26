@@ -7,6 +7,8 @@
 # is passed explicitly.
 REPO_DIR=$(cd "$(dirname "$0")/.." && pwd)
 . "$REPO_DIR/scripts/lib/mss-common.sh" || exit 1
+. "$REPO_DIR/scripts/lib/mss-acquire.sh" || exit 1
+. "$REPO_DIR/scripts/lib/mss-run.sh" || exit 1
 
 # ── Modes (1.4.0). With no flag and no terminal, or with MSS_BACKENDS set, the
 # 1.3.0 flow runs unchanged: environment variables only, backends.env is never
@@ -18,7 +20,7 @@ usage: scripts/install.sh [--configure | --configure-only]
   (no flag)          on a terminal, use the saved backends.env or pick on first run;
                      with MSS_BACKENDS set or no terminal, environment variables only
   --configure        pick the backends again, save backends.env, then install
-  --configure-only   pick and save backends.env, check it, change nothing
+  --configure-only   pick and save backends.env, check it; installs nothing (may leave a verification stamp)
 USAGE
 }
 MSS_FLAG=""
@@ -49,6 +51,10 @@ elif [ -e "$MSS_ENV_FILE" ] || [ -L "$MSS_ENV_FILE" ]; then
 else
     MSS_MODE=picker
 fi
+# U1: a terminal run asks for the password once, then keeps sudo alive.
+if [ "$MSS_MODE" != env ]; then
+    mss_sudo_keepalive || exit 1
+fi
 if [ "$MSS_MODE" = loaded ]; then
     mss_envfile_load "$MSS_ENV_FILE" || exit 1
     echo "Using $MSS_ENV_FILE: MSS_BACKENDS=$MSS_BACKENDS${MSS_ENVFILE_OVERRIDDEN:+ (set in the environment instead:$MSS_ENVFILE_OVERRIDDEN)}" >&2
@@ -73,48 +79,32 @@ log_action() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
-run_install_backends() {
-    # MSS_REPLACE_BACKEND reaches only the --check-only pass of a switch.
-    mss_replace=""
-    [ "${1:-}" != --check-only ] || mss_replace=$MSS_PICKER_REPLACE
-    sudo env \
-        MSS_REPLACE_BACKEND="$mss_replace" \
-        MSS_BACKENDS="$BACKENDS" \
-        OLLAMA_USER="$USER" \
-        OLLAMA_BIND="$BIND" \
-        OLLAMA_GPU_PERCENT="$GPU_PERCENT" \
-        LLAMACPP_BIN="${LLAMACPP_BIN:-}" \
-        LLAMACPP_MODEL="${LLAMACPP_MODEL:-}" \
-        LLAMACPP_MODEL_SHA256="${LLAMACPP_MODEL_SHA256:-}" \
-        LLAMACPP_HOST="${LLAMACPP_HOST:-}" \
-        LLAMACPP_PORT="${LLAMACPP_PORT:-}" \
-        LLAMACPP_ALLOW_FROM="${LLAMACPP_ALLOW_FROM:-}" \
-        LLAMACPP_API_KEY_FILE="${LLAMACPP_API_KEY_FILE:-}" \
-        LLAMACPP_CTX="${LLAMACPP_CTX:-}" \
-        LLAMACPP_PARALLEL="${LLAMACPP_PARALLEL:-}" \
-        LLAMACPP_EXTRA_ARGS="${LLAMACPP_EXTRA_ARGS:-}" \
-        DS4_BIN="${DS4_BIN:-}" \
-        DS4_MODEL="${DS4_MODEL:-}" \
-        DS4_MODEL_SHA256="${DS4_MODEL_SHA256:-}" \
-        DS4_HOST="${DS4_HOST:-}" \
-        DS4_PORT="${DS4_PORT:-}" \
-        DS4_ALLOW_FROM="${DS4_ALLOW_FROM:-}" \
-        DS4_CTX="${DS4_CTX:-}" \
-        DS4_BATCHED_SESSIONS="${DS4_BATCHED_SESSIONS:-}" \
-        DS4_WORKDIR="${DS4_WORKDIR:-}" \
-        DS4_EXTRA_ARGS="${DS4_EXTRA_ARGS:-}" \
-        MSS_GUARD_FREE_PCT="${MSS_GUARD_FREE_PCT:-}" \
-        MSS_GUARD_SWAP_HEADROOM_MB="${MSS_GUARD_SWAP_HEADROOM_MB:-}" \
-        MSS_GUARD_STREAK="${MSS_GUARD_STREAK:-}" \
-        MSS_LOG_MAX_MB="${MSS_LOG_MAX_MB:-}" \
-        /bin/sh "$REPO_DIR/scripts/install-backends.sh" "$@"
+# mss_check <install-backends args>: the root check or install; a sha256
+# mismatch (exit 3) keeps a file downloaded in this run as .sha-mismatch.
+mss_check() {
+    run_install_backends "$@"
+    mss_rc=$?
+    [ "$mss_rc" != 3 ] || mss_sha_mismatch_rename
+    return "$mss_rc"
 }
 
 # Validate before any system change.
 mss_validate_selection "$BACKENDS" || exit 1
 mss_validate_ipv4 "$BIND" || { mss_error "OLLAMA_BIND: '$BIND' must be a single IPv4 address"; exit 1; }
+case ${MSS_TUNE_MACOS:-} in ''|yes|no) ;; *) mss_error "MSS_TUNE_MACOS must be yes or no"; exit 1 ;; esac
+OLLAMA_EXE=${OLLAMA_BIN:-/usr/local/bin/ollama}
+if [ -n "${OLLAMA_BIN:-}" ]; then
+    mss_validate_path_chars OLLAMA_BIN "$OLLAMA_BIN" || exit 1
+    [ -f "$OLLAMA_BIN" ] && [ -x "$OLLAMA_BIN" ] || { mss_error "OLLAMA_BIN: not an executable file: $OLLAMA_BIN"; exit 1; }
+fi
+[ -z "${MSS_PROGRESS_SECONDS:-}" ] || mss_validate_uint MSS_PROGRESS_SECONDS "$MSS_PROGRESS_SECONDS" 1 60 || exit 1
+# D7: acquisition asked for by environment variables (the picker asks instead).
+if [ "$MSS_MODE" != picker ]; then
+    mss_d7_validate || exit 1
+    mss_d7_run || exit 1
+fi
 if [ "$MSS_FLAG" = --configure-only ]; then
-    run_install_backends --check-only || exit 1
+    mss_check --check-only || exit 1
     if [ -n "$MSS_PICKER_REPLACE" ]; then
         echo "$MSS_PICKER_REPLACE is still installed. install.sh --configure will offer to replace it." >&2
     fi
@@ -122,7 +112,7 @@ if [ "$MSS_FLAG" = --configure-only ]; then
     exit 0
 fi
 if mss_backend_selected llamacpp || mss_backend_selected ds4; then
-    run_install_backends --check-only || exit 1
+    mss_check --check-only || exit 1
 fi
 # A confirmed switch removes the old backend only now, after the check passed.
 if [ -n "$MSS_SWITCH_FROM" ]; then
@@ -144,14 +134,18 @@ chown "$USER:staff" "$BASE_DIR/logs"
 log_action "Making scripts executable..."
 chmod +x "$BASE_DIR/scripts/"*.sh
 
-# Run optimization script
-log_action "Running system optimization..."
-"$BASE_DIR/scripts/optimize-mac-server.sh"
+# Headless macOS tweaks (I2): asked once in the picker; unset keeps 1.4.0.
+if [ "${MSS_TUNE_MACOS:-}" = no ]; then
+    log_action "Skipping headless macOS tweaks (MSS_TUNE_MACOS=no; ./scripts/optimize-mac-server.sh applies them)"
+else
+    log_action "Running system optimization..."
+    "$BASE_DIR/scripts/optimize-mac-server.sh"
+fi
 
 # Install launch daemon
 log_action "Installing Ollama launch daemon..."
-# Replace user in plist file
-sed -e "s|<OLLAMA_USER>|$USER|g" -e "s|<OLLAMA_BIND>|$BIND|g" "$BASE_DIR/config/com.ollama.service.plist" > "/tmp/com.ollama.service.plist"
+# Replace user, bind address and binary in the plist file
+mss_render_ollama_plist "$BASE_DIR/config/com.ollama.service.plist" "$USER" "$BIND" "$OLLAMA_EXE" > "/tmp/com.ollama.service.plist"
 sudo cp "/tmp/com.ollama.service.plist" /Library/LaunchDaemons/
 rm "/tmp/com.ollama.service.plist"
 
@@ -170,8 +164,23 @@ sudo launchctl load -w /Library/LaunchDaemons/com.ollama.service.plist
 
 mss_is_loopback_host "$BIND" || \
     log_action "WARNING: Ollama is LAN-bound on $BIND (OLLAMA_BIND=127.0.0.1 makes it loopback-only)"
+
+# M2: the Ollama starter model, offered once the service is loaded (picker only).
+if [ "$MSS_MODE" = picker ]; then
+    if [ -x "$OLLAMA_EXE" ]; then
+        [ "$BIND" = 0.0.0.0 ] && mss_ollama_host=127.0.0.1 || mss_ollama_host=$BIND
+        mss_pick_ollama_model "$OLLAMA_EXE" "$mss_ollama_host"
+    else
+        echo "Ollama is not installed; later: brew install ollama, then scripts/install.sh" >&2
+    fi
+fi
 else
     log_action "Skipping Ollama (MSS_BACKENDS=$BACKENDS); an existing Ollama install is left untouched"
+    # Without Ollama the tweaks run only on an explicit yes (1.4.0 never ran them here).
+    if [ "${MSS_TUNE_MACOS:-}" = yes ]; then
+        log_action "Running system optimization..."
+        "$BASE_DIR/scripts/optimize-mac-server.sh"
+    fi
 fi
 
 # Install GPU memory optimization (if GPU_PERCENT is set)
@@ -246,7 +255,7 @@ fi
 # Optional backend (llamacpp or ds4), validated above.
 if mss_backend_selected llamacpp || mss_backend_selected ds4; then
     log_action "Installing optional backend (MSS_BACKENDS=$BACKENDS)..."
-    run_install_backends || exit 1
+    mss_check || exit 1
 fi
 
 log_action "Installation completed" 

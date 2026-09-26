@@ -34,7 +34,7 @@ if command -v shellcheck >/dev/null 2>&1; then
     else
         fail "shellcheck -s sh"
     fi
-    if shellcheck -S warning "$ROOT"/scripts/install.sh "$ROOT"/scripts/lib/mss-picker.sh; then ok "shellcheck install.sh + mss-picker.sh (bash)"; else fail "shellcheck install.sh + mss-picker.sh"; fi
+    if shellcheck -S warning "$ROOT"/scripts/install.sh "$ROOT"/scripts/model.sh "$ROOT"/scripts/lib/mss-picker.sh "$ROOT"/scripts/lib/mss-acquire.sh "$ROOT"/scripts/lib/mss-run.sh; then ok "shellcheck bash scripts"; else fail "shellcheck bash scripts"; fi
 else
     echo "skip - shellcheck not installed"
 fi
@@ -172,8 +172,8 @@ grep -q "^$PTMP/fix/ds4/model.gguf [0-9]* [0-9]* [0-9]* $(cat "$TMP/fix/ds4/mode
     && ok "ds4 stamp is path size inode mtime sha" || fail "ds4 stamp format"
 
 echo "== phase A: golden ollama render =="
-sed -e 's|<OLLAMA_USER>|mssgolden|g' -e 's|<OLLAMA_BIND>|0.0.0.0|g' \
-    "$ROOT/config/com.ollama.service.plist" > "$TMP/ollama-rendered.plist"
+mss_render_ollama_plist "$ROOT/config/com.ollama.service.plist" mssgolden 0.0.0.0 /usr/local/bin/ollama \
+    > "$TMP/ollama-rendered.plist"
 if cmp -s "$TMP/ollama-rendered.plist" "$ROOT/tests/golden/com.ollama.service.v1.2.0.plist"; then
     ok "ollama default render byte-identical to v1.2.0 golden"
 else
@@ -404,15 +404,170 @@ OUT=$(env MSS_BACKENDS=ds4 OLLAMA_USER="$TUSER" MSS_REPLACE_BACKEND=llamacpp DS4
     sh "$ROOT/scripts/install-backends.sh" --check-only 2>&1) && fail "A15 accepted a replace of a backend that is not installed" \
     || { printf '%s' "$OUT" | grep -q 'is not the installed optional backend' && ok "A15 refuses a replace of a backend that is not installed" || fail "A15: $OUT"; }
 
-echo "== phase A: picker on a pty (A3b, A12, A13) =="
+echo "== phase A: 1.5.0 pure functions and static checks (#15) =="
+. "$ROOT/scripts/lib/mss-acquire.sh"
+REPO_DIR=$ROOT
+check "catalogue starter" "qwen3-4b" "$(mss_catalog_ids llamacpp starter)"
+check "catalogue more (llama.cpp)" "gpt-oss-20b-mxfp4" "$(mss_catalog_ids llamacpp more)"
+check "catalogue more (ds4)" "qwen38-q2 qwen38-q4" "$(mss_catalog_ids ds4 more | tr '\n' ' ' | sed 's/ $//')"
+check "test rows are never menu rows" "" "$( { mss_catalog_ids llamacpp starter; mss_catalog_ids llamacpp more; } | grep stories260k)"
+check "catalogue URL pins the revision" \
+    "https://huggingface.co/ggml-org/models-moved/resolve/499bc8821c6b12b4e53c5bffcb21ec206f212d81/tinyllamas/stories260K.gguf" \
+    "$(mss_catalog_url llamacpp stories260k)"
+check_fail "catalogue: unknown id" mss_catalog_get llamacpp nope size
+check "sizes: 2.5 GB / 137 GiB / 165 GiB" "2.5 GB|137 GiB|165 GiB" \
+    "$(mss_human_size 2497280640)|$(mss_human_size 147207127040)|$(mss_human_size 177280286720)"
+check "free space via MSS_DF (A8)" "1073741824" "$(MSS_DF="$ROOT/tests/stubs/df-low" mss_free_bytes /)"
+MSS_SW_VERS="$ROOT/tests/stubs/sw-vers-14" mss_ds4_missing_prereqs | grep -q '^macOS 15 or later (this Mac runs 14.7.1)' \
+    && ok "the ds4 build needs macOS 15, naming this Mac's version" || fail "ds4 macOS gate on 14"
+MSS_SW_VERS="$ROOT/tests/stubs/sw-vers-15" mss_ds4_missing_prereqs | grep -q 'macOS' \
+    && fail "macOS 15 refused by the ds4 gate" || ok "macOS 15 passes the ds4 gate"
+OUT=$(MSS_SW_VERS="$ROOT/tests/stubs/sw-vers-14" mss_acquire_ds4_build "$TMP/ds4-on-14" 2>&1) && fail "ds4 built on macOS 14" \
+    || { printf '%s' "$OUT" | grep -q 'needs: macOS 15 or later (this Mac runs 14.7.1)' && [ ! -e "$TMP/ds4-on-14" ] \
+        && ok "on macOS 14 the ds4 build is refused before any clone" || fail "ds4 on 14: $OUT"; }
+check_fail "an http:// URL is refused (A10)" mss_url_valid http://example.com/m.gguf
+( unset DS4_BIN DS4_BUILD_DIR LLAMACPP_BREW_INSTALL DS4_MODEL_URL DS4_MODEL_SHA256
+  LLAMACPP_MODEL_URL=https://example.com/m.gguf mss_d7_validate ) >/dev/null 2>&1 \
+    && fail "a URL without a sha256 is accepted (A10)" || ok "a URL without a sha256 is refused before any network call (A10)"
+( unset DS4_BUILD_DIR LLAMACPP_MODEL_URL DS4_MODEL_URL
+  DS4_BIN=/x DS4_BUILD_DIR=/y mss_d7_validate ) >/dev/null 2>&1 \
+    && fail "DS4_BIN with DS4_BUILD_DIR accepted (A13)" || ok "DS4_BIN with DS4_BUILD_DIR is refused (A13)"
+( unset DS4_BIN DS4_BUILD_DIR LLAMACPP_MODEL_URL
+  DS4_MODEL_URL=catalog:nope mss_d7_validate ) >/dev/null 2>&1 \
+    && fail "an unknown catalogue id accepted" || ok "an unknown catalogue id is refused"
+printf 'MSS_BACKENDS=ds4\nDS4_MODEL_URL=catalog:qwen38-q4\n' > "$EFT/d7.env"; chmod 600 "$EFT/d7.env"
+OUT=$(mss_envfile_load "$EFT/d7.env" 2>&1) && fail "backends.env accepted DS4_MODEL_URL (A14)" \
+    || { printf '%s' "$OUT" | grep -q 'unknown key DS4_MODEL_URL' && ok "backends.env rejects DS4_MODEL_URL (A14)" || fail "A14: $OUT"; }
+# A15: every curl in these files is HTTPS-only for the request and for redirects; the Homebrew
+# installer fetch needs --proto only. sudo in mss-acquire.sh is the CLT install alone.
+BADCURL=$(grep -n 'curl ' "$ROOT/bootstrap.sh" "$ROOT/scripts/lib/mss-acquire.sh" "$ROOT/scripts/model.sh" \
+    | grep -v '^[^:]*:[0-9]*:[[:space:]]*#' | grep -Ev 'printf|echo|mss_brew_install_cmd|manual:|mss_error|mssb_say|mssb_die' \
+    | grep -v "\-\-proto '=https'" || true)
+BADREDIR=$(grep -n '/usr/bin/curl\|MSSB_CURL' "$ROOT/bootstrap.sh" "$ROOT/scripts/lib/mss-acquire.sh" \
+    | grep -v "MSS_BREW_INSTALLER\"\\|--proto-redir '=https'" | grep -v '^[^:]*:[0-9]*:[[:space:]]*#' || true)
+[ -z "$BADCURL$BADREDIR" ] && ok "A15 curl calls are HTTPS-only" || fail "A15 curl: $BADCURL $BADREDIR"
+check "A15 sudo in mss-acquire.sh is the CLT install only" 'sudo softwareupdate -i "$label" >&2' \
+    "$(grep -v '^[[:space:]]*#' "$ROOT/scripts/lib/mss-acquire.sh" | grep -o 'sudo .*' | sed 's/[[:space:]]*$//' | tr '\n' '|' | sed 's/|$//')"
+"$ROOT/scripts/install.sh" --help 2>&1 | grep -q 'may leave a verification stamp' \
+    && ok "install.sh --help mentions the verification stamp" || fail "install.sh --help wording"
+
+echo "== phase A: bootstrap.sh (B1a, B5) =="
+sh -n "$ROOT/bootstrap.sh" && ok "bootstrap.sh sh -n" || fail "bootstrap.sh sh -n"
+if command -v shellcheck >/dev/null 2>&1; then
+    shellcheck -S warning -s sh "$ROOT/bootstrap.sh" && ok "shellcheck -s sh bootstrap.sh" || fail "shellcheck bootstrap.sh"
+fi
+check "the last non-comment line calls main" 'main "$@"' "$(grep -v '^[[:space:]]*#' "$ROOT/bootstrap.sh" | grep -v '^[[:space:]]*$' | tail -n 1)"
+BS="$TMP/bootstrap"; mkdir -p "$BS"
+sed '$d' "$ROOT/bootstrap.sh" > "$BS/lib.sh"
+printf '#!/bin/sh\nwhile [ $# -gt 0 ]; do case $1 in -o) o=$2; shift 2 ;; *) shift ;; esac; done\ncp "$MSSB_FAKE_RAW" "$o"\n' > "$BS/curl"
+chmod +x "$BS/curl"
+cp "$ROOT/bootstrap.sh" "$BS/same.sh"
+{ cat "$ROOT/bootstrap.sh"; printf ' '; } > "$BS/onebyte.sh"
+sed 's/^MSS_TAG=.*/MSS_TAG=v0.0.0/' "$ROOT/bootstrap.sh" > "$BS/tag.sh"
+B5SHA=0123456789abcdef0123456789abcdef01234567
+b5() { ( . "$BS/lib.sh"; MSSB_CURL="$BS/curl" MSSB_FAKE_RAW=$1 mssb_verify "$2" "$3" "$4" ) >/dev/null 2>&1; }
+TAG=$(sed -n 's/^MSS_TAG=//p' "$ROOT/bootstrap.sh")
+b5 "$BS/same.sh" "$TAG" "$BS/same.sh" x && ok "B5 accepts an identical copy at the tag" || fail "B5 identical copy refused"
+b5 "$BS/same.sh" "$B5SHA" "$BS/same.sh" "$B5SHA" && ok "B5 accepts an identical copy at a 40-hex ref" || fail "B5 40-hex refused"
+b5 "$BS/onebyte.sh" "$TAG" "$BS/same.sh" x && fail "B5 accepted a 1-byte difference" || ok "B5 refuses a raw file 1 byte off"
+b5 "$BS/tag.sh" "$TAG" "$BS/tag.sh" x && fail "B5 accepted another MSS_TAG line" || ok "B5 refuses an MSS_TAG mismatch"
+b5 "$BS/same.sh" main "$BS/same.sh" x && fail "B5 accepted --ref main" || ok "B5 refuses --ref main"
+b5 "$BS/same.sh" 0123456 "$BS/same.sh" 0123456 && fail "B5 accepted a 7-character sha" || ok "B5 refuses a 7-character sha"
+b5 "$BS/same.sh" "$B5SHA" "$BS/same.sh" "$(printf 'f%.0s' $(seq 40))" && fail "B5 accepted a commit that is not the ref" \
+    || ok "B5 refuses a clone at another commit"
+
+echo "== phase A: waiting for a model (M4, M6) =="
+check_fail "an empty model is the 1.4.0 error without MSS_DEFER_MODEL (M6)" \
+    render llamacpp "$TMP/m6-unset" LLAMACPP_MODEL= LLAMACPP_MODEL_SHA256=
+if render llamacpp "$TMP/m6-yes" MSS_DEFER_MODEL=yes LLAMACPP_MODEL= LLAMACPP_MODEL_SHA256= >/dev/null 2>&1; then
+    ok "MSS_DEFER_MODEL=yes renders without a model (M6)"
+    grep -qx 'MSS_MODEL_STATE=waiting' "$TMP/m6-yes/backends.conf" && grep -qx 'MSS_GUARD_BACKEND=llamacpp' "$TMP/m6-yes/backends.conf" \
+        && ok "conf says waiting and keeps MSS_GUARD_BACKEND (M3)" || fail "waiting conf: $(cat "$TMP/m6-yes/backends.conf")"
+    [ ! -e "$TMP/m6-yes/com.mac-studio-server.llamacpp.plist" ] && [ ! -e "$TMP/m6-yes/com.mac-studio-server.guard.plist" ] \
+        && [ ! -e "$TMP/m6-yes/llamacpp.model.verified" ] && ok "no backend or guard plist and no stamp (M3)" || fail "waiting render wrote jobs: $(ls "$TMP/m6-yes")"
+    OUT=$(MSS_CONF="$TMP/m6-yes/backends.conf" sh "$ROOT/scripts/status.sh" 2>&1); RC=$?
+    check "status on a waiting llama.cpp exits 0 (M4)" 0 "$RC"
+    printf '%s' "$OUT" | grep -qx 'llamacpp: waiting for a model (run scripts/model.sh)' && ok "status prints the waiting line (M4)" || fail "M4: $OUT"
+else
+    fail "MSS_DEFER_MODEL=yes render: $(render llamacpp "$TMP/m6-yes" MSS_DEFER_MODEL=yes LLAMACPP_MODEL= 2>&1 | tail -1)"
+fi
+# the render-only output with the variable unset stays 1.4.0's (A3)
+render llamacpp "$TMP/m6-parity" >/dev/null 2>&1
+grep -q MSS_MODEL_STATE "$TMP/m6-parity/backends.conf" && fail "MSS_MODEL_STATE written without MSS_DEFER_MODEL" \
+    || ok "no MSS_MODEL_STATE without MSS_DEFER_MODEL"
+
+echo "== phase A: model.sh without a terminal (M7) =="
+M7="$TMP/m7"; mkdir -p "$M7"
+MSS_ENV_FILE="$M7/b.env" HOME="$M7" "$ROOT/scripts/model.sh" --catalog stories260k </dev/null >"$M7/out" 2>&1
+check "model.sh without a terminal exits 2 (M7)" 2 $?
+grep -q 'model.sh needs a terminal' "$M7/out" && ok "M7 says it needs a terminal" || fail "M7: $(cat "$M7/out")"
+[ -z "$(ls -A "$M7" | grep -v '^out$')" ] && ok "M7 created nothing" || fail "M7 created: $(ls -A "$M7")"
+
+echo "== phase A: one hash, as root only a stamp (D6, U3) =="
+if [ "$(uname)" = Darwin ] && [ "$(id -u)" -ne 0 ]; then
+    U3="$TMP/u3"; mkdir -p "$U3"; mkfile 4g "$U3/big.gguf"
+    U3SHA=$(shasum -a 256 "$U3/big.gguf" | awk '{print $1}')
+    env MSS_BACKENDS=ds4 OLLAMA_USER="$(id -un)" MSS_PROGRESS_SECONDS=1 DS4_BIN="$TMP/fix/ds4/ds4-server" \
+        DS4_MODEL="$U3/big.gguf" DS4_MODEL_SHA256="$U3SHA" DS4_PORT=18999 \
+        sh "$ROOT/scripts/install-backends.sh" --check-only >"$U3/log" 2>&1
+    check "4 GiB check passes (U3)" 0 $?
+    PROG=$(grep -c '^hashing ds4 model: [0-9.]* / 4.0 GiB$' "$U3/log")
+    [ "$PROG" -ge 2 ] && ok "U3 $PROG progress lines at 1 s" || fail "U3 progress lines: $PROG ($(cat "$U3/log"))"
+    check "U3 exactly one done line" 1 "$(grep -c '^hashing ds4 model: done (4.0 GiB)$' "$U3/log")"
+    rm -f "$U3/big.gguf"
+    env MSS_BACKENDS=ds4 OLLAMA_USER="$(id -un)" DS4_BIN="$TMP/fix/ds4/ds4-server" DS4_MODEL="$TMP/fix/ds4/model.gguf" \
+        DS4_MODEL_SHA256="$(cat "$TMP/fix/ds4/model.sha")" DS4_PORT=18999 \
+        sh "$ROOT/scripts/install-backends.sh" --check-only >"$U3/small" 2>&1
+    check "a small model logs only the done line (U3)" "hashing ds4 model: done (0.0 GiB)" "$(grep '^hashing' "$U3/small")"
+    [ ! -e /var/db/mac-studio-server/ds4.model.verified ] || [ /var/db/mac-studio-server/ds4.model.verified -ot "$U3/small" ] \
+        && ok "a non-root check writes no stamp (D6)" || fail "a non-root check wrote a stamp"
+else
+    echo "skip - U3 needs macOS (mkfile, BSD dd) and a non-root user"
+fi
+
+echo "== phase A: docs (R1, R2, S2, S3) =="
+R1=$(awk '/^# /{s="title"} /^## /{s=$0} NF{c[s]++} END{for (k in c) print k"|"c[k]}' "$ROOT/README.md")
+cap() { printf '%s\n' "$R1" | awk -F'|' -v k="$1" '$1==k{print $2}'; }
+check "README sections in order (R1)" \
+    "## Install|## What the installer asks|## After install|## Options|## Requirements|## Updates|## Contributing|## License" \
+    "$(grep '^## ' "$ROOT/README.md" | tr '\n' '|' | sed 's/|$//')"
+for sc in "title:3:1" "## Install:8:0" "## What the installer asks:12:0" "## After install:12:0" "## Options:25:0" \
+    "## Requirements:5:0" "## Updates:6:0"; do
+    name=${sc%%:*}; rest=${sc#*:}; max=${rest%%:*}; extra=${rest#*:}
+    n=$(cap "$name"); n=$(( ${n:-0} - extra ))
+    [ "$n" -le "$max" ] && ok "README '$name' within $max lines ($n)" || fail "README '$name' has $n lines, cap $max"
+done
+check "README Contributing + License within 4 lines" "4" "$(( $(cap '## Contributing') + $(cap '## License') ))"
+[ "$(wc -l < "$ROOT/README.md")" -le 120 ] && ok "README ≤ 120 lines" || fail "README is $(wc -l < "$ROOT/README.md") lines"
+for gone in 'launchctl unload' 'sudo cp config/' 'Customizing Configuration' 'Performance Considerations' 'Troubleshooting Docker'; do
+    grep -q "$gone" "$ROOT/README.md" && fail "README still has '$gone' (R2)" || ok "README has no '$gone' (R2)"
+done
+awk '/^## Options/{f=1;next} /^## /{f=0} f' "$ROOT/README.md" | grep -q '0\.0\.0\.0.*OLLAMA_BIND=127\.0\.0\.1' \
+    && ok "README Options keeps the Ollama exposure line (R2)" || fail "README exposure line missing"
+for word in OLLAMA_BIND ./scripts/optimize-mac-server.sh OLLAMA_GPU_PERCENT DOCKER_AUTOSTART; do
+    grep -q -- "$word" "$ROOT/docs/options.md" && ok "docs/options.md has $word (R2, F6)" || fail "docs/options.md lacks $word"
+done
+[ "$(wc -l < "$ROOT/docs/options.md")" -le 80 ] && ok "docs/options.md ≤ 80 lines" || fail "docs/options.md too long"
+S2=$(awk '/^## \[1\.5\.0\]/{f=1;next} /^## \[/{f=0} f && /^- /' "$ROOT/CHANGELOG.md")
+[ "$(printf '%s\n' "$S2" | grep -c .)" -le 5 ] && ok "CHANGELOG 1.5.0 has ≤ 5 bullets (S2)" || fail "CHANGELOG bullets: $S2"
+[ -z "$(printf '%s\n' "$S2" | awk 'length($0) > 100')" ] && ok "CHANGELOG bullets ≤ 100 characters (S2)" || fail "long CHANGELOG bullet"
+printf '%s\n' "$S2" | grep -Eq '\.sh|/|\(\)|_[a-z]' && fail "CHANGELOG names internals (S2)" || ok "CHANGELOG names no internals (S2)"
+printf '%s\n' "$S2" | grep -qi 'headless.*asked once' && ok "CHANGELOG says the headless tweaks are asked once (F6)" || fail "F6 CHANGELOG line"
+S3=$(awk '/^## One-line install/{f=1} /^## Status/{f=0} f' "$ROOT/docs/backends.md" | wc -l)
+[ "$S3" -le 30 ] && ok "docs/backends.md new section ≤ 30 lines ($S3) (S3)" || fail "docs/backends.md section is $S3 lines"
+grep -q "configure-only.*may leave a verification stamp" "$ROOT/docs/backends.md" && ok "backends.md --configure-only wording (S3)" || fail "S3 wording"
+
+echo "== phase A: picker on a pty (A3b, A12, A13, F5, M4, I2) =="
 if [ "$(id -u)" -eq 0 ]; then
     echo "skip - picker tests need a non-root user (interactive modes refuse root)"
 elif ! command -v expect >/dev/null 2>&1; then
     fail "expect is not installed (the picker tests need it)"
 else
-    # sudo runs the --check-only pass as this user here: no system change.
+    # sudo runs the --check-only pass as this user here: no system change. -v (the run's one
+    # password prompt) and the keep-alive's -n pass through.
     mkdir -p "$TMP/nosudo"
-    printf '#!/bin/sh\nexec "$@"\n' > "$TMP/nosudo/sudo"; chmod +x "$TMP/nosudo/sudo"
+    printf '#!/bin/sh\ncase $1 in -v) exit 0 ;; -n) shift ;; esac\nexec "$@"\n' > "$TMP/nosudo/sudo"; chmod +x "$TMP/nosudo/sudo"
+    cp "$ROOT/tests/stubs/fake-ollama.sh" "$TMP/nosudo/ollama"; chmod +x "$TMP/nosudo/ollama"
     PK="$TMP/picker"; mkdir -p "$PK"
     drive() { # drive <name> <steps...> -- <env...>: run install.sh on a pty
         _name=$1; shift
@@ -432,16 +587,18 @@ else
     check "3 bad menu answers exit 2 (A12)" 2 $?
     [ ! -e "$PK/menu3.env" ] && ok "3 bad menu answers write nothing (A12)" || fail "A12 menu wrote a file"
 
-    drive noallow "Choose [1]: ${T}5" "binary path: ${T}$DS4B" "(.gguf) path: ${T}$DS4M" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" \
+    drive noallow "Choose [1]: ${T}5" "later [4]: ${T}3" "path or https URL: ${T}$DS4M" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" \
         "LAN access to ds4? [y/N]: ${T}y" "listen on [192.0.2.10]: ${T}@ENTER" \
-        "(space-separated): ${T}@ENTER" "(space-separated): ${T}@ENTER" "(space-separated): ${T}@ENTER" -- MSS_ENV_FILE="$PK/noallow.env"
+        "(space-separated): ${T}@ENTER" "(space-separated): ${T}@ENTER" "(space-separated): ${T}@ENTER" -- \
+        MSS_ENV_FILE="$PK/noallow.env" DS4_BIN="$DS4B"
     check "LAN ds4 with an empty allowlist cannot complete (A12)" 2 $?
     [ ! -e "$PK/noallow.env" ] && ok "LAN ds4 with an empty allowlist writes nothing" || fail "A12 allowlist wrote a file"
 
-    drive keyfile "Choose [1]: ${T}4" "binary path${T}$LLB" "(.gguf) path: ${T}$LLM" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" \
+    drive keyfile "Choose [1]: ${T}4" "later [1]: ${T}3" "path or https URL: ${T}$LLM" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" \
         "LAN access to llamacpp? [y/N]: ${T}y" "listen on [192.0.2.10]: ${T}@ENTER" \
         "use an allowlist instead): ${T}sk-test123" "use an allowlist instead): ${T}@ENTER" \
-        "(space-separated): ${T}192.0.2.99" "Port [8080]: ${T}@ENTER" "Save? [Y/n]: ${T}n" -- MSS_ENV_FILE="$PK/keyfile.env"
+        "(space-separated): ${T}192.0.2.99" "auto-updates)? ${T}@ENTER" "Save? [Y/n]: ${T}n" -- \
+        MSS_ENV_FILE="$PK/keyfile.env" LLAMACPP_BIN="$LLB"
     check "declining the summary exits 1" 1 $?
     grep -q 'not the key itself' "$PK/keyfile.transcript" && ok "key prompt rejects a key typed as a path (A12)" || fail "A12 key prompt: $(tail -5 "$PK/keyfile.transcript")"
     # once is the terminal echoing the typed answer; any more is the installer printing it
@@ -451,24 +608,61 @@ else
     LEAK=$(grep -l 'sk-test123' "$PK"/*.env "$ROOT/backends.env" /usr/local/etc/mac-studio-server/backends.conf 2>/dev/null || true)
     [ -z "$LEAK" ] && ok "the rejected key is in no file (A12)" || fail "sk-test123 found in: $LEAK"
 
-    drive intr "Choose [1]: ${T}5" "binary path: ${T}$DS4B" "(.gguf) path: ${T}@INTR" -- MSS_ENV_FILE="$PK/intr.env"
+    drive intr "Choose [1]: ${T}5" "later [4]: ${T}3" "path or https URL: ${T}@INTR" -- MSS_ENV_FILE="$PK/intr.env" DS4_BIN="$DS4B"
     check "Ctrl-C at the model prompt exits 130 (A13)" 130 $?
     [ ! -e "$PK/intr.env" ] && ok "Ctrl-C writes nothing (A13)" || fail "A13 wrote a file"
 
-    drive envdef "Choose [5]: ${T}@ENTER" "binary path: ${T}$DS4B" "(.gguf) path: ${T}$DS4M" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" \
-        "LAN access to ds4? [y/N]: ${T}@ENTER" "Port [8001]: ${T}@ENTER" "Save? [Y/n]: ${T}@ENTER" -- \
-        MSS_ENV_FILE="$PK/envdef.env" MSS_BACKENDS=ds4 DS4_PORT=8001
+    drive envdef "Choose [5]: ${T}@ENTER" "later [4]: ${T}3" "path or https URL: ${T}$DS4M" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" \
+        "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" "Save? [Y/n]: ${T}@ENTER" -- \
+        MSS_ENV_FILE="$PK/envdef.env" MSS_BACKENDS=ds4 DS4_PORT=8001 DS4_BIN="$DS4B"
     check "--configure-only with MSS_BACKENDS set shows the menu with env defaults (A3b)" 0 $?
     grep -q '^MSS_BACKENDS=ds4$' "$PK/envdef.env" 2>/dev/null && grep -q '^DS4_PORT=8001$' "$PK/envdef.env" \
         && ok "A3b saved MSS_BACKENDS=ds4 and DS4_PORT=8001" || fail "A3b saved: $(cat "$PK/envdef.env" 2>&1)"
     check "A3b file mode 0600" 600 "$(stat -f '%Lp' "$PK/envdef.env" 2>/dev/null)"
     grep -q "^DS4_MODEL_SHA256=$DS4S\$" "$PK/envdef.env" && ok "A3b saved the computed sha256" || fail "A3b sha"
+    grep -q 'Port' "$PK/envdef.transcript" && fail "the port was asked (I6)" || ok "no port prompt (I6)"
 
-    drive saved "Choose [5]: ${T}@ENTER" "binary path [$DS4B]: ${T}@ENTER" "(.gguf) path [$DS4M]: ${T}@ENTER" \
-        "c computes it now) [$DS4S]: ${T}@ENTER" "LAN access to ds4? [y/N]: ${T}@ENTER" "Port [8001]: ${T}@ENTER" \
-        "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/envdef.env"
+    drive saved "Choose [5]: ${T}@ENTER" "(.gguf) path [$DS4M]: ${T}@ENTER" \
+        "c computes it now) [$DS4S]: ${T}@ENTER" "LAN access to ds4? [y/N]: ${T}@ENTER" \
+        "auto-updates)? ${T}@ENTER" "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/envdef.env"
     check "--configure-only reuses every saved answer as its default" 0 $?
     grep -q 'Hashing' "$PK/saved.transcript" && fail "a saved sha256 was re-hashed by the picker" || ok "a saved sha256 is not re-hashed by the picker"
+    grep -q 'binary path' "$PK/saved.transcript" && fail "a saved binary was asked for again (I7)" || ok "a saved binary is used without asking (I7)"
+
+    # F5: a llama-server found on PATH and the default port: neither is asked.
+    mkdir -p "$TMP/found"; cp "$ROOT/tests/stubs/fake-server.sh" "$TMP/found/llama-server"; chmod +x "$TMP/found/llama-server"
+    drive found "Choose [1]: ${T}4" "later [1]: ${T}4" "LAN access to llamacpp? [y/N]: ${T}@ENTER" \
+        "auto-updates)? ${T}@ENTER" "Save? [Y/n]: ${T}@ENTER" -- \
+        MSS_ENV_FILE="$PK/found.env" PATH="$TMP/found:$TMP/nosudo:$PATH"
+    check "F5 found llama-server, later" 0 $?
+    grep -q 'binary path\|Port' "$PK/found.transcript" && fail "F5 asked for the binary or the port" || ok "F5 no binary or port prompt"
+    grep -q "^LLAMACPP_BIN=$TMP/found/llama-server\$" "$PK/found.env" && grep -q '^LLAMACPP_PORT=8080$' "$PK/found.env" \
+        && ok "F5 saved the found binary and port 8080" || fail "F5 saved: $(cat "$PK/found.env")"
+    grep -q '^MSS_DEFER_MODEL=yes$' "$PK/found.env" && ok "later saves MSS_DEFER_MODEL=yes (M3)" || fail "later not saved"
+    grep -q '^MSS_TUNE_MACOS=no$' "$PK/found.env" && ok "I2 is asked without Ollama too and saved as no (A1)" || fail "I2 without Ollama"
+
+    # M4: ds4 with nothing found: the build offer (declined), the manual command, then the menu.
+    drive ds4menu "Choose [1]: ${T}5" "in ~/ds4? [y/N]: ${T}@ENTER" "binary path: ${T}$DS4B" "later [4]: ${T}@ENTER" \
+        "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" "Save? [Y/n]: ${T}@ENTER" -- \
+        MSS_ENV_FILE="$PK/ds4menu.env" HOME="$PK/home"
+    check "M4 ds4 with the build declined and a model later" 0 $?
+    grep -q 'no small one exists).*later \[4\]: ' "$PK/ds4menu.transcript" && ok "M4 ds4 menu says no small model and defaults to later" \
+        || fail "M4 menu: $(grep 'ds4 (' "$PK/ds4menu.transcript")"
+    grep -q '^manual: git clone https://github.com/antirez/ds4.git' "$PK/ds4menu.transcript" && ok "declining the build prints the manual command" \
+        || fail "no manual build command"
+    [ ! -e "$PK/home/ds4" ] && ok "declining the build creates nothing" || fail "declined build created ~/ds4"
+
+    # I2: with Ollama, the headless tweaks are asked once and saved; default no.
+    drive tweaks "Choose [1]: ${T}1" "auto-updates)? ${T}@ENTER" "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/tweaks.env"
+    check "I2 ollama only" 0 $?
+    grep -q '^MSS_TUNE_MACOS=no$' "$PK/tweaks.env" && ok "I2 saved MSS_TUNE_MACOS=no" || fail "I2 saved: $(cat "$PK/tweaks.env")"
+    grep -q "^OLLAMA_BIN=$TMP/nosudo/ollama\$" "$PK/tweaks.env" && ok "an ollama on PATH is saved as OLLAMA_BIN (P2)" || fail "P2 OLLAMA_BIN"
+    check "I2 asked once" 1 "$(grep -c 'headless macOS tweaks' "$PK/tweaks.transcript")"
+
+    # S4: prompt lines stay within 100 characters.
+    LONG=$(cat "$PK"/found.transcript "$PK"/ds4menu.transcript "$PK"/tweaks.transcript | tr -d '\r' \
+        | sed -n 's/^\(.*\]: \).*/\1/p' | awk 'length($0) > 100')
+    [ -z "$LONG" ] && ok "prompts ≤ 100 characters (S4)" || fail "long prompt: $LONG"
 fi
 echo
 echo "phase A: $PASS passed, $FAIL failed"
@@ -588,6 +782,13 @@ bdrive() {
     env MSS_ENV_FILE="$EFB" OLLAMA_USER="$(id -un)" "$@" MSS_EXPECT_TIMEOUT=180 \
         expect "$ROOT/tests/expect/drive.exp" "$PB/$_name.steps" "$PB/$_name.transcript" /bin/bash "$IS" $_args \
         >/dev/null 2>"$PB/$_name.err"
+    _rc=$?
+    # 124/125 are the driver's own timeout / early exit: show where the dialogue stopped.
+    if [ "$_rc" = 124 ] || [ "$_rc" = 125 ]; then
+        echo "--- $_name: $(cat "$PB/$_name.err"); transcript tail:"
+        tr -d '\r' < "$PB/$_name.transcript" | tail -n 12
+    fi
+    return "$_rc"
 }
 has() { grep -q -- "$2" "$PB/$1.transcript"; }
 
@@ -610,17 +811,28 @@ env MSS_BACKENDS=ds4 OLLAMA_USER="$(id -un)" OLLAMA_BIND=0.0.0.0 DS4_BIN="$DS4B"
 cmp -s "$CONFB" "$PB/a3r/backends.conf" && ok "A3 installed conf equals the render" || fail "A3 conf differs: $(diff "$CONFB" "$PB/a3r/backends.conf")"
 sudo sh "$ROOT/scripts/uninstall.sh" --backend ds4 >/dev/null 2>&1
 
-# A5: first run on a pty with no backends.env: llama.cpp only.
+# A PATH without llama-server, so "nothing found" is deterministic on any runner.
+PATH_NOLL=$(printf '%s\n' "$PATH" | tr ':' '\n' | while IFS= read -r d; do [ -x "$d/llama-server" ] || printf '%s:' "$d"; done)
+PATH_NOLL=${PATH_NOLL%:}
+LOGS="$HOME/mac-studio-server/logs"
+
+# A5 / A1 / U2: first run on a pty with no backends.env, llama.cpp only. Nothing is found, the
+# brew offer is declined, the path is asked, and the model is the user's own file.
 rm -f "$EFB"
-bdrive a5ll "" "Choose [1]: ${T}4" "binary path${T}$LLB" "(.gguf) path: ${T}$LLM" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" \
-    "LAN access to llamacpp? [y/N]: ${T}@ENTER" "Port [8080]: ${T}18080" "Install with these settings? [Y/n]: ${T}@ENTER" --
+bdrive a5ll "" "Choose [1]: ${T}4" "brew install llama.cpp)? [y/N]: ${T}n" "binary path: ${T}$LLB" "later [1]: ${T}3" \
+    "path or https URL: ${T}$LLM" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" "LAN access to llamacpp? [y/N]: ${T}@ENTER" \
+    "auto-updates)? ${T}n" "Install with these settings? [Y/n]: ${T}@ENTER" -- LLAMACPP_PORT=18080 PATH="$PATH_NOLL"
 check "A5 first-run picker install (llama.cpp only)" 0 $?
 check "A5 backends.env mode and owner" "600 $(id -un)" "$(stat -f '%Lp %Su' "$EFB" 2>/dev/null)"
 loaded com.mac-studio-server.llamacpp && loaded com.mac-studio-server.guard && ! loaded com.mac-studio-server.ds4 \
     && ok "A5 labels match llama.cpp only" || fail "A5 labels: $(daemons)"
 wait_listen 18080 && ok "A5 llama.cpp stub listening" || fail "A5 llama.cpp stub not listening"
+has a5ll '^manual: brew install llama.cpp' && ok "A1 declining brew prints the manual command" || fail "A1 manual command"
+check "U2 exactly one hashing line across check and install" 1 "$(tr -d '\r' < "$PB/a5ll.transcript" | grep -c '^hashing llamacpp model')"
+grep -q '^MSS_TUNE_MACOS=no$' "$EFB" && ok "A1 saved MSS_TUNE_MACOS=no" || fail "A1 MSS_TUNE_MACOS: $(cat "$EFB")"
 
-# A6: re-run with the saved file: no prompts, same conf, no re-hash.
+# A6 / A5: re-run with the saved file: no prompts (the password is not asked with NOPASSWD
+# sudo), same conf, no hash.
 cp "$CONFB" "$PB/conf.a5"
 bdrive a6 "" --
 check "A6 re-run with saved backends.env" 0 $?
@@ -637,52 +849,57 @@ check "A7 conf differs only in LLAMACPP_PORT" "<LLAMACPP_PORT=18080 >LLAMACPP_PO
     "$(diff "$PB/conf.a5" "$CONFB" | sed -n 's/^\([<>]\) /\1/p' | tr '\n' ' ')"
 wait_listen 18081 && ok "A7 llama.cpp moved to 18081" || fail "A7 not listening on 18081"
 
-# A10c: --configure-only choosing ds4 while llama.cpp is installed.
+# A10c: --configure-only choosing ds4 while llama.cpp is installed. The ds4 build is declined.
 BEFORE=$(daemons)
-bdrive a10c "--configure-only" "Choose [4]: ${T}5" "binary path: ${T}$DS4B" "(.gguf) path: ${T}$DS4M" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" \
-    "LAN access to ds4? [y/N]: ${T}@ENTER" "Port [8000]: ${T}18000" "Save? [Y/n]: ${T}@ENTER" --
+bdrive a10c "--configure-only" "Choose [4]: ${T}5" "in ~/ds4? [y/N]: ${T}n" "binary path: ${T}$DS4B" "later [4]: ${T}3" \
+    "path or https URL: ${T}$DS4M" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" "LAN access to ds4? [y/N]: ${T}@ENTER" \
+    "auto-updates)? ${T}@ENTER" "Save? [Y/n]: ${T}@ENTER" -- DS4_PORT=18000
 check "A10c --configure-only with another backend installed" 0 $?
 has a10c 'Remove it first' && fail "A10c asked the switch question" || ok "A10c no switch question"
 has a10c 'install.sh --configure will offer to replace it' && ok "A10c message names install.sh --configure" || fail "A10c message missing"
 grep -q '^MSS_BACKENDS=ds4$' "$EFB" && ok "A10c saved MSS_BACKENDS=ds4" || fail "A10c saved: $(grep MSS_BACKENDS "$EFB")"
 loaded com.mac-studio-server.llamacpp && ok "A10c llama.cpp still loaded" || fail "A10c llama.cpp gone"
 check "A10c /Library/LaunchDaemons unchanged" "$BEFORE" "$(daemons)"
+[ -e "$HOME/ds4" ] && fail "A10c the declined build created ~/ds4" || ok "A10c the declined build created nothing"
 
 # A9: --configure switch to ds4, answer n.
 BEFORE=$(daemons); cp "$CONFB" "$PB/conf.a9"
-bdrive a9 "--configure" "Choose [4]: ${T}5" "binary path [$DS4B]: ${T}@ENTER" "(.gguf) path [$DS4M]: ${T}@ENTER" \
-    "c computes it now) [$DS4S]: ${T}@ENTER" "LAN access to ds4? [y/N]: ${T}@ENTER" "Port [18000]: ${T}@ENTER" \
+bdrive a9 "--configure" "Choose [4]: ${T}5" "(.gguf) path [$DS4M]: ${T}@ENTER" "c computes it now) [$DS4S]: ${T}@ENTER" \
+    "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" \
     "Install with these settings? [Y/n]: ${T}@ENTER" "--backend llamacpp? [y/N]: ${T}n" --
 check "A9 declining the switch exits 1" 1 $?
+has a9 'binary path' && fail "A9 asked for a saved binary (I7)" || ok "A9 a saved binary is not asked (I7)"
 loaded com.mac-studio-server.llamacpp && wait_listen 18081 && ok "A9 llama.cpp still running" || fail "A9 llama.cpp not running"
 check "A9 /Library/LaunchDaemons unchanged" "$BEFORE" "$(daemons)"
 cmp -s "$CONFB" "$PB/conf.a9" && ok "A9 backends.conf unchanged" || fail "A9 conf changed"
 
-# A10: switch with a wrong ds4 sha256, answer y: stops at the check.
-bdrive a10 "--configure" "Choose [4]: ${T}5" "binary path [$DS4B]: ${T}@ENTER" "(.gguf) path [$DS4M]: ${T}@ENTER" \
-    "c computes it now) [$DS4S]: ${T}$ZERO" "LAN access to ds4? [y/N]: ${T}@ENTER" "Port [18000]: ${T}@ENTER" \
+# A10 / A9 (sha): switch with a wrong ds4 sha256, answer y: stops at the check with exit 1.
+bdrive a10 "--configure" "Choose [4]: ${T}5" "(.gguf) path [$DS4M]: ${T}@ENTER" "c computes it now) [$DS4S]: ${T}$ZERO" \
+    "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" \
     "Install with these settings? [Y/n]: ${T}@ENTER" "--backend llamacpp? [y/N]: ${T}y" --
 check "A10 wrong sha stops the switch with exit 1" 1 $?
 has a10 'sha256 mismatch' && ok "A10 failed at the check" || fail "A10 did not fail at the check"
 has a10 'Removing llamacpp' && fail "A10 ran uninstall" || ok "A10 uninstall never ran"
+[ -e "$DS4M" ] && [ ! -e "$DS4M.sha-mismatch" ] && ok "A10 a model not downloaded in this run is never renamed" || fail "A10 renamed the user's model"
 loaded com.mac-studio-server.llamacpp && wait_listen 18081 && ok "A10 llama.cpp still running" || fail "A10 llama.cpp not running"
 
-# A10b: a foreign listener on ds4's port stops the switch at the sudo check.
+# A10b / F7 (switch): a foreign listener on ds4's port stops the switch at the root check.
 nc -l 127.0.0.1 18000 >/dev/null 2>&1 &
 NCPID=$!
 sleep 1
-bdrive a10b "--configure" "Choose [4]: ${T}5" "binary path [$DS4B]: ${T}@ENTER" "(.gguf) path [$DS4M]: ${T}@ENTER" \
-    "c computes it now) [$ZERO]: ${T}$DS4S" "LAN access to ds4? [y/N]: ${T}@ENTER" "Port [18000]: ${T}@ENTER" \
+bdrive a10b "--configure" "Choose [4]: ${T}5" "(.gguf) path [$DS4M]: ${T}@ENTER" "c computes it now) [$ZERO]: ${T}$DS4S" \
+    "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" \
     "Install with these settings? [Y/n]: ${T}@ENTER" "--backend llamacpp? [y/N]: ${T}y" --
 check "A10b foreign listener stops the switch with exit 1" 1 $?
-has a10b "bound by pid(s) $NCPID" && ok "A10b names the foreign PID" || fail "A10b: $(grep -i 'bound' "$PB/a10b.transcript")"
+has a10b "port 18000 is in use (pid $NCPID); set DS4_PORT in backends.env and re-run" && ok "A10b names the pid and the variable (I6)" \
+    || fail "A10b: $(grep -i 'in use' "$PB/a10b.transcript")"
 has a10b 'Removing llamacpp' && fail "A10b ran uninstall" || ok "A10b uninstall never ran"
 loaded com.mac-studio-server.llamacpp && ok "A10b llama.cpp still loaded" || fail "A10b llama.cpp gone"
 kill "$NCPID" 2>/dev/null; wait "$NCPID" 2>/dev/null
 
 # A8: switch llama.cpp -> ds4, answer y.
-bdrive a8 "--configure" "Choose [4]: ${T}5" "binary path [$DS4B]: ${T}@ENTER" "(.gguf) path [$DS4M]: ${T}@ENTER" \
-    "c computes it now) [$DS4S]: ${T}@ENTER" "LAN access to ds4? [y/N]: ${T}@ENTER" "Port [18000]: ${T}@ENTER" \
+bdrive a8 "--configure" "Choose [4]: ${T}5" "(.gguf) path [$DS4M]: ${T}@ENTER" "c computes it now) [$DS4S]: ${T}@ENTER" \
+    "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" \
     "Install with these settings? [Y/n]: ${T}@ENTER" "--backend llamacpp? [y/N]: ${T}y" --
 check "A8 switch llama.cpp -> ds4" 0 $?
 loaded com.mac-studio-server.ds4 && loaded com.mac-studio-server.guard && ! loaded com.mac-studio-server.llamacpp \
@@ -691,30 +908,41 @@ loaded com.mac-studio-server.ds4 && loaded com.mac-studio-server.guard && ! load
     && ok "A8 llama.cpp plist and stamp gone" || fail "A8 llama.cpp leftovers"
 wait_listen 18000 && ok "A8 ds4 listening" || fail "A8 ds4 not listening"
 
-# A5: ollama + ds4 (same optional backend: no switch, real Ollama flow).
-bdrive a5o3 "--configure" "Choose [5]: ${T}3" "binary path [$DS4B]: ${T}@ENTER" "(.gguf) path [$DS4M]: ${T}@ENTER" \
-    "c computes it now) [$DS4S]: ${T}@ENTER" "LAN access to ds4? [y/N]: ${T}@ENTER" "Port [18000]: ${T}@ENTER" \
-    "Install with these settings? [Y/n]: ${T}@ENTER" --
+# A5 / F3: ollama + ds4 (same optional backend: no switch), headless tweaks answered y.
+touch "$PB/f3.marker"; sleep 1
+bdrive a5o3 "--configure" "Choose [5]: ${T}3" "(.gguf) path [$DS4M]: ${T}@ENTER" "c computes it now) [$DS4S]: ${T}@ENTER" \
+    "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}y" \
+    "Install with these settings? [Y/n]: ${T}@ENTER" "(starter) 2) later [1]: ${T}2" --
 check "A5 ollama + ds4" 0 $?
 loaded com.ollama.service && loaded com.mac-studio-server.ds4 && ok "A5 ollama + ds4 labels" || fail "A5 option 3 labels: $(daemons)"
+[ "$LOGS/optimization.log" -nt "$PB/f3.marker" ] && ok "F3 tweaks answered y run the optimizer" || fail "F3 optimization.log not written"
+pmset -g custom 2>/dev/null | grep -Eq '^[[:space:]]*sleep[[:space:]]+0$' && ok "F3 pmset shows sleep 0" || fail "F3 pmset: $(pmset -g custom | grep -w sleep)"
+has a5o3 '^later: ollama pull qwen3:4b' && ok "M5 declining the Ollama starter prints the pull command" || fail "M5 no pull command"
 
-# A5: ollama + llama.cpp (switch ds4 -> llama.cpp).
-bdrive a5o2 "--configure" "Choose [3]: ${T}2" "binary path [$LLB]: ${T}@ENTER" "(.gguf) path [$LLM]: ${T}@ENTER" \
-    "c computes it now) [$LLS]: ${T}@ENTER" "LAN access to llamacpp? [y/N]: ${T}@ENTER" "Port [18081]: ${T}@ENTER" \
-    "Install with these settings? [Y/n]: ${T}@ENTER" "--backend ds4? [y/N]: ${T}y" --
+# A5 / F2: ollama + llama.cpp (switch ds4 -> llama.cpp), tweaks answered N: nothing it covers changes.
+snap() { pmset -g custom 2>/dev/null; mdutil -s / 2>/dev/null; tmutil destinationinfo 2>/dev/null
+    defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticCheckEnabled 2>/dev/null; }
+snap > "$PB/f2.before"; touch "$PB/f2.marker"; sleep 1
+bdrive a5o2 "--configure" "Choose [3]: ${T}2" "(.gguf) path [$LLM]: ${T}@ENTER" "c computes it now) [$LLS]: ${T}@ENTER" \
+    "LAN access to llamacpp? [y/N]: ${T}@ENTER" "auto-updates)? ${T}n" \
+    "Install with these settings? [Y/n]: ${T}@ENTER" "--backend ds4? [y/N]: ${T}y" "(starter) 2) later [1]: ${T}2" --
 check "A5 ollama + llama.cpp" 0 $?
 loaded com.ollama.service && loaded com.mac-studio-server.llamacpp && ! loaded com.mac-studio-server.ds4 \
     && ok "A5 ollama + llama.cpp labels" || fail "A5 option 2 labels: $(daemons)"
+snap > "$PB/f2.after"
+cmp -s "$PB/f2.before" "$PB/f2.after" && ok "F2 pmset, mdutil, tmutil and update settings unchanged" || fail "F2 settings changed"
+[ "$LOGS/optimization.log" -nt "$PB/f2.marker" ] && fail "F2 the optimizer ran" || ok "F2 optimization.log not written"
 
 # A5: ollama only (removes llama.cpp; no check to run).
-bdrive a5o1 "--configure" "Choose [2]: ${T}1" "Install with these settings? [Y/n]: ${T}@ENTER" "--backend llamacpp? [y/N]: ${T}y" --
+bdrive a5o1 "--configure" "Choose [2]: ${T}1" "auto-updates)? ${T}n" "Install with these settings? [Y/n]: ${T}@ENTER" \
+    "--backend llamacpp? [y/N]: ${T}y" "(starter) 2) later [1]: ${T}2" --
 check "A5 ollama only" 0 $?
 loaded com.ollama.service && ! loaded com.mac-studio-server.llamacpp && ! loaded com.mac-studio-server.guard \
     && ok "A5 ollama-only labels" || fail "A5 option 1 labels: $(daemons)"
 
 # A5: MSS_BACKENDS set in the environment, --configure choosing ds4 only.
-bdrive a5env "--configure" "Choose [4]: ${T}5" "binary path [$DS4B]: ${T}@ENTER" "(.gguf) path [$DS4M]: ${T}@ENTER" \
-    "c computes it now) [$DS4S]: ${T}@ENTER" "LAN access to ds4? [y/N]: ${T}@ENTER" "Port [18000]: ${T}@ENTER" \
+bdrive a5env "--configure" "Choose [4]: ${T}5" "(.gguf) path [$DS4M]: ${T}@ENTER" "c computes it now) [$DS4S]: ${T}@ENTER" \
+    "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}n" \
     "Install with these settings? [Y/n]: ${T}@ENTER" -- MSS_BACKENDS=llamacpp
 check "A5 --configure overrides MSS_BACKENDS from the environment" 0 $?
 loaded com.mac-studio-server.ds4 && ! loaded com.mac-studio-server.llamacpp && ok "A5 env run installed ds4" || fail "A5 env run labels: $(daemons)"
@@ -737,6 +965,115 @@ OUT=$(sudo env MSS_BACKENDS=ds4 OLLAMA_USER="$(id -un)" MSS_REPLACE_BACKEND=ds4 
     DS4_MODEL_SHA256="$DS4S" DS4_PORT=18000 sh "$ROOT/scripts/install-backends.sh" 2>&1) \
     && fail "A15 full install accepted MSS_REPLACE_BACKEND" \
     || { printf '%s' "$OUT" | grep -q 'only with --check-only' && ok "A15 full install refuses MSS_REPLACE_BACKEND" || fail "A15: $OUT"; }
+
+echo "== phase B: 1.5.0 model later, model.sh, stamp and prompts (#15) =="
+# M1: llama.cpp with a model later: the conf says waiting and no backend or guard job exists.
+EFM="$PB/m.env"
+bdrive m1 "--configure" "Choose [5]: ${T}4" "brew install llama.cpp)? [y/N]: ${T}n" "binary path: ${T}$LLB" "later [1]: ${T}4" \
+    "LAN access to llamacpp? [y/N]: ${T}@ENTER" "auto-updates)? ${T}n" \
+    "Install with these settings? [Y/n]: ${T}@ENTER" "--backend ds4? [y/N]: ${T}y" -- \
+    MSS_ENV_FILE="$EFM" LLAMACPP_PORT=18082 PATH="$PATH_NOLL"
+check "M1 install with a model later" 0 $?
+! loaded com.mac-studio-server.llamacpp && ! loaded com.mac-studio-server.guard \
+    && [ ! -e /Library/LaunchDaemons/com.mac-studio-server.llamacpp.plist ] && [ ! -e /Library/LaunchDaemons/com.mac-studio-server.guard.plist ] \
+    && ok "M1 no llama.cpp or guard plist or label" || fail "M1 labels: $(daemons)"
+grep -qx 'MSS_MODEL_STATE=waiting' "$CONFB" && grep -qx 'MSS_GUARD_BACKEND=llamacpp' "$CONFB" \
+    && ok "M1 conf says waiting and keeps MSS_GUARD_BACKEND" || fail "M1 conf: $(cat "$CONFB")"
+OUT=$(sh "$ROOT/scripts/status.sh" 2>&1); RC=$?
+printf '%s' "$OUT" | grep -qx 'llamacpp: waiting for a model (run scripts/model.sh)' && ok "M1 status prints the waiting line" || fail "M1 status: $OUT"
+check "M1 status exits 0 with the backend waiting" 0 "$RC"
+
+# M7: model.sh without a terminal changes nothing, even with a waiting backend and Ollama loaded.
+cp "$EFM" "$PB/m7.env"; cp "$CONFB" "$PB/m7.conf"
+OLLPID() { launchctl print system/com.ollama.service 2>/dev/null | sed -n 's/^[[:space:]]*pid = \([0-9]*\).*/\1/p' | head -n 1; }
+P0=$(OLLPID)
+MSS_ENV_FILE="$EFM" "$ROOT/scripts/model.sh" --catalog stories260k </dev/null >/dev/null 2>&1
+check "M7 model.sh without a terminal exits 2" 2 $?
+cmp -s "$EFM" "$PB/m7.env" && cmp -s "$CONFB" "$PB/m7.conf" && [ ! -e "$HOME/models/stories260K.gguf.part" ] \
+    && ok "M7 backends.env, conf and models unchanged" || fail "M7 changed something"
+check "M7 Ollama PID unchanged" "$P0" "$(OLLPID)"
+
+# M2 / M9: model.sh --catalog downloads, hashes once as root, and loads the backend and guard,
+# never touching Ollama.
+env MSS_ENV_FILE="$EFM" OLLAMA_USER="$(id -un)" MSS_EXPECT_TIMEOUT=300 \
+    expect "$ROOT/tests/expect/drive.exp" /dev/null "$PB/m2.transcript" /bin/bash "$ROOT/scripts/model.sh" --catalog stories260k \
+    >/dev/null 2>"$PB/m2.err"
+check "M2 model.sh --catalog stories260k" 0 $?
+check "M2 exactly one hashing line" 1 "$(tr -d '\r' < "$PB/m2.transcript" | grep -c '^hashing llamacpp model')"
+loaded com.mac-studio-server.llamacpp && loaded com.mac-studio-server.guard && ok "M2 backend and guard loaded" || fail "M2 labels: $(daemons)"
+grep -q MSS_DEFER_MODEL "$EFM" && fail "M2 MSS_DEFER_MODEL still saved" || ok "M2 MSS_DEFER_MODEL removed"
+wait_listen 18082 && sh "$ROOT/scripts/status.sh" >/dev/null 2>&1 && ok "M2 status healthy" || fail "M2 status: $(sh "$ROOT/scripts/status.sh" 2>&1)"
+check "M9 Ollama PID unchanged by model.sh" "$P0" "$(OLLPID)"
+
+# M3: switch to another model by path: one hash, the new -m, the old file untouched.
+OLDM="$HOME/models/stories260K.gguf"; OLDT=$(stat -f %m "$OLDM" 2>/dev/null)
+printf 'phase-b-other-model' > "$PB/other.gguf"; OTHS=$(shasum -a 256 "$PB/other.gguf" | awk '{print $1}')
+env MSS_ENV_FILE="$EFM" OLLAMA_USER="$(id -un)" MSS_EXPECT_TIMEOUT=180 \
+    expect "$ROOT/tests/expect/drive.exp" /dev/null "$PB/m3.transcript" /bin/bash "$ROOT/scripts/model.sh" \
+    --path "$PB/other.gguf" --sha256 "$OTHS" >/dev/null 2>"$PB/m3.err"
+check "M3 model.sh --path" 0 $?
+check "M3 exactly one hashing line" 1 "$(tr -d '\r' < "$PB/m3.transcript" | grep -c '^hashing llamacpp model')"
+sleep 3
+tail -n 1 /tmp/mss-stub-argv | grep -q -- "-m $(cd "$PB" && pwd -P)/other.gguf" && ok "M3 the backend runs the new model" \
+    || fail "M3 argv: $(tail -n 1 /tmp/mss-stub-argv)"
+check "M3 the old model's mtime is unchanged" "$OLDT" "$(stat -f %m "$OLDM" 2>/dev/null)"
+check "M9 Ollama PID unchanged after a switch" "$P0" "$(OLLPID)"
+
+# M8(b) / M3: a deferred re-install removes the backend and guard jobs; uninstall of a waiting
+# backend removes its conf and exits 0.
+sudo env MSS_BACKENDS=llamacpp OLLAMA_USER="$(id -un)" MSS_DEFER_MODEL=yes LLAMACPP_BIN="$LLB" LLAMACPP_PORT=18082 \
+    sh "$ROOT/scripts/install-backends.sh" >"$PB/m8.log" 2>&1
+check "M8 deferred re-install" 0 $?
+! loaded com.mac-studio-server.llamacpp && ! loaded com.mac-studio-server.guard && ok "M8 deferred re-install unloads the backend and guard" \
+    || fail "M8 labels: $(daemons)"
+sudo sh "$ROOT/scripts/uninstall.sh" --backend llamacpp >/dev/null 2>&1
+check "M8 uninstall of a waiting backend exits 0" 0 $?
+[ ! -e "$CONFB" ] && ok "M8 conf removed" || fail "M8 conf left: $(cat "$CONFB")"
+
+# A18: a root --check-only writes only the stamp (and its directory).
+printf 'phase-b-a18-model' > "$PB/a18.gguf"; A18S=$(shasum -a 256 "$PB/a18.gguf" | awk '{print $1}')
+sudo rm -f /var/db/mac-studio-server/ds4.model.verified
+touch "$PB/a18.marker"; sleep 1
+sudo env MSS_BACKENDS=ds4 OLLAMA_USER="$(id -un)" DS4_BIN="$DS4B" DS4_MODEL="$PB/a18.gguf" DS4_MODEL_SHA256="$A18S" DS4_PORT=18000 \
+    sh "$ROOT/scripts/install-backends.sh" --check-only >"$PB/a18.log" 2>&1
+check "A18 root --check-only" 0 $?
+NEW=$(sudo find /var/db/mac-studio-server /usr/local/etc/mac-studio-server /usr/local/libexec/mac-studio-server /Library/LaunchDaemons \
+    -newer "$PB/a18.marker" 2>/dev/null | sort | tr '\n' ' ')
+check "A18 only the stamp directory and the stamp are new" "/var/db/mac-studio-server /var/db/mac-studio-server/ds4.model.verified " "$NEW"
+check "A18 stamp root:wheel 0644" "root:wheel 644" "$(stat -f '%Su:%Sg %Lp' /var/db/mac-studio-server/ds4.model.verified 2>/dev/null)"
+check "A18 directory root:wheel 755" "root:wheel 755" "$(stat -f '%Su:%Sg %Lp' /var/db/mac-studio-server 2>/dev/null)"
+
+# F7: a foreign listener on llama.cpp's default port refuses at the check, before any change.
+nc -l 127.0.0.1 8080 >/dev/null 2>&1 &
+NCPID=$!
+sleep 1; BEFORE=$(daemons)
+bdrive f7 "--configure" "Choose [1]: ${T}4" "later [1]: ${T}3" "path or https URL: ${T}$LLM" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" \
+    "LAN access to llamacpp? [y/N]: ${T}@ENTER" "auto-updates)? ${T}n" "Install with these settings? [Y/n]: ${T}@ENTER" -- \
+    MSS_ENV_FILE="$PB/f7.env" LLAMACPP_BIN="$LLB"
+check "F7 a busy default port exits 1" 1 $?
+has f7 "port 8080 is in use (pid $NCPID); set LLAMACPP_PORT in backends.env and re-run" && ok "F7 names the pid, LLAMACPP_PORT and backends.env" \
+    || fail "F7: $(grep -i 'in use' "$PB/f7.transcript")"
+has f7 'Port' && fail "F7 showed a port prompt" || ok "F7 no port prompt"
+check "F7 /Library/LaunchDaemons unchanged" "$BEFORE" "$(daemons)"
+kill "$NCPID" 2>/dev/null; wait "$NCPID" 2>/dev/null
+
+# F4: non-interactive Ollama with MSS_TUNE_MACOS=no skips the optimizer; unset ran it (A2).
+touch "$PB/f4.marker"; sleep 1
+MSS_BACKENDS=ollama MSS_TUNE_MACOS=no "$IS" </dev/null >"$PB/f4.log" 2>&1
+check "F4 non-interactive with MSS_TUNE_MACOS=no" 0 $?
+[ "$LOGS/optimization.log" -nt "$PB/f4.marker" ] && fail "F4 the optimizer ran" || ok "F4 MSS_TUNE_MACOS=no skips the optimizer"
+
+# U1 / U4: one sudo -v, before every other sudo call; the keep-alive is gone after the run.
+mkdir -p "$PB/shim"
+printf '#!/bin/sh\necho "$(date +%%s) $*" >> "%s/sudo.log"\nexec /usr/bin/sudo "$@"\n' "$PB" > "$PB/shim/sudo"; chmod +x "$PB/shim/sudo"
+: > "$PB/sudo.log"
+bdrive u1 "" -- PATH="$PB/shim:$PATH"
+check "U1 loaded-mode run through the sudo shim" 0 $?
+check "U1 exactly one sudo -v" 1 "$(grep -c ' -v -p ' "$PB/sudo.log")"
+head -n 1 "$PB/sudo.log" | grep -q ' -v -p \[sudo\] password (asked once): ' && ok "U1 sudo -v comes first" \
+    || fail "U1 first sudo call: $(head -n 1 "$PB/sudo.log")"
+sleep 60
+pgrep -f 'sudo -n true' >/dev/null && fail "U4 the keep-alive is still running" || ok "U4 no keep-alive 60 s after the run"
 
 sudo sh "$ROOT/scripts/uninstall.sh" --all >/dev/null 2>&1
 

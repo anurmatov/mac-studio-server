@@ -1,0 +1,3 @@
+#!/bin/sh
+# sw_vers stub (#15): a macOS 15 host.
+[ "$1" = -productVersion ] && echo 15.1

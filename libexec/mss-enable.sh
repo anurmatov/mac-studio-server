@@ -21,6 +21,10 @@ if [ -z "$_backend" ]; then
     echo "mss-enable: no optional backend configured" >&2
     exit 1
 fi
+if [ "$(mss_conf_get MSS_MODEL_STATE || true)" = waiting ]; then
+    echo "mss-enable: $_backend is waiting for a model (run scripts/model.sh)" >&2
+    exit 1
+fi
 PLIST="/Library/LaunchDaemons/com.mac-studio-server.$_backend.plist"
 
 rm -f "$TRIP_MARKER" "$BASELINE"

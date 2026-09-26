@@ -1,0 +1,3 @@
+#!/bin/sh
+# xcode-select stub (B3): the Command Line Tools are missing.
+exit 2

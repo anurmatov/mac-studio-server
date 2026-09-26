@@ -328,6 +328,31 @@ mss_validate_extra_args() {
     return 0
 }
 
+# ── Ollama plist render (P3) ───────────────────────────────────────────────────
+# mss_render_ollama_plist <template> <user> <bind> <bin>. With the default bin
+# /usr/local/bin/ollama the output is byte-identical to the v1.2.0 golden file.
+mss_render_ollama_plist() {
+    sed -e "s|<OLLAMA_USER>|$2|g" -e "s|<OLLAMA_BIND>|$3|g" -e "s|<OLLAMA_BIN>|$4|g" "$1"
+}
+
+# ── one password prompt per run (U1) ──────────────────────────────────────────
+# Asks once, then refreshes the sudo timestamp until the run's PID is gone. The
+# PID check also ends the loop after an exec, which drops traps.
+mss_sudo_keepalive() {
+    sudo -v -p '[sudo] password (asked once): ' || { mss_error "sudo failed; nothing was changed"; return 1; }
+    MSS_RUN_PID=${MSS_RUN_PID:-$$}
+    ( while kill -0 "$MSS_RUN_PID" 2>/dev/null; do sudo -n true 2>/dev/null; sleep 50; done ) >/dev/null 2>&1 &
+    MSS_KEEPALIVE_PID=$!
+    trap 'mss_keepalive_stop' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+}
+
+mss_keepalive_stop() {
+    [ -z "${MSS_KEEPALIVE_PID:-}" ] || kill "$MSS_KEEPALIVE_PID" 2>/dev/null
+    MSS_KEEPALIVE_PID=""
+}
+
 # ── conf file ──────────────────────────────────────────────────────────────────
 # Read-only loader for runtime scripts: backends.conf is root:wheel 0644.
 mss_conf_path() { printf '%s\n' "${MSS_CONF:-/usr/local/etc/mac-studio-server/backends.conf}"; }
@@ -360,7 +385,8 @@ mss_pf_rule_count() {
 # ── backends.env: the saved install.sh answers (parsed, never sourced) ────────
 # Keys in config/backends.env.example order; tests/run.sh asserts they match.
 mss_envfile_keys() {
-    echo MSS_BACKENDS OLLAMA_BIND OLLAMA_USER OLLAMA_GPU_PERCENT \
+    echo MSS_BACKENDS MSS_DEFER_MODEL OLLAMA_BIND OLLAMA_USER OLLAMA_GPU_PERCENT OLLAMA_BIN \
+        MSS_TUNE_MACOS \
         LLAMACPP_BIN LLAMACPP_MODEL LLAMACPP_MODEL_SHA256 LLAMACPP_HOST LLAMACPP_PORT \
         LLAMACPP_ALLOW_FROM LLAMACPP_API_KEY_FILE LLAMACPP_CTX LLAMACPP_PARALLEL \
         LLAMACPP_EXTRA_ARGS \

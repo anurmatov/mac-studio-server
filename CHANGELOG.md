@@ -2,13 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [1.5.0] - 2026-09-26
 
 ### Added
+- One-line curl install that verifies the download and offers to install or build what is missing
+- A model menu with a starter model and resumable downloads, and a command to switch models later
 - DS4_EXTRA_ARGS accepts ds4's MTP speculative decoding, prefill chunk and weight warm-up flags
 
 ### Changed
-- ds4 serves several sessions by default (4 with 96 GB of RAM or more, otherwise 2); existing installs change on re-install unless DS4_BATCHED_SESSIONS is set
+- Headless macOS tweaks are now asked once instead of always applied; the answer is saved
+- ds4 now serves 4 sessions at 96 GB of RAM or more, else 2, unless DS4_BATCHED_SESSIONS is set
 
 ## [1.4.0] - 2026-09-26
 

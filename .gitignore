@@ -22,3 +22,7 @@ community/
 *.api-key
 # Saved install.sh answers (issue #12)
 backends.env
+
+# Partial and rejected model downloads (1.5.0)
+*.gguf.part
+*.sha-mismatch

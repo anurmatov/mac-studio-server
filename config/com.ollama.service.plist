@@ -6,7 +6,7 @@
     <string>com.ollama.service</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/ollama</string>
+        <string><OLLAMA_BIN></string>
         <string>serve</string>
     </array>
     <key>EnvironmentVariables</key>

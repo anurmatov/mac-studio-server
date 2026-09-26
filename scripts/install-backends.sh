@@ -8,11 +8,16 @@
 # renders backends.conf, pf.conf and plists, installs files with the ownership
 # table from the issue, and bootstraps boot -> backend -> guard.
 #
-# --check-only runs only the validation (and hash) and writes nothing; install.sh
-# calls it before touching Ollama. --render-only DIR writes the rendered files
-# (and the model stamp) into DIR without root, launchd or pf — used by tests. In
-# that mode MSS_PFCTL may point at a stub; production always renders /sbin/pfctl
-# unless explicitly overridden.
+# --check-only runs only the validation and the hash; install.sh calls it before
+# touching Ollama. As root, and only on a matching hash, it writes the model
+# stamp (the only thing it may create), so the install does not hash again. A
+# sha256 mismatch exits 3. --render-only DIR writes the rendered files (and the
+# model stamp) into DIR without root, launchd or pf — used by tests. In that mode
+# MSS_PFCTL may point at a stub; production always renders /sbin/pfctl unless
+# explicitly overridden.
+#
+# MSS_DEFER_MODEL=yes installs the optional backend without a model: the conf
+# says MSS_MODEL_STATE=waiting and no backend or guard job is installed.
 
 set -u
 # sudo inherits the caller's umask; with 077, mkdir -p would create a missing
@@ -71,6 +76,8 @@ MSS_LOG_MAX_MB=${MSS_LOG_MAX_MB:-100}
 MSS_PFCTL=${MSS_PFCTL:-/sbin/pfctl}
 # Set only by install.sh --configure(-only) when switching optional backends.
 MSS_REPLACE_BACKEND=${MSS_REPLACE_BACKEND:-}
+MSS_DEFER_MODEL=${MSS_DEFER_MODEL:-}
+MSS_PROGRESS_SECONDS=${MSS_PROGRESS_SECONDS:-10}
 
 LIBEXEC_DIR="/usr/local/libexec/mac-studio-server"
 ETC_DIR="/usr/local/etc/mac-studio-server"
@@ -93,6 +100,8 @@ if [ -z "$RENDER_ONLY" ]; then
     id -u "$MSS_SERVICE_USER" >/dev/null 2>&1 || mss_die "OLLAMA_USER: user '$MSS_SERVICE_USER' does not exist"
 fi
 mss_validate_path_chars MSS_PFCTL "$MSS_PFCTL" || exit 1
+case $MSS_DEFER_MODEL in ''|yes) ;; *) mss_die "MSS_DEFER_MODEL must be yes or unset" ;; esac
+mss_validate_uint MSS_PROGRESS_SECONDS "$MSS_PROGRESS_SECONDS" 1 60 || exit 1
 
 # The optional backend already installed (backends.conf is world-readable).
 _installed_opt=""
@@ -157,12 +166,47 @@ validate_port_free() {
         [ "$_mine" = 1 ] || _foreign="$_foreign $_lp"
     done
     [ -z "$_foreign" ] && return 0
-    mss_die "$_var: port $_port is already bound by pid(s)$_foreign"
+    mss_die "port $_port is in use (pid$_foreign); set $_var in backends.env and re-run"
+}
+
+gib() { awk -v b="$1" 'BEGIN { printf "%.1f", b / 1073741824 }'; }
+
+# hash_file <backend> <path> <size>: prints the sha256. Progress goes to stderr
+# (U3): every MSS_PROGRESS_SECONDS, SIGINFO makes BSD dd report the bytes copied,
+# and one final "done" line always ends it. The sum is read through a FIFO.
+hash_file() {
+    _hb=$1; _hp=$2; _hs=$3
+    _ht=$(mktemp -d "${TMPDIR:-/tmp}/mss-hash.XXXXXX") || return 1
+    if ! mkfifo "$_ht/fifo"; then rm -rf "$_ht"; return 1; fi
+    shasum -a 256 < "$_ht/fifo" > "$_ht/sum" &
+    _hsum=$!
+    dd if="$_hp" of="$_ht/fifo" bs=16777216 2>"$_ht/dd.log" &
+    _hdd=$!
+    _hn=0; _hlast=""
+    while kill -0 "$_hdd" 2>/dev/null; do
+        sleep 1
+        _hn=$((_hn + 1))
+        [ "$_hn" -ge "$MSS_PROGRESS_SECONDS" ] || continue
+        _hn=0
+        _hnow=$(sed -n 's/^[[:space:]]*\([0-9][0-9]*\) bytes.*/\1/p' "$_ht/dd.log" | tail -n 1)
+        if [ -n "$_hnow" ] && [ "$_hnow" != "$_hlast" ]; then
+            echo "hashing $_hb model: $(gib "$_hnow") / $(gib "$_hs") GiB" >&2
+            _hlast=$_hnow
+        fi
+        kill -INFO "$_hdd" 2>/dev/null
+    done
+    wait "$_hdd"; _hrc=$?
+    wait "$_hsum"
+    _hsha=$(awk '{print $1}' "$_ht/sum")
+    rm -rf "$_ht"
+    if [ "$_hrc" != 0 ] || [ -z "$_hsha" ]; then mss_error "reading $_hp failed"; return 1; fi
+    echo "hashing $_hb model: done ($(gib "$_hs") GiB)" >&2
+    printf '%s\n' "$_hsha"
 }
 
 # verify_model <backend> <resolved model> <expected sha>: prints the stamp line
 # "path size inode mtime sha". Skips the re-hash only when the existing stamp
-# matches the path, stat and expected sha. Writes nothing.
+# matches the path, stat and expected sha. Writes nothing. A mismatch returns 3.
 verify_model() {
     _vb=$1; _vpath=$2; _vwant=$(printf '%s' "$3" | tr '[:upper:]' '[:lower:]')
     _vstat=$(stat -f '%z %i %m' "$_vpath" 2>/dev/null) || { mss_error "stat failed: $_vpath"; return 1; }
@@ -173,9 +217,8 @@ verify_model() {
         echo "stamp unchanged for $_vb (skipping re-hash)" >&2
         _vsha=$_sh
     else
-        echo "hashing $_vpath ..." >&2
-        _vsha=$(shasum -a 256 "$_vpath" | awk '{print $1}')
-        [ "$_vsha" = "$_vwant" ] || { mss_error "$_vb model sha256 mismatch (expected $_vwant, got $_vsha)"; return 1; }
+        _vsha=$(hash_file "$_vb" "$_vpath" "${_vstat%% *}") || return 1
+        [ "$_vsha" = "$_vwant" ] || { mss_error "$_vb model sha256 mismatch (expected $_vwant, got $_vsha)"; return 3; }
     fi
     printf '%s %s %s\n' "$_vpath" "$_vstat" "$_vsha"
 }
@@ -195,12 +238,13 @@ validate_optional_backend() {
     esac
 
     [ -n "$_bin" ]   || mss_die "${_upper}_BIN is required when '$_b' is selected"
-    [ -n "$_model" ] || mss_die "${_upper}_MODEL is required when '$_b' is selected"
-    mss_validate_sha256 "${_upper}_MODEL_SHA256" "$_sha" || exit 1
-
-    case $(basename "$_model") in
-        *-[0-9]*-of-[0-9]*.gguf) mss_die "${_upper}_MODEL: split GGUF sets are not supported" ;;
-    esac
+    if [ "$MSS_DEFER_MODEL" != yes ]; then
+        [ -n "$_model" ] || mss_die "${_upper}_MODEL is required when '$_b' is selected"
+        mss_validate_sha256 "${_upper}_MODEL_SHA256" "$_sha" || exit 1
+        case $(basename "$_model") in
+            *-[0-9]*-of-[0-9]*.gguf) mss_die "${_upper}_MODEL: split GGUF sets are not supported" ;;
+        esac
+    fi
 
     _resolved_bin=$(mss_resolve_path "$_bin") || exit 1
     mss_validate_path_chars "${_upper}_BIN (resolved)" "$_resolved_bin" || exit 1
@@ -211,9 +255,13 @@ validate_optional_backend() {
         ds4) DS4_BIN_RESOLVED=$_resolved_bin ;;
     esac
 
-    _resolved_model=$(mss_resolve_path "$_model") || exit 1
-    mss_validate_path_chars "${_upper}_MODEL (resolved)" "$_resolved_model" || exit 1
-    [ -f "$_resolved_model" ] || mss_die "${_upper}_MODEL: not a regular file: $_resolved_model"
+    # Waiting for a model (M3): nothing about the model is checked or written.
+    _resolved_model=""
+    if [ "$MSS_DEFER_MODEL" != yes ]; then
+        _resolved_model=$(mss_resolve_path "$_model") || exit 1
+        mss_validate_path_chars "${_upper}_MODEL (resolved)" "$_resolved_model" || exit 1
+        [ -f "$_resolved_model" ] || mss_die "${_upper}_MODEL: not a regular file: $_resolved_model"
+    fi
     case $_b in
         llamacpp) LLAMACPP_MODEL_RESOLVED=$_resolved_model ;;
         ds4) DS4_MODEL_RESOLVED=$_resolved_model ;;
@@ -328,16 +376,43 @@ if [ -n "${OLLAMA_GPU_PERCENT:-}" ] && [ "$_has_optional" = 1 ]; then
     fi
 fi
 
-# The model hash is the only slow check, so it runs last.
-if mss_backend_selected llamacpp; then
-    LLAMACPP_STAMP_LINE=$(verify_model llamacpp "$LLAMACPP_MODEL_RESOLVED" "$LLAMACPP_MODEL_SHA256") || exit 1
-fi
-if mss_backend_selected ds4; then
-    DS4_STAMP_LINE=$(verify_model ds4 "$DS4_MODEL_RESOLVED" "$DS4_MODEL_SHA256") || exit 1
+# The model hash is the only slow check, so it runs last. Exit 3 is a mismatch.
+LLAMACPP_STAMP_LINE=""; DS4_STAMP_LINE=""
+if [ "$MSS_DEFER_MODEL" != yes ]; then
+    if mss_backend_selected llamacpp; then
+        LLAMACPP_STAMP_LINE=$(verify_model llamacpp "$LLAMACPP_MODEL_RESOLVED" "$LLAMACPP_MODEL_SHA256") || exit $?
+    fi
+    if mss_backend_selected ds4; then
+        DS4_STAMP_LINE=$(verify_model ds4 "$DS4_MODEL_RESOLVED" "$DS4_MODEL_SHA256") || exit $?
+    fi
 fi
 
+# write_stamp <backend> <line>: the verified model's stamp, root:wheel 0644.
+write_stamp() {
+    _stamp="$STAMP_DIR/$1.model.verified"
+    printf '%s\n' "$2" > "$_stamp.tmp"
+    if [ -z "$RENDER_ONLY" ]; then chown root:wheel "$_stamp.tmp"; fi
+    chmod 0644 "$_stamp.tmp"
+    mv "$_stamp.tmp" "$_stamp"
+}
+
 if [ "$CHECK_ONLY" = 1 ]; then
-    echo "install-backends: check passed (backends: $MSS_BACKENDS)"
+    # D6: the hash matched, so root keeps it for the install. The directory and
+    # one stamp per backend are the only paths this pass may create or change.
+    if [ "$(id -u)" -eq 0 ] && { [ -n "$LLAMACPP_STAMP_LINE" ] || [ -n "$DS4_STAMP_LINE" ]; }; then
+        if [ ! -d "$DB_DIR" ]; then
+            mkdir -p "$DB_DIR"
+            chown root:wheel "$DB_DIR"
+            chmod 0755 "$DB_DIR"
+        fi
+        [ -z "$LLAMACPP_STAMP_LINE" ] || write_stamp llamacpp "$LLAMACPP_STAMP_LINE"
+        [ -z "$DS4_STAMP_LINE" ] || write_stamp ds4 "$DS4_STAMP_LINE"
+    fi
+    if [ "$MSS_DEFER_MODEL" = yes ] && [ -n "$_optional" ]; then
+        echo "install-backends: check passed (backends: $MSS_BACKENDS; $_optional waiting for a model)"
+    else
+        echo "install-backends: check passed (backends: $MSS_BACKENDS)"
+    fi
     exit 0
 fi
 
@@ -390,13 +465,6 @@ render_placeholders() {
 # ── phase 3: write outputs ─────────────────────────────────────────────────────
 # The model stamp comes first: the sha is already verified, and a conf is never
 # written that points at a model without a matching stamp.
-write_stamp() {
-    _stamp="$STAMP_DIR/$1.model.verified"
-    printf '%s\n' "$2" > "$_stamp.tmp"
-    if [ -z "$RENDER_ONLY" ]; then chown root:wheel "$_stamp.tmp"; fi
-    chmod 0644 "$_stamp.tmp"
-    mv "$_stamp.tmp" "$_stamp"
-}
 if [ -z "$RENDER_ONLY" ]; then
     mkdir -p "$DB_DIR"
     chown root:wheel "$DB_DIR"
@@ -404,8 +472,8 @@ if [ -z "$RENDER_ONLY" ]; then
 else
     mkdir -p "$RENDER_ONLY"
 fi
-if mss_backend_selected llamacpp; then write_stamp llamacpp "$LLAMACPP_STAMP_LINE"; fi
-if mss_backend_selected ds4; then write_stamp ds4 "$DS4_STAMP_LINE"; fi
+[ -z "$LLAMACPP_STAMP_LINE" ] || write_stamp llamacpp "$LLAMACPP_STAMP_LINE"
+[ -z "$DS4_STAMP_LINE" ] || write_stamp ds4 "$DS4_STAMP_LINE"
 
 if [ -z "$RENDER_ONLY" ]; then
     mkdir -p "$LIBEXEC_DIR" "$ETC_DIR" "$LOG_DIR"
@@ -433,6 +501,7 @@ fi
     echo "MSS_SERVICE_USER=$MSS_SERVICE_USER"
     echo "OLLAMA_BIND=$OLLAMA_BIND"
     [ -n "$_optional" ] && echo "MSS_GUARD_BACKEND=$_optional"
+    [ -n "$_optional" ] && [ "$MSS_DEFER_MODEL" = yes ] && echo "MSS_MODEL_STATE=waiting"
     echo "MSS_PFCTL=$MSS_PFCTL"
     echo "MSS_PF_RULE_COUNT=$PF_RULE_COUNT"
     [ -n "$MSS_WIRED_LIMIT_MB" ] && echo "MSS_WIRED_LIMIT_MB=$MSS_WIRED_LIMIT_MB"
@@ -484,7 +553,10 @@ install_plist() {
     chmod 0644 "$_dst.tmp"
     mv "$_dst.tmp" "$_dst"
 }
-if [ -n "$_optional" ]; then
+# Waiting for a model: no backend or guard job, so nothing respawns at boot.
+_JOBS=0
+[ -n "$_optional" ] && [ "$MSS_DEFER_MODEL" != yes ] && _JOBS=1
+if [ "$_JOBS" = 1 ]; then
     install_plist "com.mac-studio-server.$_optional.plist" "$PLIST_DIR/com.mac-studio-server.$_optional.plist"
     install_plist "com.mac-studio-server.guard.plist" "$PLIST_DIR/com.mac-studio-server.guard.plist"
 fi
@@ -498,8 +570,16 @@ if [ -n "$RENDER_ONLY" ]; then
     exit 0
 fi
 
+# A deferred re-install leaves no backend or guard job from an earlier install.
+if [ -n "$_optional" ] && [ "$_JOBS" = 0 ]; then
+    for label in "$_optional" guard; do
+        launchctl bootout "system/com.mac-studio-server.$label" 2>/dev/null || true
+        rm -f "$PLIST_DIR/com.mac-studio-server.$label.plist"
+    done
+fi
+
 # pre-create runtime files with the ownership table
-if [ -n "$_optional" ]; then
+if [ "$_JOBS" = 1 ]; then
     if [ ! -f "$LOG_DIR/$_optional.log" ]; then
         : > "$LOG_DIR/$_optional.log"
         chown "$MSS_SERVICE_USER:staff" "$LOG_DIR/$_optional.log"
@@ -514,8 +594,7 @@ fi
 
 BOOTSTRAP=""
 [ "$HAS_PF_POLICY" = 1 ] && BOOTSTRAP="$BOOTSTRAP boot"
-[ -n "$_optional" ] && BOOTSTRAP="$BOOTSTRAP $_optional"
-[ -n "$_optional" ] && BOOTSTRAP="$BOOTSTRAP guard"
+[ "$_JOBS" = 1 ] && BOOTSTRAP="$BOOTSTRAP $_optional guard"
 
 for label in $BOOTSTRAP; do
     launchctl bootout "system/com.mac-studio-server.$label" 2>/dev/null || true
