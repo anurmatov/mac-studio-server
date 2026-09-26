@@ -484,11 +484,15 @@ elif [ "$OLD_ISOLATED" = 1 ]; then
     for sel in ollama llamacpp ds4 'ollama,llamacpp' 'ollama,ds4' 'llamacpp,ds4'; do
         tag=$(echo "$sel" | tr , -)
         for tree in old new; do
-            [ "$tree" = old ] && src="$TMP/old" || src="$ROOT"
+            # The 1.3.0 tree is a fixture that hashes with a bare shasum (Perl), which
+            # fails under a locale Perl cannot load, so it alone runs under C (#21).
+            # The new tree keeps the inherited locale.
+            if [ "$tree" = old ]; then src="$TMP/old"; loc="LC_ALL=C LANG=C"; else src="$ROOT"; loc=""; fi
             d="$TMP/parity-$tree-$tag"
             # DS4_BATCHED_SESSIONS is explicit: its RAM-based default (#19) is
             # the one documented difference from 1.3.0.
-            env MSS_BACKENDS="$sel" OLLAMA_USER=testuser DS4_BATCHED_SESSIONS=1 \
+            # shellcheck disable=SC2086  # $loc is a word list, empty for the new tree
+            env $loc MSS_BACKENDS="$sel" OLLAMA_USER=testuser DS4_BATCHED_SESSIONS=1 \
                 LLAMACPP_BIN="$TMP/fix/llamacpp/llamacpp-server" LLAMACPP_MODEL="$TMP/fix/llamacpp/model.gguf" \
                 LLAMACPP_MODEL_SHA256="$(cat "$TMP/fix/llamacpp/model.sha")" \
                 DS4_BIN="$TMP/fix/ds4/ds4-server" DS4_MODEL="$TMP/fix/ds4/model.gguf" \
