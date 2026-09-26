@@ -24,7 +24,7 @@ jobs:
           test -x /usr/bin/expect || { echo "ERROR: /usr/bin/expect is missing; the picker tests need it"; exit 1; }
           /bin/bash --version | head -1
           /bin/bash --version | head -1 | grep -q 'version 3\.2' || { echo "ERROR: /bin/bash is not 3.2"; exit 1; }
-          if grep -nE 'declare -A|mapfile|readarray|,,\}|\^\^\}' scripts/install.sh scripts/lib/*.sh; then
+          if grep -nE 'declare -A|mapfile|readarray|,,\}|\^\^\}' scripts/install.sh scripts/model.sh scripts/lib/*.sh; then
             echo "ERROR: bash 4 feature found"; exit 1
           fi
 

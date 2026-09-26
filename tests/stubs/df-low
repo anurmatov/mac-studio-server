@@ -1,0 +1,4 @@
+#!/bin/sh
+# df stub (A8): 1 GiB available wherever it is asked.
+echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
+echo "/dev/disk3s1 10485760 9437184 1048576 90% /"

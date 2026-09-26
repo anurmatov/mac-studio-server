@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.5.0] - 2026-09-26
+
+### Added
+- One-line install with curl that fetches a verified copy of this repository
+- The installer offers to install Homebrew, Ollama, llama.cpp or build DwarfStar when missing
+- A model menu with a small starter model, resumable downloads, or a model later
+- A command to add or switch the llama.cpp or DwarfStar model after installation
+
+### Changed
+- Headless macOS tweaks are now asked once instead of always applied; the answer is saved
+
 ## [1.4.0] - 2026-09-26
 
 ### Added
