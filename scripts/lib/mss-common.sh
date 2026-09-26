@@ -337,3 +337,119 @@ mss_pf_rule_count() {
     done
     echo "$_count"
 }
+
+# ── backends.env: the saved install.sh answers (parsed, never sourced) ────────
+# Keys in config/backends.env.example order; tests/run.sh asserts they match.
+mss_envfile_keys() {
+    echo MSS_BACKENDS OLLAMA_BIND OLLAMA_USER OLLAMA_GPU_PERCENT \
+        LLAMACPP_BIN LLAMACPP_MODEL LLAMACPP_MODEL_SHA256 LLAMACPP_HOST LLAMACPP_PORT \
+        LLAMACPP_ALLOW_FROM LLAMACPP_API_KEY_FILE LLAMACPP_CTX LLAMACPP_PARALLEL \
+        LLAMACPP_EXTRA_ARGS \
+        DS4_BIN DS4_MODEL DS4_MODEL_SHA256 DS4_HOST DS4_PORT DS4_ALLOW_FROM DS4_CTX \
+        DS4_BATCHED_SESSIONS DS4_WORKDIR DS4_EXTRA_ARGS \
+        MSS_GUARD_FREE_PCT MSS_GUARD_SWAP_HEADROOM_MB MSS_GUARD_STREAK MSS_LOG_MAX_MB
+}
+
+# A value is taken literally. Characters a shell would interpret are refused
+# instead of escaped, so the file can never mean more than it says.
+_mss_envfile_value_ok() {
+    case ${1:-} in
+        *'$'*|*'`'*|*'"'*|*"'"*|*'\'*|*"$_mss_cr"*|*"$_mss_nl"*) return 1 ;;
+    esac
+    return 0
+}
+
+# The file must be a regular file (not a symlink), owned by the invoking uid,
+# and not group- or world-writable.
+mss_envfile_check_file() {
+    _ef=$1
+    if [ -L "$_ef" ]; then mss_error "$_ef is a symlink; refusing to read it"; return 1; fi
+    [ -f "$_ef" ] || { mss_error "$_ef is not a regular file"; return 1; }
+    _euid=$(stat -f '%u' "$_ef") || return 1
+    [ "$_euid" = "$(id -u)" ] || { mss_error "$_ef is owned by uid $_euid, not by you (uid $(id -u))"; return 1; }
+    _emode=$(stat -f '%Lp' "$_ef") || return 1
+    if [ $(( (0$_emode / 8) & 2 )) -ne 0 ] || [ $(( 0$_emode & 2 )) -ne 0 ]; then
+        mss_error "$_ef is group- or world-writable (mode $_emode); run chmod 600 on it"
+        return 1
+    fi
+    return 0
+}
+
+# mss_envfile_load FILE: validate every line first, then export each non-empty
+# value unless the environment already has a non-empty value for that key.
+# Sets MSS_ENVFILE_OVERRIDDEN to the keys the environment overrode.
+mss_envfile_load() {
+    _ef=$1
+    mss_envfile_check_file "$_ef" || return 1
+    _ekeys=" $(mss_envfile_keys) "
+    _eseen=" "
+    _eok=""
+    _eno=0
+    while IFS= read -r _eline || [ -n "$_eline" ]; do
+        _eno=$((_eno + 1))
+        _estrip=${_eline#"${_eline%%[![:space:]]*}"}
+        case $_estrip in ''|'#'*) continue ;; esac
+        case $_eline in
+            export[[:space:]]*) mss_error "$_ef line $_eno: 'export' is not allowed; write KEY=value"; return 1 ;;
+            *=*) ;;
+            *) mss_error "$_ef line $_eno: not a KEY=value line"; return 1 ;;
+        esac
+        _ekey=${_eline%%=*}
+        _evalue=${_eline#*=}
+        case $_ekey in
+            ''|*[!A-Z0-9_]*) mss_error "$_ef line $_eno: invalid key '$_ekey'"; return 1 ;;
+        esac
+        case $_ekeys in *" $_ekey "*) ;; *) mss_error "$_ef line $_eno: unknown key $_ekey"; return 1 ;; esac
+        case $_eseen in *" $_ekey "*) mss_error "$_ef line $_eno: duplicate key $_ekey"; return 1 ;; esac
+        _eseen="$_eseen$_ekey "
+        _mss_envfile_value_ok "$_evalue" || {
+            mss_error "$_ef line $_eno: $_ekey contains a quote, \$, backtick, backslash or carriage return; values are literal"
+            return 1
+        }
+        [ "$_ekey" != MSS_BACKENDS ] || [ -n "$_evalue" ] || { mss_error "$_ef line $_eno: MSS_BACKENDS is empty"; return 1; }
+        _eok="$_eok$_ekey=$_evalue$_mss_nl"
+    done < "$_ef"
+    case $_eseen in *" MSS_BACKENDS "*) ;; *) mss_error "$_ef has no MSS_BACKENDS line"; return 1 ;; esac
+
+    MSS_ENVFILE_OVERRIDDEN=""
+    while IFS= read -r _eline; do
+        [ -n "$_eline" ] || continue
+        _ekey=${_eline%%=*}
+        _evalue=${_eline#*=}
+        [ -n "$_evalue" ] || continue
+        if [ -n "$(printenv "$_ekey")" ]; then
+            MSS_ENVFILE_OVERRIDDEN="$MSS_ENVFILE_OVERRIDDEN $_ekey"
+            continue
+        fi
+        export "$_ekey=$_evalue"
+    done <<MSS_ENVFILE_EOF
+$_eok
+MSS_ENVFILE_EOF
+    return 0
+}
+
+# mss_envfile_write FILE: write every exported non-empty key, in the example's
+# order, atomically with mode 0600. Refuses to run as root or to replace a
+# symlink. Comments are not preserved.
+mss_envfile_write() {
+    _ef=$1
+    [ "$(id -u)" -ne 0 ] || { mss_error "refusing to write $_ef as root"; return 1; }
+    if [ -L "$_ef" ]; then mss_error "$_ef is a symlink; refusing to replace it"; return 1; fi
+    for _ek in $(mss_envfile_keys); do
+        _ev=$(printenv "$_ek")
+        _mss_envfile_value_ok "$_ev" || { mss_error "$_ek has a character backends.env cannot hold (quote, \$, backtick, backslash)"; return 1; }
+    done
+    _etmp=$(mktemp "$(dirname "$_ef")/.backends.env.XXXXXX") || { mss_error "cannot create a temporary file next to $_ef"; return 1; }
+    if ! chmod 600 "$_etmp"; then rm -f "$_etmp"; return 1; fi
+    if ! {
+        echo "# Written by scripts/install.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ)."
+        echo "# KEY=value lines, parsed and never sourced: no quotes, no \$, no export."
+        for _ek in $(mss_envfile_keys); do
+            _ev=$(printenv "$_ek")
+            [ -z "$_ev" ] || printf '%s=%s\n' "$_ek" "$_ev"
+        done
+    } > "$_etmp"; then
+        rm -f "$_etmp"; mss_error "cannot write $_etmp"; return 1
+    fi
+    mv -f "$_etmp" "$_ef" || { rm -f "$_etmp"; mss_error "cannot replace $_ef"; return 1; }
+}

@@ -20,3 +20,5 @@ community/
 # Model artifacts and API keys (issue #9)
 *.gguf
 *.api-key
+# Saved install.sh answers (issue #12)
+backends.env

@@ -8,6 +8,58 @@
 REPO_DIR=$(cd "$(dirname "$0")/.." && pwd)
 . "$REPO_DIR/scripts/lib/mss-common.sh" || exit 1
 
+# ── Modes (1.4.0). With no flag and no terminal, or with MSS_BACKENDS set, the
+# 1.3.0 flow runs unchanged: environment variables only, backends.env is never
+# read and nothing is asked. On a terminal, the saved backends.env is used, or
+# the picker runs on first use. --configure / --configure-only always pick.
+mss_install_usage() {
+    cat >&2 <<'USAGE'
+usage: scripts/install.sh [--configure | --configure-only]
+  (no flag)          on a terminal, use the saved backends.env or pick on first run;
+                     with MSS_BACKENDS set or no terminal, environment variables only
+  --configure        pick the backends again, save backends.env, then install
+  --configure-only   pick and save backends.env, check it, change nothing
+USAGE
+}
+MSS_FLAG=""
+for mss_arg in "$@"; do
+    case $mss_arg in
+        --configure|--configure-only)
+            [ -z "$MSS_FLAG" ] || { mss_install_usage; exit 2; }
+            MSS_FLAG=$mss_arg ;;
+        -h|--help) mss_install_usage; exit 0 ;;
+        *) echo "install.sh: unknown argument '$mss_arg'" >&2; mss_install_usage; exit 2 ;;
+    esac
+done
+MSS_ENV_FILE=${MSS_ENV_FILE:-$REPO_DIR/backends.env}
+MSS_PICKER_REPLACE=""
+MSS_SWITCH_FROM=""
+mss_on_terminal() { [ -t 0 ] && [ -t 2 ]; }
+if [ -n "$MSS_FLAG" ]; then
+    mss_on_terminal || { echo "install.sh $MSS_FLAG needs a terminal" >&2; exit 2; }
+    [ "$(id -u)" -ne 0 ] || { echo "install.sh: run install.sh as your user; it calls sudo itself" >&2; exit 1; }
+    MSS_MODE=picker
+elif ! mss_on_terminal || [ -n "${MSS_BACKENDS+x}" ]; then
+    MSS_MODE="env"
+elif [ "$(id -u)" -eq 0 ]; then
+    echo "install.sh: run install.sh as your user; it calls sudo itself" >&2
+    exit 1
+elif [ -e "$MSS_ENV_FILE" ] || [ -L "$MSS_ENV_FILE" ]; then
+    MSS_MODE=loaded
+else
+    MSS_MODE=picker
+fi
+if [ "$MSS_MODE" = loaded ]; then
+    mss_envfile_load "$MSS_ENV_FILE" || exit 1
+    echo "Using $MSS_ENV_FILE: MSS_BACKENDS=$MSS_BACKENDS${MSS_ENVFILE_OVERRIDDEN:+ (set in the environment instead:$MSS_ENVFILE_OVERRIDDEN)}" >&2
+elif [ "$MSS_MODE" = picker ]; then
+    . "$REPO_DIR/scripts/lib/mss-picker.sh" || exit 1
+    MSS_INSTALLED_SEL=$(mss_conf_get MSS_BACKENDS 2>/dev/null)
+    MSS_INSTALLED_OPT=$(mss_conf_get MSS_GUARD_BACKEND 2>/dev/null)
+    mss_picker_run "$MSS_ENV_FILE" "$MSS_INSTALLED_SEL" "$MSS_INSTALLED_OPT" \
+        "$([ "$MSS_FLAG" = --configure-only ] && echo 1 || echo 0)"
+fi
+
 # Configuration
 USER=${OLLAMA_USER:-$(whoami)}
 BASE_DIR=${OLLAMA_BASE_DIR:-"/Users/$USER/mac-studio-server"}
@@ -22,7 +74,11 @@ log_action() {
 }
 
 run_install_backends() {
+    # MSS_REPLACE_BACKEND reaches only the --check-only pass of a switch.
+    mss_replace=""
+    [ "${1:-}" != --check-only ] || mss_replace=$MSS_PICKER_REPLACE
     sudo env \
+        MSS_REPLACE_BACKEND="$mss_replace" \
         MSS_BACKENDS="$BACKENDS" \
         OLLAMA_USER="$USER" \
         OLLAMA_BIND="$BIND" \
@@ -57,8 +113,21 @@ run_install_backends() {
 # Validate before any system change.
 mss_validate_selection "$BACKENDS" || exit 1
 mss_validate_ipv4 "$BIND" || { mss_error "OLLAMA_BIND: '$BIND' must be a single IPv4 address"; exit 1; }
+if [ "$MSS_FLAG" = --configure-only ]; then
+    run_install_backends --check-only || exit 1
+    if [ -n "$MSS_PICKER_REPLACE" ]; then
+        echo "$MSS_PICKER_REPLACE is still installed. install.sh --configure will offer to replace it." >&2
+    fi
+    echo "Saved $MSS_ENV_FILE and checked it; nothing was installed." >&2
+    exit 0
+fi
 if mss_backend_selected llamacpp || mss_backend_selected ds4; then
     run_install_backends --check-only || exit 1
+fi
+# A confirmed switch removes the old backend only now, after the check passed.
+if [ -n "$MSS_SWITCH_FROM" ]; then
+    echo "Removing $MSS_SWITCH_FROM ..." >&2
+    sudo /bin/sh "$REPO_DIR/scripts/uninstall.sh" --backend "$MSS_SWITCH_FROM" || exit 1
 fi
 
 # log_action appends to $LOG_FILE, so its directory must exist first.

@@ -69,6 +69,8 @@ MSS_GUARD_SWAP_HEADROOM_MB=${MSS_GUARD_SWAP_HEADROOM_MB:-2048}
 MSS_GUARD_STREAK=${MSS_GUARD_STREAK:-3}
 MSS_LOG_MAX_MB=${MSS_LOG_MAX_MB:-100}
 MSS_PFCTL=${MSS_PFCTL:-/sbin/pfctl}
+# Set only by install.sh --configure(-only) when switching optional backends.
+MSS_REPLACE_BACKEND=${MSS_REPLACE_BACKEND:-}
 
 LIBEXEC_DIR="/usr/local/libexec/mac-studio-server"
 ETC_DIR="/usr/local/etc/mac-studio-server"
@@ -92,6 +94,20 @@ if [ -z "$RENDER_ONLY" ]; then
 fi
 mss_validate_path_chars MSS_PFCTL "$MSS_PFCTL" || exit 1
 
+# The optional backend already installed (backends.conf is world-readable).
+_installed_opt=""
+if [ -r "$CONF" ]; then
+    _installed_opt=$(awk -F= 'index($0,"MSS_GUARD_BACKEND=")==1{print substr($0,length("MSS_GUARD_BACKEND=")+1)}' "$CONF")
+fi
+
+# MSS_REPLACE_BACKEND lets the switch check see through the backend that is
+# about to be removed: only with --check-only, only for the installed backend.
+if [ -n "$MSS_REPLACE_BACKEND" ]; then
+    [ "$CHECK_ONLY" = 1 ] || mss_die "MSS_REPLACE_BACKEND is accepted only with --check-only"
+    [ "$MSS_REPLACE_BACKEND" = "$_installed_opt" ] \
+        || mss_die "MSS_REPLACE_BACKEND='$MSS_REPLACE_BACKEND' is not the installed optional backend ('${_installed_opt:-none}')"
+fi
+
 mss_validate_ipv4 "$OLLAMA_BIND" || mss_die "OLLAMA_BIND: '$OLLAMA_BIND' must be a single IPv4 address"
 if mss_backend_selected ollama; then
     mss_is_loopback_host "$OLLAMA_BIND" || \
@@ -113,24 +129,32 @@ pid_is_under() {
     return 1
 }
 
-# A listener is fine only when it belongs to this backend's own running job
-# (re-install): its PID, or an ancestor, is the job PID. The job PID comes from
-# `launchctl print system/<label>`, which needs root, so the exemption is
-# decided only in the root pass. A non-root pass (--check-only or
-# --render-only) defers any listener to it.
+# A listener is fine only when it belongs to one of the given labels' running
+# jobs (re-install, or the backend a switch replaces): its PID, or an ancestor,
+# is that job's PID. The job PID comes from `launchctl print system/<label>`,
+# which needs root, so the exemption is decided only in the root pass. A
+# non-root pass (--check-only or --render-only) defers any listener to it.
 validate_port_free() {
-    _port=$1 _var=$2 _label=$3
+    _port=$1 _var=$2
+    shift 2
     _pids=$(lsof -nP -iTCP:"$_port" -sTCP:LISTEN -t 2>/dev/null | sort -u)
     [ -n "$_pids" ] || return 0
     if [ "$(id -u)" -ne 0 ]; then
         echo "note: $_var: port $_port is in use; ownership is checked in the root install" >&2
         return 0
     fi
-    _own=$(launchctl print "system/$_label" 2>/dev/null | sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\).*/\1/p' | head -n 1)
+    _owns=""
+    for _label in "$@"; do
+        _own=$(launchctl print "system/$_label" 2>/dev/null | sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\).*/\1/p' | head -n 1)
+        [ -z "$_own" ] || _owns="$_owns $_own"
+    done
     _foreign=""
     for _lp in $_pids; do
-        [ -n "$_own" ] && pid_is_under "$_lp" "$_own" && continue
-        _foreign="$_foreign $_lp"
+        _mine=0
+        for _own in $_owns; do
+            if pid_is_under "$_lp" "$_own"; then _mine=1; break; fi
+        done
+        [ "$_mine" = 1 ] || _foreign="$_foreign $_lp"
     done
     [ -z "$_foreign" ] && return 0
     mss_die "$_var: port $_port is already bound by pid(s)$_foreign"
@@ -244,7 +268,11 @@ validate_optional_backend() {
             ;;
     esac
 
-    validate_port_free "$_port" "${_upper}_PORT" "com.mac-studio-server.$_b"
+    if [ -n "$MSS_REPLACE_BACKEND" ]; then
+        validate_port_free "$_port" "${_upper}_PORT" "com.mac-studio-server.$_b" "com.mac-studio-server.$MSS_REPLACE_BACKEND"
+    else
+        validate_port_free "$_port" "${_upper}_PORT" "com.mac-studio-server.$_b"
+    fi
 }
 
 if mss_backend_selected llamacpp; then
@@ -271,13 +299,11 @@ mss_validate_uint MSS_GUARD_FREE_PCT "$MSS_GUARD_FREE_PCT" 1 99 || exit 1
 mss_validate_uint MSS_GUARD_SWAP_HEADROOM_MB "$MSS_GUARD_SWAP_HEADROOM_MB" 0 || exit 1
 mss_validate_uint MSS_LOG_MAX_MB "$MSS_LOG_MAX_MB" 1 || exit 1
 
-# Re-install with a different optional backend: refuse (D7).
-_installed_opt=""
-if [ -r "$CONF" ]; then
-    _installed_opt=$(awk -F= 'index($0,"MSS_GUARD_BACKEND=")==1{print substr($0,length("MSS_GUARD_BACKEND=")+1)}' "$CONF")
-    if [ -n "$_installed_opt" ] && [ -n "$_optional" ] && [ "$_installed_opt" != "$_optional" ]; then
-        mss_die "installed optional backend is '$_installed_opt'; run scripts/uninstall.sh --backend $_installed_opt first"
-    fi
+# Re-install with a different optional backend: refuse (D7), unless this is the
+# switch check for exactly the installed backend.
+if [ -n "$_installed_opt" ] && [ -n "$_optional" ] && [ "$_installed_opt" != "$_optional" ] \
+    && [ -z "$MSS_REPLACE_BACKEND" ]; then
+    mss_die "installed optional backend is '$_installed_opt'; run scripts/uninstall.sh --backend $_installed_opt first, or scripts/install.sh --configure to switch"
 fi
 
 # Wired limit: same integer formula and evaluation order as set-gpu-memory.sh.
