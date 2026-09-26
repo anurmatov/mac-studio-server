@@ -186,7 +186,9 @@ mss_acquire_homebrew() {
 mss_acquire_ollama_brew() {
     local brew
     brew=$(mss_brew) || return 1
-    "$brew" install ollama >&2 || return 1
+    # The user's y to our offer is the consent: Homebrew's own ask mode (its default since 4.6)
+    # would stop again at "Do you want to proceed?" whenever dependencies come along.
+    HOMEBREW_NO_ASK=1 "$brew" install ollama </dev/null >&2 || return 1
     OLLAMA_BIN="$("$brew" --prefix)/bin/ollama"
     [ -x "$OLLAMA_BIN" ] || return 1
     export OLLAMA_BIN
@@ -195,7 +197,7 @@ mss_acquire_ollama_brew() {
 mss_acquire_llamacpp_brew() {
     local brew
     brew=$(mss_brew) || return 1
-    "$brew" install llama.cpp >&2 || return 1
+    HOMEBREW_NO_ASK=1 "$brew" install llama.cpp </dev/null >&2 || return 1
     LLAMACPP_BIN="$("$brew" --prefix)/bin/llama-server"
     [ -x "$LLAMACPP_BIN" ] || return 1
     export LLAMACPP_BIN
