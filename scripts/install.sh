@@ -176,6 +176,11 @@ if [ "$MSS_MODE" = picker ]; then
 fi
 else
     log_action "Skipping Ollama (MSS_BACKENDS=$BACKENDS); an existing Ollama install is left untouched"
+    # Without Ollama the tweaks run only on an explicit yes (1.4.0 never ran them here).
+    if [ "${MSS_TUNE_MACOS:-}" = yes ]; then
+        log_action "Running system optimization..."
+        "$BASE_DIR/scripts/optimize-mac-server.sh"
+    fi
 fi
 
 # Install GPU memory optimization (if GPU_PERCENT is set)

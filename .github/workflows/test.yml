@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches: [main]
+    tags: ['v*']
 
 jobs:
   tests:
@@ -107,3 +108,225 @@ jobs:
           sudo cat /usr/local/etc/mac-studio-server/backends.conf || true
           sudo tail -n 80 /var/log/mac-studio-server/llamacpp.log || true
           sudo tail -n 20 /var/log/mac-studio-server/guard.jsonl || true
+
+  acquire:
+    # 1.5.0 acquisition against the real network: the pinned ds4 build, brew llama.cpp through the
+    # picker, and the resumable, size- and sha-checked download.
+    runs-on: macos-14
+    timeout-minutes: 60
+    env:
+      CAT: tests/fixtures/catalog/more.tsv
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ds4-server at the pinned commit (A11)
+        run: |
+          set -eu
+          REPO_DIR=$PWD; . scripts/lib/mss-common.sh; . scripts/lib/mss-acquire.sh
+          d=$RUNNER_TEMP/ds4
+          mss_acquire_ds4_build "$d"
+          test "$(git -C "$d" rev-parse HEAD)" = "$MSS_DS4_COMMIT"
+          "$d/ds4-server" --help 2>&1 | grep -q -- --batched-session
+          # a second run reuses the checkout; the untracked mss-build.log is accepted
+          mss_acquire_ds4_build "$d" 2>"$RUNNER_TEMP/second.log"
+          if grep -q '^cloning' "$RUNNER_TEMP/second.log"; then echo "re-cloned"; exit 1; fi
+          # refused and left unchanged: another commit, a non-git directory, the pin with an edit
+          git clone -q "$d" "$RUNNER_TEMP/other"; git -C "$RUNNER_TEMP/other" checkout -q --detach HEAD~1
+          before=$(git -C "$RUNNER_TEMP/other" rev-parse HEAD)
+          if mss_acquire_ds4_build "$RUNNER_TEMP/other"; then echo "accepted another commit"; exit 1; fi
+          test "$(git -C "$RUNNER_TEMP/other" rev-parse HEAD)" = "$before"
+          mkdir "$RUNNER_TEMP/plain"; echo keep > "$RUNNER_TEMP/plain/file"
+          if mss_acquire_ds4_build "$RUNNER_TEMP/plain"; then echo "accepted a non-git directory"; exit 1; fi
+          test "$(ls "$RUNNER_TEMP/plain")" = file
+          git clone -q "$d" "$RUNNER_TEMP/edited"; git -C "$RUNNER_TEMP/edited" checkout -q --detach "$MSS_DS4_COMMIT"
+          echo edit >> "$RUNNER_TEMP/edited/README.md"
+          if mss_acquire_ds4_build "$RUNNER_TEMP/edited"; then echo "accepted an edited checkout"; exit 1; fi
+          grep -q '^edit$' "$RUNNER_TEMP/edited/README.md"
+
+      - name: ds4 build without git (A12)
+        run: |
+          set -u
+          REPO_DIR=$PWD; . scripts/lib/mss-common.sh; . scripts/lib/mss-acquire.sh
+          mkdir -p "$RUNNER_TEMP/nogit"
+          for t in make cc grep dirname xcode-select; do ln -sf "$(command -v "$t")" "$RUNNER_TEMP/nogit/$t"; done
+          out=$(PATH="$RUNNER_TEMP/nogit" mss_acquire_ds4_build "$RUNNER_TEMP/ds4-nogit" 2>&1) && { echo "built without git"; exit 1; }
+          echo "$out"
+          echo "$out" | grep -q 'needs: git' || { echo "the message does not name git"; exit 1; }
+          test ! -e "$RUNNER_TEMP/ds4-nogit"
+
+      - name: llama.cpp through the picker, brew and a catalogue download (A4)
+        run: |
+          set -u
+          if command -v llama-server >/dev/null; then echo "llama-server is already on PATH"; exit 1; fi
+          T=$(printf '\t')
+          printf '%s\n' "Choose [1]: ${T}4" "brew install llama.cpp)? [y/N]: ${T}y" "later [1]: ${T}2" \
+            "Save the model to [${HOME}/models/stories260K.gguf]: ${T}@ENTER" "free)? [y/N]: ${T}y" \
+            "LAN access to llamacpp? [y/N]: ${T}@ENTER" "auto-updates)? [y/N]: ${T}n" \
+            "Install with these settings? [Y/n]: ${T}@ENTER" > "$RUNNER_TEMP/a4.steps"
+          MSS_CATALOG="$PWD/$CAT" MSS_ENV_FILE="$RUNNER_TEMP/a4.env" LLAMACPP_PORT=18080 MSS_EXPECT_TIMEOUT=600 \
+            expect tests/expect/drive.exp "$RUNNER_TEMP/a4.steps" "$RUNNER_TEMP/a4.transcript" /bin/bash scripts/install.sh
+          rc=$?; tr -d '\r' < "$RUNNER_TEMP/a4.transcript"
+          test "$rc" = 0
+          test "$(tr -d '\r' < "$RUNNER_TEMP/a4.transcript" | grep -c '^hashing llamacpp model')" = 1
+          for i in $(seq 1 60); do nc -z 127.0.0.1 18080 && break; sleep 2; done
+          sh scripts/status.sh
+
+      - name: Downloads resume, refuse and keep a bad file (A6-A9)
+        run: |
+          set -eu
+          REPO_DIR=$PWD; . scripts/lib/mss-common.sh; . scripts/lib/mss-acquire.sh
+          url=$(mss_catalog_url llamacpp stories260k); D=$RUNNER_TEMP/dl
+          mkdir -p "$D"; head -c 500000 "$HOME/models/stories260K.gguf" > "$D/r.gguf.part"
+          mss_acquire_download "$url" "$D/r.gguf" 1185376 0 2>"$D/a6.log"; cat "$D/a6.log"
+          grep -q 'resuming r.gguf at 500000 bytes' "$D/a6.log"                                    # A6
+          test "$(stat -f %z "$D/r.gguf")" = 1185376
+          echo "270cba1bd5109f42d03350f60406024560464db173c0e387d91f0426d3bd256d  $D/r.gguf" | shasum -a 256 -c
+          if MSS_CATALOG="$PWD/tests/fixtures/catalog/size-plus-one.tsv" \
+            mss_acquire_download "$url" "$D/big.gguf" "$(MSS_CATALOG="$PWD/tests/fixtures/catalog/size-plus-one.tsv" mss_catalog_get llamacpp stories260k size)" 0; then
+            echo "A7 accepted a size mismatch"; exit 1; fi
+          test ! -e "$D/big.gguf.part"                                                              # A7
+          if out=$(MSS_DF="$PWD/tests/stubs/df-low" mss_acquire_download "$url" "$D/low.gguf" 1185376 0 2>&1); then
+            echo "A8 downloaded with too little space"; exit 1; fi
+          echo "$out" | grep -q 'needs .*free'; test ! -e "$D/low.gguf.part"                       # A8
+          # A9: the right size, the wrong sha: the check exits 3, the file becomes .sha-mismatch
+          zero=$(printf '0%.0s' $(seq 64))
+          set +e
+          MSS_BACKENDS=llamacpp LLAMACPP_BIN="$(command -v llama-server)" LLAMACPP_MODEL="$D/bad.gguf" \
+            LLAMACPP_MODEL_URL="$url" LLAMACPP_MODEL_SHA256="$zero" LLAMACPP_PORT=18090 \
+            ./scripts/install.sh </dev/null > "$D/a9.log" 2>&1
+          rc=$?; set -e; cat "$D/a9.log"
+          test "$rc" = 1
+          test -e "$D/bad.gguf.sha-mismatch"; test ! -e "$D/bad.gguf"
+          ! launchctl print system/com.mac-studio-server.llamacpp >/dev/null 2>&1 || grep -q 18080 /usr/local/etc/mac-studio-server/backends.conf
+
+      - name: Clean up
+        if: always()
+        run: sudo sh scripts/uninstall.sh --all || true
+
+  bootstrap:
+    # The one-liner on clean runners (B1b-B4), through the real raw URL of this commit.
+    runs-on: macos-14
+    timeout-minutes: 45
+    env:
+      REF: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: No terminal (B1b)
+        run: |
+          set -u
+          out=$(curl -fsSL "https://raw.githubusercontent.com/anurmatov/mac-studio-server/$REF/bootstrap.sh" | sh -s -- --ref "$REF" 2>&1)
+          rc=$?; echo "$out"
+          test "$rc" = 1
+          echo "$out" | grep -q '^no terminal: git clone https://github.com/anurmatov/mac-studio-server.git'
+          test ! -e "$HOME/mac-studio-server"
+
+      - name: Missing Command Line Tools, declined (B3)
+        run: |
+          set -u
+          T=$(printf '\t')
+          printf '%s\n' "(needed for git)? [y/N]: ${T}n" > "$RUNNER_TEMP/b3.steps"
+          MSS_XCODE_SELECT="$PWD/tests/stubs/xcode-select-missing" expect tests/expect/drive.exp "$RUNNER_TEMP/b3.steps" \
+            "$RUNNER_TEMP/b3.transcript" sh -c "curl -fsSL https://raw.githubusercontent.com/anurmatov/mac-studio-server/$REF/bootstrap.sh | sh -s -- --ref $REF"
+          rc=$?; tr -d '\r' < "$RUNNER_TEMP/b3.transcript"
+          test "$rc" = 1
+          grep -q '^xcode-select --install' "$RUNNER_TEMP/b3.transcript"
+          test ! -e "$HOME/mac-studio-server"
+
+      - name: Existing directories (B4)
+        run: |
+          set -u
+          T=$(printf '\t'); run() { # run <dir> <transcript>: bootstrap into MSS_DIR, Ctrl-C at the menu
+            printf '%s\n' "Choose [1]: ${T}@INTR" > "$RUNNER_TEMP/b4.steps"
+            MSS_DIR=$1 expect tests/expect/drive.exp "$RUNNER_TEMP/b4.steps" "$2" \
+              sh -c "curl -fsSL https://raw.githubusercontent.com/anurmatov/mac-studio-server/$REF/bootstrap.sh | sh -s -- --ref $REF"; }
+          git clone -q https://github.com/anurmatov/mac-studio-server.git "$RUNNER_TEMP/old"
+          git -C "$RUNNER_TEMP/old" checkout -q --detach 66c9d35
+          run "$RUNNER_TEMP/old" "$RUNNER_TEMP/b4a.transcript"; tr -d '\r' < "$RUNNER_TEMP/b4a.transcript"
+          test "$(git -C "$RUNNER_TEMP/old" rev-parse HEAD)" = "$REF"
+          grep -q "at commit $REF" "$RUNNER_TEMP/b4a.transcript"
+          git clone -q https://github.com/anurmatov/mac-studio-server.git "$RUNNER_TEMP/edited"
+          git -C "$RUNNER_TEMP/edited" checkout -q --detach 66c9d35; echo edit >> "$RUNNER_TEMP/edited/README.md"
+          run "$RUNNER_TEMP/edited" "$RUNNER_TEMP/b4b.transcript"
+          test "$(git -C "$RUNNER_TEMP/edited" rev-parse HEAD)" = "$(git -C "$RUNNER_TEMP/edited" rev-parse 66c9d35)"
+          grep -q 'has modified files; left untouched' "$RUNNER_TEMP/b4b.transcript"
+          mkdir "$RUNNER_TEMP/plain"; echo keep > "$RUNNER_TEMP/plain/file"
+          run "$RUNNER_TEMP/plain" "$RUNNER_TEMP/b4c.transcript"
+          test "$(ls "$RUNNER_TEMP/plain")" = file
+          grep -q 'not a mac-studio-server clone; left untouched' "$RUNNER_TEMP/b4c.transcript"
+
+      - name: Fresh install from the one-liner (B2, F1, S4)
+        run: |
+          set -u
+          test ! -e /usr/local/bin/ollama
+          # Ollama must be missing: drop any PATH directory that has it.
+          P=$(printf '%s\n' "$PATH" | tr ':' '\n' | while IFS= read -r d; do [ -x "$d/ollama" ] || printf '%s:' "$d"; done)
+          T=$(printf '\t')
+          printf '%s\n' "Choose [1]: ${T}2" "(brew install ollama)? [y/N]: ${T}y" "brew install llama.cpp)? [y/N]: ${T}y" \
+            "later [1]: ${T}2" "Save the model to [${HOME}/models/stories260K.gguf]: ${T}@ENTER" "free)? [y/N]: ${T}y" \
+            "LAN access to llamacpp? [y/N]: ${T}@ENTER" "auto-updates)? [y/N]: ${T}n" \
+            "Install with these settings? [Y/n]: ${T}@ENTER" "(starter) 2) later [1]: ${T}1" > "$RUNNER_TEMP/b2.steps"
+          PATH="${P%:}" MSS_CATALOG="$HOME/mac-studio-server/tests/fixtures/catalog/more.tsv" LLAMACPP_PORT=18080 \
+            MSS_EXPECT_TIMEOUT=900 expect tests/expect/drive.exp "$RUNNER_TEMP/b2.steps" "$RUNNER_TEMP/b2.transcript" \
+            sh -c "curl -fsSL https://raw.githubusercontent.com/anurmatov/mac-studio-server/$REF/bootstrap.sh | sh -s -- --ref $REF"
+          rc=$?; tr -d '\r' < "$RUNNER_TEMP/b2.transcript" > "$RUNNER_TEMP/b2.txt"; cat "$RUNNER_TEMP/b2.txt"
+          test "$rc" = 0
+          test "$(git -C "$HOME/mac-studio-server" rev-parse HEAD)" = "$REF"
+          grep -q "at commit $REF" "$RUNNER_TEMP/b2.txt"
+          grep -qx 'OLLAMA_BIN=/opt/homebrew/bin/ollama' "$HOME/mac-studio-server/backends.env"
+          grep -q '<string>/opt/homebrew/bin/ollama</string>' /Library/LaunchDaemons/com.ollama.service.plist
+          /opt/homebrew/bin/ollama list | grep -q 'smollm2:135m'
+          test "$(grep -c '^hashing llamacpp model' "$RUNNER_TEMP/b2.txt")" = 1
+          for i in $(seq 1 60); do nc -z 127.0.0.1 18080 && break; sleep 2; done
+          sh "$HOME/mac-studio-server/scripts/status.sh"
+          # F1: every prompt is on the allowlist, none repeats, at most 11 (entry 7 includes its
+          # "more" sub-prompts); S4: prompts stay within 100 characters.
+          sed -n 's/^\(.*\]: \).*/\1/p' "$RUNNER_TEMP/b2.txt" > "$RUNNER_TEMP/prompts"
+          cat "$RUNNER_TEMP/prompts"
+          test -z "$(awk 'length($0) > 100' "$RUNNER_TEMP/prompts")"
+          test -z "$(sort "$RUNNER_TEMP/prompts" | uniq -d)"
+          n=$(grep -v -e '^Save the model to' -e '^Download ' "$RUNNER_TEMP/prompts" | wc -l | tr -d ' ')
+          echo "prompts (allowlist entries): $n"; test "$n" -le 11
+
+      - name: Clean up
+        if: always()
+        run: sudo sh "$HOME/mac-studio-server/scripts/uninstall.sh" --all || true
+
+  release-bootstrap:
+    # B6: on a v* tag, the README one-liner verbatim, after checking the tag ruleset exists.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Release tags are protected
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          for id in $(gh api repos/anurmatov/mac-studio-server/rulesets --jq '.[] | select(.target == "tag" and .enforcement == "active") | .id'); do
+            gh api "repos/anurmatov/mac-studio-server/rulesets/$id" > "$RUNNER_TEMP/rs.json"
+            if jq -e '(.conditions.ref_name.include | index("refs/tags/v*")) and ([.rules[].type] | index("update") and index("deletion"))' \
+              "$RUNNER_TEMP/rs.json" >/dev/null; then echo "ruleset $id protects v* tags"; exit 0; fi
+          done
+          echo "no active ruleset blocks update and deletion of refs/tags/v*"; exit 1
+
+      - name: The README one-liner, declining everything
+        run: |
+          set -u
+          line=$(grep -m 1 '^curl -fsSL https://raw.githubusercontent.com/anurmatov/mac-studio-server/' README.md)
+          echo "$line"
+          T=$(printf '\t'); printf '%s\n' "Choose [1]: ${T}@INTR" > "$RUNNER_TEMP/b6.steps"
+          commit=$GITHUB_SHA
+          for attempt in 1 2; do
+            rm -rf "$HOME/mac-studio-server"
+            expect tests/expect/drive.exp "$RUNNER_TEMP/b6.steps" "$RUNNER_TEMP/b6.transcript" sh -c "$line"
+            rc=$?
+            if grep -q "at commit $commit" "$RUNNER_TEMP/b6.transcript" && grep -q 'Which backends' "$RUNNER_TEMP/b6.transcript"; then
+              tr -d '\r' < "$RUNNER_TEMP/b6.transcript"; echo "exit $rc (130 is the Ctrl-C at the menu)"; exit 0
+            fi
+            tr -d '\r' < "$RUNNER_TEMP/b6.transcript"
+            [ "$attempt" = 2 ] || { echo "retrying in 5 minutes (raw CDN)"; sleep 300; }
+          done
+          exit 1

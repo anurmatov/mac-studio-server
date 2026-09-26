@@ -544,9 +544,9 @@ _mss_pick_summary() {
         *,ollama,*)
             echo "  ollama: the Ollama service is (re)installed and restarted" >&2
             [ -z "$(printenv OLLAMA_BIN)" ] || echo "  ollama binary: $(printenv OLLAMA_BIN)" >&2
-            echo "  headless tweaks: $(printenv MSS_TUNE_MACOS)" >&2
             ;;
     esac
+    echo "  headless tweaks: $(printenv MSS_TUNE_MACOS)" >&2
     if [ -n "$b" ]; then
         P=$(mss_prefix "$b")
         echo "  $b binary:  $(printenv "${P}_BIN")" >&2
@@ -600,7 +600,7 @@ mss_picker_run() {
 
     case ",$sel," in *,ollama,*) _mss_pick_ollama ;; esac
     [ -z "$b" ] || _mss_pick_backend "$b"
-    case ",$sel," in *,ollama,*) _mss_pick_tweaks ;; esac
+    _mss_pick_tweaks
 
     # 7. summary and confirmation
     _mss_pick_summary "$sel" "$b"
