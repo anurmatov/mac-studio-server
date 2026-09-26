@@ -305,7 +305,16 @@ validate_optional_backend() {
             ;;
         ds4)
             mss_validate_uint DS4_CTX "$DS4_CTX" 1 || exit 1
-            [ -z "$DS4_BATCHED_SESSIONS" ] || mss_validate_uint DS4_BATCHED_SESSIONS "$DS4_BATCHED_SESSIONS" 0 || exit 1
+            if [ -n "$DS4_BATCHED_SESSIONS" ]; then
+                mss_validate_uint DS4_BATCHED_SESSIONS "$DS4_BATCHED_SESSIONS" 0 || exit 1
+            else
+                # Unset: default from installed RAM. MSS_HW_MEMSIZE is a test
+                # override, honoured only with --render-only.
+                _memsize=$(sysctl -n hw.memsize 2>/dev/null)
+                [ -z "$RENDER_ONLY" ] || _memsize=${MSS_HW_MEMSIZE:-$_memsize}
+                DS4_BATCHED_SESSIONS=$(mss_ds4_default_sessions "$_memsize")
+                echo "DS4_BATCHED_SESSIONS unset: using $DS4_BATCHED_SESSIONS for this Mac's RAM (set it to override; 1 = one session)" >&2
+            fi
             if [ -n "$DS4_WORKDIR" ]; then
                 DS4_WORKDIR_RESOLVED=$(mss_resolve_path "$DS4_WORKDIR") || exit 1
                 [ -d "$DS4_WORKDIR_RESOLVED" ] || mss_die "DS4_WORKDIR: not a directory: $DS4_WORKDIR_RESOLVED"
