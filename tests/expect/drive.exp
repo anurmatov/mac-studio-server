@@ -1,0 +1,46 @@
+#!/usr/bin/expect -f
+# drive.exp — run a command on a real pty and answer its prompts.
+#
+#   expect tests/expect/drive.exp STEPS TRANSCRIPT CMD [ARGS...]
+#
+# STEPS has one "TEXT<TAB>ANSWER" line per prompt: wait until TEXT (an exact
+# substring) is printed, then send ANSWER and Enter. ANSWER @ENTER sends Enter
+# alone, @INTR sends Ctrl-C. Lines starting with # are ignored. The whole
+# session is logged to TRANSCRIPT. The exit code is the command's, or 124 on a
+# timeout and 125 when the command ends before an expected prompt.
+
+set timeout 60
+if {[info exists env(MSS_EXPECT_TIMEOUT)]} { set timeout $env(MSS_EXPECT_TIMEOUT) }
+set steps [lindex $argv 0]
+set transcript [lindex $argv 1]
+set cmd [lrange $argv 2 end]
+log_user 0
+log_file -a -noappend $transcript
+eval spawn $cmd
+
+set f [open $steps r]
+while {[gets $f line] >= 0} {
+    if {$line eq "" || [string index $line 0] eq "#"} { continue }
+    set parts [split $line "\t"]
+    set text [lindex $parts 0]
+    set answer [lindex $parts 1]
+    expect {
+        -ex $text {}
+        timeout { puts stderr "drive.exp: timeout waiting for: $text"; exit 124 }
+        eof { puts stderr "drive.exp: exited before: $text"; catch wait; exit 125 }
+    }
+    if {$answer eq "@INTR"} {
+        send "\003"
+    } elseif {$answer eq "@ENTER"} {
+        send "\r"
+    } else {
+        send -- "$answer\r"
+    }
+}
+close $f
+expect {
+    eof {}
+    timeout { puts stderr "drive.exp: timeout waiting for exit"; exit 124 }
+}
+set result [wait]
+exit [lindex $result 3]

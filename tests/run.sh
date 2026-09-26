@@ -29,12 +29,12 @@ check_fail() { # check_fail <desc> <cmd...>
 if [ "$PHASE" != B ]; then
 echo "== phase A: static =="
 if command -v shellcheck >/dev/null 2>&1; then
-    if shellcheck -S warning -s sh "$ROOT"/libexec/*.sh "$ROOT"/scripts/lib/*.sh "$ROOT"/scripts/install-backends.sh "$ROOT"/scripts/status.sh "$ROOT"/scripts/uninstall.sh; then
+    if shellcheck -S warning -s sh "$ROOT"/libexec/*.sh "$ROOT"/scripts/lib/mss-common.sh "$ROOT"/scripts/install-backends.sh "$ROOT"/scripts/status.sh "$ROOT"/scripts/uninstall.sh; then
         ok "shellcheck -s sh"
     else
         fail "shellcheck -s sh"
     fi
-    if shellcheck -S warning "$ROOT"/scripts/install.sh; then ok "shellcheck install.sh"; else fail "shellcheck install.sh"; fi
+    if shellcheck -S warning "$ROOT"/scripts/install.sh "$ROOT"/scripts/lib/mss-picker.sh; then ok "shellcheck install.sh + mss-picker.sh (bash)"; else fail "shellcheck install.sh + mss-picker.sh"; fi
 else
     echo "skip - shellcheck not installed"
 fi
@@ -275,6 +275,167 @@ else
     echo "skip - LAN render needs the stub ifconfig (macOS only)"
 fi
 
+
+echo "== phase A: backends.env keys match config/backends.env.example (#12) =="
+EXAMPLE_KEYS=$(sed -n 's/^#\{0,1\} \{0,1\}\([A-Z][A-Z0-9_]*\)=.*/\1/p' "$ROOT/config/backends.env.example" | tr '\n' ' ' | sed 's/ $//')
+check "mss_envfile_keys equals the example's keys, in order" "$EXAMPLE_KEYS" "$(mss_envfile_keys | tr -s ' ')"
+
+echo "== phase A: backends.env parser (A11) =="
+EF="$ROOT/tests/fixtures/envfile"
+EFT="$TMP/envfile"
+mkdir -p "$EFT"
+# fixtures are copied so the owner and mode checks see a file this user owns
+envload() { ( unset MSS_BACKENDS DS4_PORT DS4_CTX DS4_EXTRA_ARGS; mss_envfile_load "$1" && printf '%s|%s|%s|%s' "$MSS_BACKENDS" "${DS4_PORT:-}" "${DS4_CTX:-}" "${DS4_EXTRA_ARGS:-}" ) }
+for f in "$EF"/*.env; do cp "$f" "$EFT/"; chmod 600 "$EFT/$(basename "$f")"; done
+check "valid file loads literally" "ds4|8001|32768|--power 60 --threads 8" "$(envload "$EFT/valid.env" 2>/dev/null)"
+check "environment wins over the file" "ds4|9000|32768|--power 60 --threads 8" \
+    "$( ( unset MSS_BACKENDS DS4_CTX DS4_EXTRA_ARGS; export DS4_PORT=9000; mss_envfile_load "$EFT/valid.env" && printf '%s|%s|%s|%s' "$MSS_BACKENDS" "$DS4_PORT" "$DS4_CTX" "$DS4_EXTRA_ARGS" ) 2>/dev/null)"
+for bad in unknown-key duplicate export dollar backtick dquote squote backslash no-backends; do
+    OUT=$(envload "$EFT/$bad.env" 2>&1) && fail "parser accepted $bad.env" || {
+        case $bad in
+            no-backends) ok "parser rejects $bad.env" ;;
+            *) printf '%s' "$OUT" | grep -q "line [0-9]" && ok "parser rejects $bad.env naming the line" || fail "parser rejects $bad.env without a line number: $OUT" ;;
+        esac
+    }
+done
+printf 'MSS_BACKENDS=ds4\r\n' > "$EFT/cr.env"; chmod 600 "$EFT/cr.env"
+check_fail "parser rejects a carriage return" mss_envfile_load "$EFT/cr.env"
+cp "$EFT/valid.env" "$EFT/group-writable.env"; chmod 620 "$EFT/group-writable.env"
+check_fail "parser rejects a group-writable file" mss_envfile_load "$EFT/group-writable.env"
+ln -s "$EFT/valid.env" "$EFT/link.env"
+check_fail "parser rejects a symlink" mss_envfile_load "$EFT/link.env"
+
+echo "== phase A: backends.env writer =="
+if [ "$(id -u)" -ne 0 ]; then
+    WF="$EFT/written.env"
+    ( unset MSS_BACKENDS DS4_PORT DS4_CTX DS4_EXTRA_ARGS
+      mss_envfile_load "$EFT/valid.env" && export DS4_PORT=8005 && mss_envfile_write "$WF" ) 2>/dev/null
+    check "writer mode 0600" "600" "$(stat -f '%Lp' "$WF" 2>/dev/null)"
+    check "writer keeps unasked keys, in example order" "MSS_BACKENDS=ds4 DS4_PORT=8005 DS4_CTX=32768 DS4_EXTRA_ARGS=--power 60 --threads 8" \
+        "$(grep -v '^#' "$WF" | tr '\n' ' ' | sed 's/ $//')"
+    ln -s "$WF" "$EFT/written-link.env"
+    check_fail "writer refuses to replace a symlink" env MSS_BACKENDS=ds4 sh -c ". '$ROOT/scripts/lib/mss-common.sh'; mss_envfile_write '$EFT/written-link.env'"
+    check_fail "writer refuses a value with a quote" env MSS_BACKENDS=ds4 DS4_BIN='/a"b' sh -c ". '$ROOT/scripts/lib/mss-common.sh'; mss_envfile_write '$EFT/q.env'"
+else
+    echo "skip - writer tests need a non-root user (the writer refuses root)"
+fi
+
+echo "== phase A: render parity with 1.3.0 (A1) =="
+OLD_REF=1f9473e84ca592b04a4884a913581fbbd82b0b45
+if git -C "$ROOT" cat-file -e "$OLD_REF^{commit}" 2>/dev/null; then
+    mkdir -p "$TMP/old"
+    git -C "$ROOT" archive "$OLD_REF" | tar -x -C "$TMP/old"
+    for sel in ollama llamacpp ds4 'ollama,llamacpp' 'ollama,ds4' 'llamacpp,ds4'; do
+        tag=$(echo "$sel" | tr , -)
+        for tree in old new; do
+            [ "$tree" = old ] && src="$TMP/old" || src="$ROOT"
+            d="$TMP/parity-$tree-$tag"
+            env MSS_BACKENDS="$sel" OLLAMA_USER=testuser \
+                LLAMACPP_BIN="$TMP/fix/llamacpp/llamacpp-server" LLAMACPP_MODEL="$TMP/fix/llamacpp/model.gguf" \
+                LLAMACPP_MODEL_SHA256="$(cat "$TMP/fix/llamacpp/model.sha")" \
+                DS4_BIN="$TMP/fix/ds4/ds4-server" DS4_MODEL="$TMP/fix/ds4/model.gguf" \
+                DS4_MODEL_SHA256="$(cat "$TMP/fix/ds4/model.sha")" \
+                sh "$src/scripts/install-backends.sh" --render-only "$d" >/dev/null 2>&1
+            echo $? > "$d.rc"
+        done
+        check "render '$sel' exit code matches 1.3.0" "$(cat "$TMP/parity-old-$tag.rc")" "$(cat "$TMP/parity-new-$tag.rc")"
+        # libexec copies are sources (mss-common.sh gains helpers); every
+        # rendered conf, pf file, plist and stamp must be identical.
+        if [ -d "$TMP/parity-old-$tag" ] || [ -d "$TMP/parity-new-$tag" ]; then
+            if diff -r -x '*.sh' "$TMP/parity-old-$tag" "$TMP/parity-new-$tag" >/dev/null 2>&1 \
+                && [ "$(cd "$TMP/parity-old-$tag" 2>/dev/null && ls)" = "$(cd "$TMP/parity-new-$tag" 2>/dev/null && ls)" ]; then
+                ok "render '$sel' output identical to 1.3.0"
+            else
+                fail "render '$sel' output differs from 1.3.0: $(diff -r -x '*.sh' "$TMP/parity-old-$tag" "$TMP/parity-new-$tag" 2>&1 | head -5)"
+            fi
+        fi
+    done
+else
+    fail "render parity needs commit $OLD_REF (fetch full history: actions/checkout fetch-depth 0)"
+fi
+
+echo "== phase A: install.sh arguments and modes =="
+"$ROOT/scripts/install.sh" --bogus </dev/null >/dev/null 2>&1; check "unknown argument exits 2" 2 $?
+"$ROOT/scripts/install.sh" --help </dev/null >/dev/null 2>&1; check "--help exits 0" 0 $?
+A4F="$TMP/a4.env"
+MSS_ENV_FILE="$A4F" "$ROOT/scripts/install.sh" --configure-only </dev/null >/dev/null 2>&1; check "--configure-only without a terminal exits 2 (A4)" 2 $?
+[ ! -e "$A4F" ] && ok "--configure-only without a terminal writes nothing (A4)" || fail "A4 wrote $A4F"
+
+echo "== phase A: MSS_REPLACE_BACKEND rules (A15) =="
+check_fail "MSS_REPLACE_BACKEND with --render-only" render 'ds4' "$TMP/bad-replace" MSS_REPLACE_BACKEND=llamacpp
+OUT=$(render 'ds4' "$TMP/bad-replace" MSS_REPLACE_BACKEND=llamacpp 2>&1)
+printf '%s' "$OUT" | grep -q 'MSS_REPLACE_BACKEND is accepted only with --check-only' && ok "A15 message names --check-only" || fail "A15 message: $OUT"
+TUSER=$(id -un); [ "$TUSER" != root ] || TUSER=nobody
+OUT=$(env MSS_BACKENDS=ds4 OLLAMA_USER="$TUSER" MSS_REPLACE_BACKEND=llamacpp DS4_BIN="$TMP/fix/ds4/ds4-server" \
+    DS4_MODEL="$TMP/fix/ds4/model.gguf" DS4_MODEL_SHA256="$(cat "$TMP/fix/ds4/model.sha")" DS4_PORT=18999 \
+    sh "$ROOT/scripts/install-backends.sh" --check-only 2>&1) && fail "A15 accepted a replace of a backend that is not installed" \
+    || { printf '%s' "$OUT" | grep -q 'is not the installed optional backend' && ok "A15 refuses a replace of a backend that is not installed" || fail "A15: $OUT"; }
+
+echo "== phase A: picker on a pty (A3b, A12, A13) =="
+if [ "$(id -u)" -eq 0 ]; then
+    echo "skip - picker tests need a non-root user (interactive modes refuse root)"
+elif ! command -v expect >/dev/null 2>&1; then
+    fail "expect is not installed (the picker tests need it)"
+else
+    # sudo runs the --check-only pass as this user here: no system change.
+    mkdir -p "$TMP/nosudo"
+    printf '#!/bin/sh\nexec "$@"\n' > "$TMP/nosudo/sudo"; chmod +x "$TMP/nosudo/sudo"
+    PK="$TMP/picker"; mkdir -p "$PK"
+    drive() { # drive <name> <steps...> -- <env...>: run install.sh on a pty
+        _name=$1; shift
+        : > "$PK/$_name.steps"
+        while [ "$1" != -- ]; do printf '%s\n' "$1" >> "$PK/$_name.steps"; shift; done
+        shift
+        env PATH="$TMP/nosudo:$PATH" MSS_CONF="$PK/none.conf" OLLAMA_USER="$(id -un)" \
+            MSS_IFCONFIG="$ROOT/tests/stubs/ifconfig-lan" "$@" \
+            expect "$ROOT/tests/expect/drive.exp" "$PK/$_name.steps" "$PK/$_name.transcript" \
+            /bin/bash "$ROOT/scripts/install.sh" --configure-only >/dev/null 2>"$PK/$_name.err"
+    }
+    T=$(printf '\t')
+    DS4B="$TMP/fix/ds4/ds4-server"; DS4M="$TMP/fix/ds4/model.gguf"; DS4S=$(cat "$TMP/fix/ds4/model.sha")
+    LLB="$TMP/fix/llamacpp/llamacpp-server"; LLM="$TMP/fix/llamacpp/model.gguf"
+
+    drive menu3 "Choose [1]: ${T}9" "Choose [1]: ${T}x" "Choose [1]: ${T}0" -- MSS_ENV_FILE="$PK/menu3.env"
+    check "3 bad menu answers exit 2 (A12)" 2 $?
+    [ ! -e "$PK/menu3.env" ] && ok "3 bad menu answers write nothing (A12)" || fail "A12 menu wrote a file"
+
+    drive noallow "Choose [1]: ${T}5" "binary path: ${T}$DS4B" "(.gguf) path: ${T}$DS4M" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" \
+        "LAN access to ds4? [y/N]: ${T}y" "listen on [192.0.2.10]: ${T}@ENTER" \
+        "(space-separated): ${T}@ENTER" "(space-separated): ${T}@ENTER" "(space-separated): ${T}@ENTER" -- MSS_ENV_FILE="$PK/noallow.env"
+    check "LAN ds4 with an empty allowlist cannot complete (A12)" 2 $?
+    [ ! -e "$PK/noallow.env" ] && ok "LAN ds4 with an empty allowlist writes nothing" || fail "A12 allowlist wrote a file"
+
+    drive keyfile "Choose [1]: ${T}4" "binary path${T}$LLB" "(.gguf) path: ${T}$LLM" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" \
+        "LAN access to llamacpp? [y/N]: ${T}y" "listen on [192.0.2.10]: ${T}@ENTER" \
+        "use an allowlist instead): ${T}sk-test123" "use an allowlist instead): ${T}@ENTER" \
+        "(space-separated): ${T}192.0.2.99" "Port [8080]: ${T}@ENTER" "Save? [Y/n]: ${T}n" -- MSS_ENV_FILE="$PK/keyfile.env"
+    check "declining the summary exits 1" 1 $?
+    grep -q 'not the key itself' "$PK/keyfile.transcript" && ok "key prompt rejects a key typed as a path (A12)" || fail "A12 key prompt: $(tail -5 "$PK/keyfile.transcript")"
+    # once is the terminal echoing the typed answer; any more is the installer printing it
+    check "the rejected key is never printed back" 1 "$(grep -o 'sk-test123' "$PK/keyfile.transcript" | wc -l | tr -d ' ')"
+    # the test's own inputs (.steps) and the pty transcript hold it by design
+    LEAK=$(grep -rl 'sk-test123' "$TMP" "$ROOT/backends.env" 2>/dev/null | grep -v '\.transcript$\|\.steps$' || true)
+    [ -z "$LEAK" ] && ok "the rejected key is in no file (A12)" || fail "sk-test123 found in: $LEAK"
+
+    drive intr "Choose [1]: ${T}5" "binary path: ${T}$DS4B" "(.gguf) path: ${T}@INTR" -- MSS_ENV_FILE="$PK/intr.env"
+    check "Ctrl-C at the model prompt exits 130 (A13)" 130 $?
+    [ ! -e "$PK/intr.env" ] && ok "Ctrl-C writes nothing (A13)" || fail "A13 wrote a file"
+
+    drive envdef "Choose [5]: ${T}@ENTER" "binary path: ${T}$DS4B" "(.gguf) path: ${T}$DS4M" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" \
+        "LAN access to ds4? [y/N]: ${T}@ENTER" "Port [8001]: ${T}@ENTER" "Save? [Y/n]: ${T}@ENTER" -- \
+        MSS_ENV_FILE="$PK/envdef.env" MSS_BACKENDS=ds4 DS4_PORT=8001
+    check "--configure-only with MSS_BACKENDS set shows the menu with env defaults (A3b)" 0 $?
+    grep -q '^MSS_BACKENDS=ds4$' "$PK/envdef.env" 2>/dev/null && grep -q '^DS4_PORT=8001$' "$PK/envdef.env" \
+        && ok "A3b saved MSS_BACKENDS=ds4 and DS4_PORT=8001" || fail "A3b saved: $(cat "$PK/envdef.env" 2>&1)"
+    check "A3b file mode 0600" 600 "$(stat -f '%Lp' "$PK/envdef.env" 2>/dev/null)"
+    grep -q "^DS4_MODEL_SHA256=$DS4S\$" "$PK/envdef.env" && ok "A3b saved the computed sha256" || fail "A3b sha"
+
+    drive saved "Choose [5]: ${T}@ENTER" "binary path [$DS4B]: ${T}@ENTER" "(.gguf) path [$DS4M]: ${T}@ENTER" \
+        "c computes it now) [$DS4S]: ${T}@ENTER" "LAN access to ds4? [y/N]: ${T}@ENTER" "Port [8001]: ${T}@ENTER" \
+        "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/envdef.env"
+    check "--configure-only reuses every saved answer as its default" 0 $?
+    grep -q 'Hashing' "$PK/saved.transcript" && fail "a saved sha256 was re-hashed by the picker" || ok "a saved sha256 is not re-hashed by the picker"
+fi
 echo
 echo "phase A: $PASS passed, $FAIL failed"
 fi
