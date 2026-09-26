@@ -29,7 +29,7 @@ jobs:
           mkdir -p /tmp/mss-pf
           sha=$(shasum -a 256 /etc/hosts | awk '{print $1}')
           env MSS_BACKENDS=ds4 OLLAMA_USER=runner \
-            DS4_BIN=/bin/true DS4_MODEL=/etc/hosts DS4_MODEL_SHA256="$sha" \
+            DS4_BIN=/usr/bin/true DS4_MODEL=/etc/hosts DS4_MODEL_SHA256="$sha" \
             DS4_HOST=192.0.2.10 DS4_ALLOW_FROM='192.0.2.99 198.51.100.0/24' \
             MSS_IFCONFIG="$PWD/tests/stubs/ifconfig-lan" \
             sh scripts/install-backends.sh --render-only /tmp/mss-pf
