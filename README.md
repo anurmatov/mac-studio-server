@@ -12,6 +12,7 @@ This configuration is optimized for running Mac Studio as a dedicated Ollama ser
 
 ## Latest Updates
 
+- **[v1.4.0]** Added an interactive backend picker to the installer
 - **[v1.3.0]** Added optional llama.cpp and DwarfStar inference backends beside Ollama
 - **[v1.2.0]** Added Docker autostart support for container applications (with [Colima](https://github.com/abiosoft/colima))
 - **[v1.1.0]** Added GPU Memory Optimization - configure Metal to use more RAM for models
@@ -232,7 +233,9 @@ If you don't need Docker containers, you can skip this feature entirely.
 
 Besides Ollama, you can run one more inference server as a headless service: llama.cpp `llama-server` for any GGUF model, or DwarfStar `ds4-server`. Ollama stays the default, and with `MSS_BACKENDS` unset the installation is the same as before. The model file is checked against its sha256 at install and on every start.
 
-To add a backend, set the selection and its variables before installation:
+On a terminal, `./scripts/install.sh` asks which backends to install and saves the answers to `backends.env`; later runs reuse them without asking. Run `./scripts/install.sh --configure` to change the choice, or `--configure-only` to save and check without installing.
+
+For scripted installs, set the selection and its variables instead:
 ```bash
 export MSS_BACKENDS="ollama,llamacpp"  # or ollama,ds4 / llamacpp / ds4
 export LLAMACPP_BIN="$(command -v llama-server)"
@@ -259,7 +262,7 @@ This project follows [Semantic Versioning](https://semver.org/):
 - MINOR version for new features
 - PATCH version for bug fixes
 
-The current version is *1.2.0*.
+The current version is *1.4.0*.
 
 ## Contributing
 

@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.4.0] - 2026-09-26
+
+### Added
+- Interactive backend picker when install.sh runs on a terminal
+- Saved answers in backends.env, reused on the next run
+- Guided switching between llama.cpp and DwarfStar with install.sh --configure
+
+### Changed
+- README now states the current version
+
 ## [1.3.0] - 2026-09-26
 
 ### Added

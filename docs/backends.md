@@ -73,6 +73,46 @@ twice (the check, then the root installer); a re-install with an unchanged
 model skips both. `OLLAMA_GPU_PERCENT` installs `com.ollama.gpumemory` whatever
 the selection, and an optional backend waits for that wired limit at start.
 
+## Interactive install and backends.env (1.4.0)
+
+`scripts/install.sh` picks its mode from the first matching row:
+
+| condition | behaviour |
+|---|---|
+| `--configure` / `--configure-only` without a terminal | exit 2 |
+| `--configure` / `--configure-only` as root | exit 1: run it as your user, it calls `sudo` itself |
+| `--configure` | picker, save, check, install |
+| `--configure-only` | picker, save, check under `sudo`; nothing is installed |
+| no flag, and no terminal or `MSS_BACKENDS` set | 1.3.0 behaviour: environment only, `backends.env` is not read |
+| no flag, terminal, as root | exit 1 |
+| no flag, terminal, `backends.env` exists | use it without asking |
+| no flag, terminal, no `backends.env` | picker (first run) |
+
+`backends.env` lives next to `config/backends.env.example` (override with
+`MSS_ENV_FILE`) and uses the same `KEY=value` format. It is parsed, never
+sourced: unknown or duplicate keys, `export`, and values containing `$`,
+backticks, quotes, backslashes or carriage returns are refused, naming the
+line. It must be a regular file owned by you and not group- or world-writable.
+A variable set in the environment wins over the file. The picker writes it
+atomically with mode 0600, keeps keys it did not ask about (such as `DS4_CTX`
+or `*_EXTRA_ARGS`), and drops comments. API keys are never stored; only the
+path of a key file is.
+
+Picker defaults come from the environment first, then the installed selection
+(for the menu), then `backends.env`, then built-ins. Hashing the model reads
+the whole file, and the check and root install hash it again unless the model
+is unchanged since its last verification, so a first install of a large model
+takes a few extra minutes.
+
+**Switching.** When `--configure` picks a different optional backend than the
+installed one, it asks before removing the old one. On yes it saves the file,
+checks the new selection as root first (so a busy port or bad checksum stops it
+before anything is removed), then runs `sudo scripts/uninstall.sh --backend
+<old>` and installs. On no it saves the file and installs nothing.
+`--configure-only` never removes anything: it checks the new selection against
+the installed one and says that `install.sh --configure` will offer the switch.
+A plain `install.sh` with a saved file never switches.
+
 ## Status / enable / uninstall
 
 ```bash

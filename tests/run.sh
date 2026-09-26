@@ -29,12 +29,12 @@ check_fail() { # check_fail <desc> <cmd...>
 if [ "$PHASE" != B ]; then
 echo "== phase A: static =="
 if command -v shellcheck >/dev/null 2>&1; then
-    if shellcheck -S warning -s sh "$ROOT"/libexec/*.sh "$ROOT"/scripts/lib/*.sh "$ROOT"/scripts/install-backends.sh "$ROOT"/scripts/status.sh "$ROOT"/scripts/uninstall.sh; then
+    if shellcheck -S warning -s sh "$ROOT"/libexec/*.sh "$ROOT"/scripts/lib/mss-common.sh "$ROOT"/scripts/install-backends.sh "$ROOT"/scripts/status.sh "$ROOT"/scripts/uninstall.sh; then
         ok "shellcheck -s sh"
     else
         fail "shellcheck -s sh"
     fi
-    if shellcheck -S warning "$ROOT"/scripts/install.sh; then ok "shellcheck install.sh"; else fail "shellcheck install.sh"; fi
+    if shellcheck -S warning "$ROOT"/scripts/install.sh "$ROOT"/scripts/lib/mss-picker.sh; then ok "shellcheck install.sh + mss-picker.sh (bash)"; else fail "shellcheck install.sh + mss-picker.sh"; fi
 else
     echo "skip - shellcheck not installed"
 fi
@@ -275,6 +275,168 @@ else
     echo "skip - LAN render needs the stub ifconfig (macOS only)"
 fi
 
+
+echo "== phase A: backends.env keys match config/backends.env.example (#12) =="
+EXAMPLE_KEYS=$(sed -n 's/^#\{0,1\} \{0,1\}\([A-Z][A-Z0-9_]*\)=.*/\1/p' "$ROOT/config/backends.env.example" | tr '\n' ' ' | sed 's/ $//')
+check "mss_envfile_keys equals the example's keys, in order" "$EXAMPLE_KEYS" "$(mss_envfile_keys | tr -s ' ')"
+
+echo "== phase A: backends.env parser (A11) =="
+EF="$ROOT/tests/fixtures/envfile"
+EFT="$TMP/envfile"
+mkdir -p "$EFT"
+# fixtures are copied so the owner and mode checks see a file this user owns
+envload() { ( unset MSS_BACKENDS DS4_PORT DS4_CTX DS4_EXTRA_ARGS; mss_envfile_load "$1" && printf '%s|%s|%s|%s' "$MSS_BACKENDS" "${DS4_PORT:-}" "${DS4_CTX:-}" "${DS4_EXTRA_ARGS:-}" ) }
+for f in "$EF"/*.env; do cp "$f" "$EFT/"; chmod 600 "$EFT/$(basename "$f")"; done
+check "valid file loads literally" "ds4|8001|32768|--power 60 --threads 8" "$(envload "$EFT/valid.env" 2>/dev/null)"
+check "environment wins over the file" "ds4|9000|32768|--power 60 --threads 8" \
+    "$( ( unset MSS_BACKENDS DS4_CTX DS4_EXTRA_ARGS; export DS4_PORT=9000; mss_envfile_load "$EFT/valid.env" && printf '%s|%s|%s|%s' "$MSS_BACKENDS" "$DS4_PORT" "$DS4_CTX" "$DS4_EXTRA_ARGS" ) 2>/dev/null)"
+for bad in unknown-key duplicate export dollar backtick dquote squote backslash no-backends; do
+    OUT=$(envload "$EFT/$bad.env" 2>&1) && fail "parser accepted $bad.env" || {
+        case $bad in
+            no-backends) ok "parser rejects $bad.env" ;;
+            *) printf '%s' "$OUT" | grep -q "line [0-9]" && ok "parser rejects $bad.env naming the line" || fail "parser rejects $bad.env without a line number: $OUT" ;;
+        esac
+    }
+done
+printf 'MSS_BACKENDS=ds4\r\n' > "$EFT/cr.env"; chmod 600 "$EFT/cr.env"
+check_fail "parser rejects a carriage return" mss_envfile_load "$EFT/cr.env"
+cp "$EFT/valid.env" "$EFT/group-writable.env"; chmod 620 "$EFT/group-writable.env"
+check_fail "parser rejects a group-writable file" mss_envfile_load "$EFT/group-writable.env"
+ln -s "$EFT/valid.env" "$EFT/link.env"
+check_fail "parser rejects a symlink" mss_envfile_load "$EFT/link.env"
+
+echo "== phase A: backends.env writer =="
+if [ "$(id -u)" -ne 0 ]; then
+    WF="$EFT/written.env"
+    ( unset MSS_BACKENDS DS4_PORT DS4_CTX DS4_EXTRA_ARGS
+      mss_envfile_load "$EFT/valid.env" && export DS4_PORT=8005 && mss_envfile_write "$WF" ) 2>/dev/null
+    check "writer mode 0600" "600" "$(stat -f '%Lp' "$WF" 2>/dev/null)"
+    check "writer keeps unasked keys, in example order" "MSS_BACKENDS=ds4 DS4_PORT=8005 DS4_CTX=32768 DS4_EXTRA_ARGS=--power 60 --threads 8" \
+        "$(grep -v '^#' "$WF" | tr '\n' ' ' | sed 's/ $//')"
+    ln -s "$WF" "$EFT/written-link.env"
+    check_fail "writer refuses to replace a symlink" env MSS_BACKENDS=ds4 sh -c ". '$ROOT/scripts/lib/mss-common.sh'; mss_envfile_write '$EFT/written-link.env'"
+    check_fail "writer refuses a value with a quote" env MSS_BACKENDS=ds4 DS4_BIN='/a"b' sh -c ". '$ROOT/scripts/lib/mss-common.sh'; mss_envfile_write '$EFT/q.env'"
+else
+    echo "skip - writer tests need a non-root user (the writer refuses root)"
+fi
+
+echo "== phase A: render parity with 1.3.0 (A1) =="
+OLD_REF=1f9473e84ca592b04a4884a913581fbbd82b0b45
+if git -C "$ROOT" cat-file -e "$OLD_REF^{commit}" 2>/dev/null; then
+    mkdir -p "$TMP/old"
+    git -C "$ROOT" archive "$OLD_REF" | tar -x -C "$TMP/old"
+    for sel in ollama llamacpp ds4 'ollama,llamacpp' 'ollama,ds4' 'llamacpp,ds4'; do
+        tag=$(echo "$sel" | tr , -)
+        for tree in old new; do
+            [ "$tree" = old ] && src="$TMP/old" || src="$ROOT"
+            d="$TMP/parity-$tree-$tag"
+            env MSS_BACKENDS="$sel" OLLAMA_USER=testuser \
+                LLAMACPP_BIN="$TMP/fix/llamacpp/llamacpp-server" LLAMACPP_MODEL="$TMP/fix/llamacpp/model.gguf" \
+                LLAMACPP_MODEL_SHA256="$(cat "$TMP/fix/llamacpp/model.sha")" \
+                DS4_BIN="$TMP/fix/ds4/ds4-server" DS4_MODEL="$TMP/fix/ds4/model.gguf" \
+                DS4_MODEL_SHA256="$(cat "$TMP/fix/ds4/model.sha")" \
+                sh "$src/scripts/install-backends.sh" --render-only "$d" >/dev/null 2>&1
+            echo $? > "$d.rc"
+        done
+        check "render '$sel' exit code matches 1.3.0" "$(cat "$TMP/parity-old-$tag.rc")" "$(cat "$TMP/parity-new-$tag.rc")"
+        # libexec copies are sources (mss-common.sh gains helpers); every
+        # rendered conf, pf file, plist and stamp must be identical.
+        if [ -d "$TMP/parity-old-$tag" ] || [ -d "$TMP/parity-new-$tag" ]; then
+            if diff -r -x '*.sh' "$TMP/parity-old-$tag" "$TMP/parity-new-$tag" >/dev/null 2>&1 \
+                && [ "$(cd "$TMP/parity-old-$tag" 2>/dev/null && ls)" = "$(cd "$TMP/parity-new-$tag" 2>/dev/null && ls)" ]; then
+                ok "render '$sel' output identical to 1.3.0"
+            else
+                fail "render '$sel' output differs from 1.3.0: $(diff -r -x '*.sh' "$TMP/parity-old-$tag" "$TMP/parity-new-$tag" 2>&1 | head -5)"
+            fi
+        fi
+    done
+else
+    fail "render parity needs commit $OLD_REF (fetch full history: actions/checkout fetch-depth 0)"
+fi
+
+echo "== phase A: install.sh arguments and modes =="
+"$ROOT/scripts/install.sh" --bogus </dev/null >/dev/null 2>&1; check "unknown argument exits 2" 2 $?
+"$ROOT/scripts/install.sh" --help </dev/null >/dev/null 2>&1; check "--help exits 0" 0 $?
+A4F="$TMP/a4.env"
+MSS_ENV_FILE="$A4F" "$ROOT/scripts/install.sh" --configure-only </dev/null >/dev/null 2>&1; check "--configure-only without a terminal exits 2 (A4)" 2 $?
+[ ! -e "$A4F" ] && ok "--configure-only without a terminal writes nothing (A4)" || fail "A4 wrote $A4F"
+
+echo "== phase A: MSS_REPLACE_BACKEND rules (A15) =="
+check_fail "MSS_REPLACE_BACKEND with --render-only" render 'ds4' "$TMP/bad-replace" MSS_REPLACE_BACKEND=llamacpp
+OUT=$(render 'ds4' "$TMP/bad-replace" MSS_REPLACE_BACKEND=llamacpp 2>&1)
+printf '%s' "$OUT" | grep -q 'MSS_REPLACE_BACKEND is accepted only with --check-only' && ok "A15 message names --check-only" || fail "A15 message: $OUT"
+TUSER=$(id -un); [ "$TUSER" != root ] || TUSER=nobody
+OUT=$(env MSS_BACKENDS=ds4 OLLAMA_USER="$TUSER" MSS_REPLACE_BACKEND=llamacpp DS4_BIN="$TMP/fix/ds4/ds4-server" \
+    DS4_MODEL="$TMP/fix/ds4/model.gguf" DS4_MODEL_SHA256="$(cat "$TMP/fix/ds4/model.sha")" DS4_PORT=18999 \
+    sh "$ROOT/scripts/install-backends.sh" --check-only 2>&1) && fail "A15 accepted a replace of a backend that is not installed" \
+    || { printf '%s' "$OUT" | grep -q 'is not the installed optional backend' && ok "A15 refuses a replace of a backend that is not installed" || fail "A15: $OUT"; }
+
+echo "== phase A: picker on a pty (A3b, A12, A13) =="
+if [ "$(id -u)" -eq 0 ]; then
+    echo "skip - picker tests need a non-root user (interactive modes refuse root)"
+elif ! command -v expect >/dev/null 2>&1; then
+    fail "expect is not installed (the picker tests need it)"
+else
+    # sudo runs the --check-only pass as this user here: no system change.
+    mkdir -p "$TMP/nosudo"
+    printf '#!/bin/sh\nexec "$@"\n' > "$TMP/nosudo/sudo"; chmod +x "$TMP/nosudo/sudo"
+    PK="$TMP/picker"; mkdir -p "$PK"
+    drive() { # drive <name> <steps...> -- <env...>: run install.sh on a pty
+        _name=$1; shift
+        : > "$PK/$_name.steps"
+        while [ "$1" != -- ]; do printf '%s\n' "$1" >> "$PK/$_name.steps"; shift; done
+        shift
+        env PATH="$TMP/nosudo:$PATH" MSS_CONF="$PK/none.conf" OLLAMA_USER="$(id -un)" \
+            MSS_IFCONFIG="$ROOT/tests/stubs/ifconfig-lan" "$@" \
+            expect "$ROOT/tests/expect/drive.exp" "$PK/$_name.steps" "$PK/$_name.transcript" \
+            /bin/bash "$ROOT/scripts/install.sh" --configure-only >/dev/null 2>"$PK/$_name.err"
+    }
+    T=$(printf '\t')
+    DS4B="$TMP/fix/ds4/ds4-server"; DS4M="$TMP/fix/ds4/model.gguf"; DS4S=$(cat "$TMP/fix/ds4/model.sha")
+    LLB="$TMP/fix/llamacpp/llamacpp-server"; LLM="$TMP/fix/llamacpp/model.gguf"
+
+    drive menu3 "Choose [1]: ${T}9" "Choose [1]: ${T}x" "Choose [1]: ${T}0" -- MSS_ENV_FILE="$PK/menu3.env"
+    check "3 bad menu answers exit 2 (A12)" 2 $?
+    [ ! -e "$PK/menu3.env" ] && ok "3 bad menu answers write nothing (A12)" || fail "A12 menu wrote a file"
+
+    drive noallow "Choose [1]: ${T}5" "binary path: ${T}$DS4B" "(.gguf) path: ${T}$DS4M" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" \
+        "LAN access to ds4? [y/N]: ${T}y" "listen on [192.0.2.10]: ${T}@ENTER" \
+        "(space-separated): ${T}@ENTER" "(space-separated): ${T}@ENTER" "(space-separated): ${T}@ENTER" -- MSS_ENV_FILE="$PK/noallow.env"
+    check "LAN ds4 with an empty allowlist cannot complete (A12)" 2 $?
+    [ ! -e "$PK/noallow.env" ] && ok "LAN ds4 with an empty allowlist writes nothing" || fail "A12 allowlist wrote a file"
+
+    drive keyfile "Choose [1]: ${T}4" "binary path${T}$LLB" "(.gguf) path: ${T}$LLM" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" \
+        "LAN access to llamacpp? [y/N]: ${T}y" "listen on [192.0.2.10]: ${T}@ENTER" \
+        "use an allowlist instead): ${T}sk-test123" "use an allowlist instead): ${T}@ENTER" \
+        "(space-separated): ${T}192.0.2.99" "Port [8080]: ${T}@ENTER" "Save? [Y/n]: ${T}n" -- MSS_ENV_FILE="$PK/keyfile.env"
+    check "declining the summary exits 1" 1 $?
+    grep -q 'not the key itself' "$PK/keyfile.transcript" && ok "key prompt rejects a key typed as a path (A12)" || fail "A12 key prompt: $(tail -5 "$PK/keyfile.transcript")"
+    # once is the terminal echoing the typed answer; any more is the installer printing it
+    check "the rejected key is never printed back" 1 "$(grep -o 'sk-test123' "$PK/keyfile.transcript" | wc -l | tr -d ' ')"
+    # Saved and installed files must not hold it. The pty transcript records
+    # the typed answer by design; the printed-back count above covers output.
+    LEAK=$(grep -l 'sk-test123' "$PK"/*.env "$ROOT/backends.env" /usr/local/etc/mac-studio-server/backends.conf 2>/dev/null || true)
+    [ -z "$LEAK" ] && ok "the rejected key is in no file (A12)" || fail "sk-test123 found in: $LEAK"
+
+    drive intr "Choose [1]: ${T}5" "binary path: ${T}$DS4B" "(.gguf) path: ${T}@INTR" -- MSS_ENV_FILE="$PK/intr.env"
+    check "Ctrl-C at the model prompt exits 130 (A13)" 130 $?
+    [ ! -e "$PK/intr.env" ] && ok "Ctrl-C writes nothing (A13)" || fail "A13 wrote a file"
+
+    drive envdef "Choose [5]: ${T}@ENTER" "binary path: ${T}$DS4B" "(.gguf) path: ${T}$DS4M" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" \
+        "LAN access to ds4? [y/N]: ${T}@ENTER" "Port [8001]: ${T}@ENTER" "Save? [Y/n]: ${T}@ENTER" -- \
+        MSS_ENV_FILE="$PK/envdef.env" MSS_BACKENDS=ds4 DS4_PORT=8001
+    check "--configure-only with MSS_BACKENDS set shows the menu with env defaults (A3b)" 0 $?
+    grep -q '^MSS_BACKENDS=ds4$' "$PK/envdef.env" 2>/dev/null && grep -q '^DS4_PORT=8001$' "$PK/envdef.env" \
+        && ok "A3b saved MSS_BACKENDS=ds4 and DS4_PORT=8001" || fail "A3b saved: $(cat "$PK/envdef.env" 2>&1)"
+    check "A3b file mode 0600" 600 "$(stat -f '%Lp' "$PK/envdef.env" 2>/dev/null)"
+    grep -q "^DS4_MODEL_SHA256=$DS4S\$" "$PK/envdef.env" && ok "A3b saved the computed sha256" || fail "A3b sha"
+
+    drive saved "Choose [5]: ${T}@ENTER" "binary path [$DS4B]: ${T}@ENTER" "(.gguf) path [$DS4M]: ${T}@ENTER" \
+        "c computes it now) [$DS4S]: ${T}@ENTER" "LAN access to ds4? [y/N]: ${T}@ENTER" "Port [8001]: ${T}@ENTER" \
+        "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/envdef.env"
+    check "--configure-only reuses every saved answer as its default" 0 $?
+    grep -q 'Hashing' "$PK/saved.transcript" && fail "a saved sha256 was re-hashed by the picker" || ok "a saved sha256 is not re-hashed by the picker"
+fi
 echo
 echo "phase A: $PASS passed, $FAIL failed"
 fi
@@ -359,6 +521,188 @@ if sudo sh "$ROOT/scripts/uninstall.sh" --backend ds4 >/dev/null 2>&1; then ok "
 launchctl print system/com.mac-studio-server.ds4 >/dev/null 2>&1 && fail "ds4 label gone" || ok "ds4 label gone"
 if sudo sh "$ROOT/scripts/uninstall.sh" --all >/dev/null 2>&1; then ok "uninstall --all"; else fail "uninstall --all"; fi
 if sudo sh "$ROOT/scripts/uninstall.sh" --all >/dev/null 2>&1; then ok "uninstall --all idempotent"; else fail "uninstall --all idempotent"; fi
+
+echo "== phase B: install.sh modes, picker installs and switching (#12) =="
+# install.sh's Ollama steps use $HOME/mac-studio-server (BASE_DIR) for its
+# scripts and log directory, as on a real install.
+[ -e "$HOME/mac-studio-server" ] || ln -s "$ROOT" "$HOME/mac-studio-server"
+IS="$HOME/mac-studio-server/scripts/install.sh"
+sudo install -m 0755 "$ROOT/tests/stubs/fake-ollama.sh" /usr/local/bin/ollama
+PB="$TMP/pb"; mkdir -p "$PB"
+T=$(printf '\t')
+for b in llamacpp ds4; do
+    cp "$ROOT/tests/stubs/fake-server.sh" "$PB/$b-server"; chmod +x "$PB/$b-server"
+    printf 'phase-b-model-%s' "$b" > "$PB/$b.gguf"
+done
+LLB="$PB/llamacpp-server"; LLM="$PB/llamacpp.gguf"; LLS=$(shasum -a 256 "$LLM" | awk '{print $1}')
+DS4B="$PB/ds4-server"; DS4M="$PB/ds4.gguf"; DS4S=$(shasum -a 256 "$DS4M" | awk '{print $1}')
+ZERO=$(printf '0%.0s' $(seq 64))
+EFB="$PB/backends.env"
+CONFB=/usr/local/etc/mac-studio-server/backends.conf
+loaded() { launchctl print "system/$1" >/dev/null 2>&1; }
+wait_listen() { _i=0; while [ "$_i" -lt 30 ]; do nc -z 127.0.0.1 "$1" >/dev/null 2>&1 && return 0; sleep 1; _i=$((_i + 1)); done; return 1; }
+daemons() { ls /Library/LaunchDaemons | grep -E 'mac-studio-server|ollama' | sort | tr '\n' ' '; }
+# bdrive <name> "<install.sh args>" <steps...> -- <env...>: install.sh on a pty, real sudo
+bdrive() {
+    _name=$1; _args=$2; shift 2
+    : > "$PB/$_name.steps"
+    while [ "$1" != -- ]; do printf '%s\n' "$1" >> "$PB/$_name.steps"; shift; done
+    shift
+    # shellcheck disable=SC2086  # _args is a word list
+    env MSS_ENV_FILE="$EFB" OLLAMA_USER="$(id -un)" "$@" MSS_EXPECT_TIMEOUT=180 \
+        expect "$ROOT/tests/expect/drive.exp" "$PB/$_name.steps" "$PB/$_name.transcript" /bin/bash "$IS" $_args \
+        >/dev/null 2>"$PB/$_name.err"
+}
+has() { grep -q -- "$2" "$PB/$1.transcript"; }
+
+sudo sh "$ROOT/scripts/uninstall.sh" --all >/dev/null 2>&1
+
+# A2: no terminal, MSS_BACKENDS unset, a poisoned backends.env: the 1.3.0 flow.
+printf 'MSS_BACKENDS=ds4\nNOT_A_KEY=1\n' > "$PB/poison.env"; chmod 600 "$PB/poison.env"
+MSS_ENV_FILE="$PB/poison.env" "$IS" </dev/null >"$PB/a2.log" 2>&1
+grep -q 'Which backends' "$PB/a2.log" && fail "A2 prompted without a terminal" || ok "A2 no prompt without a terminal"
+grep -Eq 'NOT_A_KEY|unknown key' "$PB/a2.log" && fail "A2 read the poisoned backends.env" || ok "A2 did not read backends.env"
+loaded com.ollama.service && ok "A2 com.ollama.service loaded" || fail "A2 com.ollama.service not loaded"
+wait_listen 11434 && curl -s http://127.0.0.1:11434/api/version | grep -q stub && ok "A2 stub ollama answers /api/version" || fail "A2 stub ollama unreachable"
+
+# A3: MSS_BACKENDS set, no flag, on a pty: no menu, conf as rendered.
+bdrive a3 "" -- MSS_BACKENDS=ds4 DS4_BIN="$DS4B" DS4_MODEL="$DS4M" DS4_MODEL_SHA256="$DS4S" DS4_PORT=18000
+check "A3 install with MSS_BACKENDS set on a pty" 0 $?
+has a3 'Which backends' && fail "A3 showed the menu" || ok "A3 no menu with MSS_BACKENDS set"
+env MSS_BACKENDS=ds4 OLLAMA_USER="$(id -un)" OLLAMA_BIND=0.0.0.0 DS4_BIN="$DS4B" DS4_MODEL="$DS4M" DS4_MODEL_SHA256="$DS4S" DS4_PORT=18000 \
+    sh "$ROOT/scripts/install-backends.sh" --render-only "$PB/a3r" >/dev/null 2>&1
+cmp -s "$CONFB" "$PB/a3r/backends.conf" && ok "A3 installed conf equals the render" || fail "A3 conf differs: $(diff "$CONFB" "$PB/a3r/backends.conf")"
+sudo sh "$ROOT/scripts/uninstall.sh" --backend ds4 >/dev/null 2>&1
+
+# A5: first run on a pty with no backends.env: llama.cpp only.
+rm -f "$EFB"
+bdrive a5ll "" "Choose [1]: ${T}4" "binary path${T}$LLB" "(.gguf) path: ${T}$LLM" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" \
+    "LAN access to llamacpp? [y/N]: ${T}@ENTER" "Port [8080]: ${T}18080" "Install with these settings? [Y/n]: ${T}@ENTER" --
+check "A5 first-run picker install (llama.cpp only)" 0 $?
+check "A5 backends.env mode and owner" "600 $(id -un)" "$(stat -f '%Lp %Su' "$EFB" 2>/dev/null)"
+loaded com.mac-studio-server.llamacpp && loaded com.mac-studio-server.guard && ! loaded com.mac-studio-server.ds4 \
+    && ok "A5 labels match llama.cpp only" || fail "A5 labels: $(daemons)"
+wait_listen 18080 && ok "A5 llama.cpp stub listening" || fail "A5 llama.cpp stub not listening"
+
+# A6: re-run with the saved file: no prompts, same conf, no re-hash.
+cp "$CONFB" "$PB/conf.a5"
+bdrive a6 "" --
+check "A6 re-run with saved backends.env" 0 $?
+has a6 'Choose' && fail "A6 prompted" || ok "A6 zero prompts"
+cmp -s "$CONFB" "$PB/conf.a5" && ok "A6 backends.conf byte-identical" || fail "A6 conf changed"
+has a6 'hashing ' && fail "A6 re-hashed the model" || ok "A6 model not re-hashed"
+
+# A7: edit one key in backends.env: only that conf line changes.
+sed -i '' 's/^LLAMACPP_PORT=18080$/LLAMACPP_PORT=18081/' "$EFB"
+bdrive a7 "" --
+check "A7 re-run after editing LLAMACPP_PORT" 0 $?
+has a7 'Choose' && fail "A7 prompted" || ok "A7 zero prompts"
+check "A7 conf differs only in LLAMACPP_PORT" "<LLAMACPP_PORT=18080 >LLAMACPP_PORT=18081 " \
+    "$(diff "$PB/conf.a5" "$CONFB" | sed -n 's/^\([<>]\) /\1/p' | tr '\n' ' ')"
+wait_listen 18081 && ok "A7 llama.cpp moved to 18081" || fail "A7 not listening on 18081"
+
+# A10c: --configure-only choosing ds4 while llama.cpp is installed.
+BEFORE=$(daemons)
+bdrive a10c "--configure-only" "Choose [4]: ${T}5" "binary path: ${T}$DS4B" "(.gguf) path: ${T}$DS4M" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" \
+    "LAN access to ds4? [y/N]: ${T}@ENTER" "Port [8000]: ${T}18000" "Save? [Y/n]: ${T}@ENTER" --
+check "A10c --configure-only with another backend installed" 0 $?
+has a10c 'Remove it first' && fail "A10c asked the switch question" || ok "A10c no switch question"
+has a10c 'install.sh --configure will offer to replace it' && ok "A10c message names install.sh --configure" || fail "A10c message missing"
+grep -q '^MSS_BACKENDS=ds4$' "$EFB" && ok "A10c saved MSS_BACKENDS=ds4" || fail "A10c saved: $(grep MSS_BACKENDS "$EFB")"
+loaded com.mac-studio-server.llamacpp && ok "A10c llama.cpp still loaded" || fail "A10c llama.cpp gone"
+check "A10c /Library/LaunchDaemons unchanged" "$BEFORE" "$(daemons)"
+
+# A9: --configure switch to ds4, answer n.
+BEFORE=$(daemons); cp "$CONFB" "$PB/conf.a9"
+bdrive a9 "--configure" "Choose [4]: ${T}5" "binary path [$DS4B]: ${T}@ENTER" "(.gguf) path [$DS4M]: ${T}@ENTER" \
+    "c computes it now) [$DS4S]: ${T}@ENTER" "LAN access to ds4? [y/N]: ${T}@ENTER" "Port [18000]: ${T}@ENTER" \
+    "Install with these settings? [Y/n]: ${T}@ENTER" "--backend llamacpp? [y/N]: ${T}n" --
+check "A9 declining the switch exits 1" 1 $?
+loaded com.mac-studio-server.llamacpp && wait_listen 18081 && ok "A9 llama.cpp still running" || fail "A9 llama.cpp not running"
+check "A9 /Library/LaunchDaemons unchanged" "$BEFORE" "$(daemons)"
+cmp -s "$CONFB" "$PB/conf.a9" && ok "A9 backends.conf unchanged" || fail "A9 conf changed"
+
+# A10: switch with a wrong ds4 sha256, answer y: stops at the check.
+bdrive a10 "--configure" "Choose [4]: ${T}5" "binary path [$DS4B]: ${T}@ENTER" "(.gguf) path [$DS4M]: ${T}@ENTER" \
+    "c computes it now) [$DS4S]: ${T}$ZERO" "LAN access to ds4? [y/N]: ${T}@ENTER" "Port [18000]: ${T}@ENTER" \
+    "Install with these settings? [Y/n]: ${T}@ENTER" "--backend llamacpp? [y/N]: ${T}y" --
+check "A10 wrong sha stops the switch with exit 1" 1 $?
+has a10 'sha256 mismatch' && ok "A10 failed at the check" || fail "A10 did not fail at the check"
+has a10 'Removing llamacpp' && fail "A10 ran uninstall" || ok "A10 uninstall never ran"
+loaded com.mac-studio-server.llamacpp && wait_listen 18081 && ok "A10 llama.cpp still running" || fail "A10 llama.cpp not running"
+
+# A10b: a foreign listener on ds4's port stops the switch at the sudo check.
+nc -l 127.0.0.1 18000 >/dev/null 2>&1 &
+NCPID=$!
+sleep 1
+bdrive a10b "--configure" "Choose [4]: ${T}5" "binary path [$DS4B]: ${T}@ENTER" "(.gguf) path [$DS4M]: ${T}@ENTER" \
+    "c computes it now) [$ZERO]: ${T}$DS4S" "LAN access to ds4? [y/N]: ${T}@ENTER" "Port [18000]: ${T}@ENTER" \
+    "Install with these settings? [Y/n]: ${T}@ENTER" "--backend llamacpp? [y/N]: ${T}y" --
+check "A10b foreign listener stops the switch with exit 1" 1 $?
+has a10b "bound by pid(s) $NCPID" && ok "A10b names the foreign PID" || fail "A10b: $(grep -i 'bound' "$PB/a10b.transcript")"
+has a10b 'Removing llamacpp' && fail "A10b ran uninstall" || ok "A10b uninstall never ran"
+loaded com.mac-studio-server.llamacpp && ok "A10b llama.cpp still loaded" || fail "A10b llama.cpp gone"
+kill "$NCPID" 2>/dev/null; wait "$NCPID" 2>/dev/null
+
+# A8: switch llama.cpp -> ds4, answer y.
+bdrive a8 "--configure" "Choose [4]: ${T}5" "binary path [$DS4B]: ${T}@ENTER" "(.gguf) path [$DS4M]: ${T}@ENTER" \
+    "c computes it now) [$DS4S]: ${T}@ENTER" "LAN access to ds4? [y/N]: ${T}@ENTER" "Port [18000]: ${T}@ENTER" \
+    "Install with these settings? [Y/n]: ${T}@ENTER" "--backend llamacpp? [y/N]: ${T}y" --
+check "A8 switch llama.cpp -> ds4" 0 $?
+loaded com.mac-studio-server.ds4 && loaded com.mac-studio-server.guard && ! loaded com.mac-studio-server.llamacpp \
+    && ok "A8 only ds4 and guard loaded" || fail "A8 labels: $(daemons)"
+[ ! -e /Library/LaunchDaemons/com.mac-studio-server.llamacpp.plist ] && [ ! -e /var/db/mac-studio-server/llamacpp.model.verified ] \
+    && ok "A8 llama.cpp plist and stamp gone" || fail "A8 llama.cpp leftovers"
+wait_listen 18000 && ok "A8 ds4 listening" || fail "A8 ds4 not listening"
+
+# A5: ollama + ds4 (same optional backend: no switch, real Ollama flow).
+bdrive a5o3 "--configure" "Choose [5]: ${T}3" "binary path [$DS4B]: ${T}@ENTER" "(.gguf) path [$DS4M]: ${T}@ENTER" \
+    "c computes it now) [$DS4S]: ${T}@ENTER" "LAN access to ds4? [y/N]: ${T}@ENTER" "Port [18000]: ${T}@ENTER" \
+    "Install with these settings? [Y/n]: ${T}@ENTER" --
+check "A5 ollama + ds4" 0 $?
+loaded com.ollama.service && loaded com.mac-studio-server.ds4 && ok "A5 ollama + ds4 labels" || fail "A5 option 3 labels: $(daemons)"
+
+# A5: ollama + llama.cpp (switch ds4 -> llama.cpp).
+bdrive a5o2 "--configure" "Choose [3]: ${T}2" "binary path [$LLB]: ${T}@ENTER" "(.gguf) path [$LLM]: ${T}@ENTER" \
+    "c computes it now) [$LLS]: ${T}@ENTER" "LAN access to llamacpp? [y/N]: ${T}@ENTER" "Port [18081]: ${T}@ENTER" \
+    "Install with these settings? [Y/n]: ${T}@ENTER" "--backend ds4? [y/N]: ${T}y" --
+check "A5 ollama + llama.cpp" 0 $?
+loaded com.ollama.service && loaded com.mac-studio-server.llamacpp && ! loaded com.mac-studio-server.ds4 \
+    && ok "A5 ollama + llama.cpp labels" || fail "A5 option 2 labels: $(daemons)"
+
+# A5: ollama only (removes llama.cpp; no check to run).
+bdrive a5o1 "--configure" "Choose [2]: ${T}1" "Install with these settings? [Y/n]: ${T}@ENTER" "--backend llamacpp? [y/N]: ${T}y" --
+check "A5 ollama only" 0 $?
+loaded com.ollama.service && ! loaded com.mac-studio-server.llamacpp && ! loaded com.mac-studio-server.guard \
+    && ok "A5 ollama-only labels" || fail "A5 option 1 labels: $(daemons)"
+
+# A5: MSS_BACKENDS set in the environment, --configure choosing ds4 only.
+bdrive a5env "--configure" "Choose [4]: ${T}5" "binary path [$DS4B]: ${T}@ENTER" "(.gguf) path [$DS4M]: ${T}@ENTER" \
+    "c computes it now) [$DS4S]: ${T}@ENTER" "LAN access to ds4? [y/N]: ${T}@ENTER" "Port [18000]: ${T}@ENTER" \
+    "Install with these settings? [Y/n]: ${T}@ENTER" -- MSS_BACKENDS=llamacpp
+check "A5 --configure overrides MSS_BACKENDS from the environment" 0 $?
+loaded com.mac-studio-server.ds4 && ! loaded com.mac-studio-server.llamacpp && ok "A5 env run installed ds4" || fail "A5 env run labels: $(daemons)"
+grep -q '^MSS_BACKENDS=ds4$' "$EFB" && ok "A5 env run saved MSS_BACKENDS=ds4" || fail "A5 env run saved: $(grep MSS_BACKENDS "$EFB")"
+
+# A11: a backends.env owned by someone else is refused.
+sudo chown root "$EFB"
+bdrive a11 "" --
+check "A11 backends.env owned by root is refused" 1 $?
+has a11 'not by you' && ok "A11 names the owner check" || fail "A11: $(tail -3 "$PB/a11.transcript")"
+sudo chown "$(id -un)" "$EFB"
+
+# A14: interactive modes refuse root.
+env MSS_ENV_FILE="$EFB" expect "$ROOT/tests/expect/drive.exp" /dev/null "$PB/a14.transcript" sudo /bin/bash "$IS" --configure >/dev/null 2>&1
+check "A14 sudo install.sh --configure exits 1" 1 $?
+grep -q 'run install.sh as your user' "$PB/a14.transcript" && ok "A14 says run as your user" || fail "A14: $(cat "$PB/a14.transcript")"
+
+# A15: MSS_REPLACE_BACKEND is refused outside --check-only.
+OUT=$(sudo env MSS_BACKENDS=ds4 OLLAMA_USER="$(id -un)" MSS_REPLACE_BACKEND=ds4 DS4_BIN="$DS4B" DS4_MODEL="$DS4M" \
+    DS4_MODEL_SHA256="$DS4S" DS4_PORT=18000 sh "$ROOT/scripts/install-backends.sh" 2>&1) \
+    && fail "A15 full install accepted MSS_REPLACE_BACKEND" \
+    || { printf '%s' "$OUT" | grep -q 'only with --check-only' && ok "A15 full install refuses MSS_REPLACE_BACKEND" || fail "A15: $OUT"; }
+
+sudo sh "$ROOT/scripts/uninstall.sh" --all >/dev/null 2>&1
 
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0
