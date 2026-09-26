@@ -101,14 +101,39 @@ fi
 _has_optional=0
 _optional=""
 
-# A listener is fine only when it is this backend's own running job (re-install).
+# pid_is_under <pid> <ancestor>: true when pid is ancestor or one of its
+# descendants. Walks ppid links, at most 32 hops.
+pid_is_under() {
+    _p=$1; _hops=0
+    while [ -n "$_p" ] && [ "$_p" -gt 1 ] && [ "$_hops" -lt 32 ]; do
+        [ "$_p" = "$2" ] && return 0
+        _p=$(ps -o ppid= -p "$_p" 2>/dev/null | tr -d ' ')
+        _hops=$((_hops + 1))
+    done
+    return 1
+}
+
+# A listener is fine only when it belongs to this backend's own running job
+# (re-install): its PID, or an ancestor, is the job PID. The job PID comes from
+# `launchctl print system/<label>`, which needs root, so the exemption is
+# decided only in the root pass. A non-root pass (--check-only or
+# --render-only) defers any listener to it.
 validate_port_free() {
     _port=$1 _var=$2 _label=$3
     _pids=$(lsof -nP -iTCP:"$_port" -sTCP:LISTEN -t 2>/dev/null | sort -u)
     [ -n "$_pids" ] || return 0
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "note: $_var: port $_port is in use; ownership is checked in the root install" >&2
+        return 0
+    fi
     _own=$(launchctl print "system/$_label" 2>/dev/null | sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\).*/\1/p' | head -n 1)
-    [ -n "$_own" ] && [ "$_pids" = "$_own" ] && return 0
-    mss_die "$_var: port $_port is already bound by pid(s) $(printf '%s' "$_pids" | tr '\n' ' ')"
+    _foreign=""
+    for _lp in $_pids; do
+        [ -n "$_own" ] && pid_is_under "$_lp" "$_own" && continue
+        _foreign="$_foreign $_lp"
+    done
+    [ -z "$_foreign" ] && return 0
+    mss_die "$_var: port $_port is already bound by pid(s)$_foreign"
 }
 
 # verify_model <backend> <resolved model> <expected sha>: prints the stamp line
