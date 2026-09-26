@@ -413,8 +413,9 @@ else
     grep -q 'not the key itself' "$PK/keyfile.transcript" && ok "key prompt rejects a key typed as a path (A12)" || fail "A12 key prompt: $(tail -5 "$PK/keyfile.transcript")"
     # once is the terminal echoing the typed answer; any more is the installer printing it
     check "the rejected key is never printed back" 1 "$(grep -o 'sk-test123' "$PK/keyfile.transcript" | wc -l | tr -d ' ')"
-    # the test's own inputs (.steps) and the pty transcript hold it by design
-    LEAK=$(grep -rl 'sk-test123' "$TMP" "$ROOT/backends.env" 2>/dev/null | grep -v '\.transcript$\|\.steps$' || true)
+    # Saved and installed files must not hold it. The pty transcript records
+    # the typed answer by design; the printed-back count above covers output.
+    LEAK=$(grep -l 'sk-test123' "$PK"/*.env "$ROOT/backends.env" /usr/local/etc/mac-studio-server/backends.conf 2>/dev/null || true)
     [ -z "$LEAK" ] && ok "the rejected key is in no file (A12)" || fail "sk-test123 found in: $LEAK"
 
     drive intr "Choose [1]: ${T}5" "binary path: ${T}$DS4B" "(.gguf) path: ${T}@INTR" -- MSS_ENV_FILE="$PK/intr.env"
@@ -560,7 +561,7 @@ sudo sh "$ROOT/scripts/uninstall.sh" --all >/dev/null 2>&1
 printf 'MSS_BACKENDS=ds4\nNOT_A_KEY=1\n' > "$PB/poison.env"; chmod 600 "$PB/poison.env"
 MSS_ENV_FILE="$PB/poison.env" "$IS" </dev/null >"$PB/a2.log" 2>&1
 grep -q 'Which backends' "$PB/a2.log" && fail "A2 prompted without a terminal" || ok "A2 no prompt without a terminal"
-grep -q 'NOT_A_KEY\|unknown key' "$PB/a2.log" && fail "A2 read the poisoned backends.env" || ok "A2 did not read backends.env"
+grep -Eq 'NOT_A_KEY|unknown key' "$PB/a2.log" && fail "A2 read the poisoned backends.env" || ok "A2 did not read backends.env"
 loaded com.ollama.service && ok "A2 com.ollama.service loaded" || fail "A2 com.ollama.service not loaded"
 wait_listen 11434 && curl -s http://127.0.0.1:11434/api/version | grep -q stub && ok "A2 stub ollama answers /api/version" || fail "A2 stub ollama unreachable"
 
