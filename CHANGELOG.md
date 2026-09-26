@@ -7,6 +7,9 @@ All notable changes to this project will be documented in this file.
 ### Added
 - DS4_EXTRA_ARGS accepts ds4's MTP speculative decoding, prefill chunk and weight warm-up flags
 
+### Changed
+- ds4 serves several sessions by default (4 with 96 GB of RAM or more, otherwise 2); existing installs change on re-install unless DS4_BATCHED_SESSIONS is set
+
 ## [1.4.0] - 2026-09-26
 
 ### Added

@@ -80,7 +80,7 @@ check "ds4 range edges (#16)" "--mtp-draft 1 --prefill-chunk 512 --prefill-chunk
     "$(mss_validate_extra_args ds4 '--mtp-draft 1 --prefill-chunk 512 --prefill-chunk 65536' T)"
 for bad in '--mtp-model x' '--trace f' '--power 0' '--power 101' \
     '--mtp-draft 9' '--mtp-draft 0' '--mtp-draft=4' '--mtp-draft' '--mtp=1' '--warm-weights=1' '--warm-weights x' \
-    '--prefill-chunk=abc' '--prefill-chunk 511' '--prefill-chunk 65537' '--prefill-chunk' '-mtp' \
+    '--prefill-chunk=abc' '--prefill-chunk 511' '--prefill-chunk 65537' '--prefill-chunk 0512' '--prefill-chunk' '-mtp' \
     '--dspark' '--dspark-confidence 0.5' '--dspark-strict' '--mtp-timing' '--mtp-margin 3'; do
     check_fail "reject ds4 extra arg: $bad" mss_validate_extra_args ds4 "$bad" T
 done
@@ -235,6 +235,30 @@ fi
 check_fail "llamacpp LAN with neither allowlist nor key" render 'llamacpp' "$TMP/bad-lan-llama" LLAMACPP_HOST=192.0.2.10 \
     MSS_IFCONFIG="$ROOT/tests/stubs/ifconfig-lan"
 
+echo "== phase A: ds4 batched sessions default (#19) =="
+check "96 GiB exactly defaults to 4" 4 "$(mss_ds4_default_sessions 103079215104)"
+check "just under 96 GiB defaults to 2" 2 "$(mss_ds4_default_sessions 103079215103)"
+check "unreadable memsize defaults to 2" 2 "$(mss_ds4_default_sessions '')"
+for case in "137438953472::4" "68719476736::2" "137438953472:1:1" "68719476736:3:3"; do
+    _mem=${case%%:*}; _rest=${case#*:}; _set=${_rest%%:*}; _want=${_rest#*:}
+    _d="$TMP/render-bs-$_mem-${_set:-unset}"
+    if render 'ds4' "$_d" MSS_HW_MEMSIZE="$_mem" DS4_BATCHED_SESSIONS="$_set" >/dev/null 2>&1; then
+        check "memsize $_mem, DS4_BATCHED_SESSIONS='${_set}' renders $_want" "DS4_BATCHED_SESSIONS=$_want" \
+            "$(grep '^DS4_BATCHED_SESSIONS=' "$_d/backends.conf")"
+    else
+        fail "render memsize $_mem, DS4_BATCHED_SESSIONS='$_set'"
+    fi
+done
+# Outside --render-only the host's RAM decides: pick an override that would
+# give the other answer and expect the host's own default.
+HOSTBS=$(mss_ds4_default_sessions "$(sysctl -n hw.memsize 2>/dev/null)")
+[ "$HOSTBS" = 4 ] && OTHERMEM=1 || OTHERMEM=137438953472
+OUT=$(env MSS_BACKENDS=ds4 OLLAMA_USER="$TUSER" MSS_HW_MEMSIZE="$OTHERMEM" DS4_BIN="$TMP/fix/ds4/ds4-server" \
+    DS4_MODEL="$TMP/fix/ds4/model.gguf" DS4_MODEL_SHA256="$(cat "$TMP/fix/ds4/model.sha")" DS4_PORT=18999 \
+    sh "$ROOT/scripts/install-backends.sh" --check-only 2>&1)
+printf '%s' "$OUT" | grep -q "DS4_BATCHED_SESSIONS unset: using $HOSTBS " \
+    && ok "MSS_HW_MEMSIZE is ignored outside --render-only" || fail "MSS_HW_MEMSIZE outside --render-only: $OUT"
+
 echo "== phase A: --check-only =="
 CK="$TMP/check-only"
 mkdir -p "$CK"
@@ -337,7 +361,9 @@ if git -C "$ROOT" cat-file -e "$OLD_REF^{commit}" 2>/dev/null; then
         for tree in old new; do
             [ "$tree" = old ] && src="$TMP/old" || src="$ROOT"
             d="$TMP/parity-$tree-$tag"
-            env MSS_BACKENDS="$sel" OLLAMA_USER=testuser \
+            # DS4_BATCHED_SESSIONS is explicit: its RAM-based default (#19) is
+            # the one documented difference from 1.3.0.
+            env MSS_BACKENDS="$sel" OLLAMA_USER=testuser DS4_BATCHED_SESSIONS=1 \
                 LLAMACPP_BIN="$TMP/fix/llamacpp/llamacpp-server" LLAMACPP_MODEL="$TMP/fix/llamacpp/model.gguf" \
                 LLAMACPP_MODEL_SHA256="$(cat "$TMP/fix/llamacpp/model.sha")" \
                 DS4_BIN="$TMP/fix/ds4/ds4-server" DS4_MODEL="$TMP/fix/ds4/model.gguf" \
@@ -488,6 +514,9 @@ STARTS=$(sudo grep -c 'START:' /var/log/mac-studio-server/ds4.log 2>/dev/null ||
 STUB_ARGV=$(cat /tmp/mss-stub-argv 2>/dev/null | tail -1)
 echo "$STUB_ARGV" | grep -q -- "-m $PTMP/system/model.gguf --host 127.0.0.1 --port 18000 --ctx 65536" \
     && ok "stub argv: resolved model path + contract flags" || fail "stub argv: $STUB_ARGV"
+BS=$(mss_ds4_default_sessions "$(sysctl -n hw.memsize)")
+echo "$STUB_ARGV" | grep -q -- "--ctx 65536 --batched-session $BS" \
+    && ok "stub argv: default --batched-session $BS for this runner's RAM (#19)" || fail "stub argv batched session: $STUB_ARGV"
 
 # Re-install while the backend is running: its own listener is not a conflict.
 if sudo env MSS_BACKENDS=ds4 OLLAMA_USER="$(id -un)" \

@@ -56,6 +56,8 @@ See `config/backends.env.example` for the full annotated list: `MSS_BACKENDS`,
 (`MSS_GUARD_FREE_PCT`, `MSS_GUARD_SWAP_HEADROOM_MB`, `MSS_GUARD_STREAK`,
 `MSS_LOG_MAX_MB`).
 
+`DS4_BATCHED_SESSIONS` defaults to 4 on a Mac with 96 GB of RAM or more and to 2 otherwise; set it to override (1 serves one session at a time), and an existing ds4 install picks up the default on its next re-install.
+
 ## Install
 
 ```bash

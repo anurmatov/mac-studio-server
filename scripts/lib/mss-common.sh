@@ -190,6 +190,17 @@ mss_wired_limit_mb() {
     echo $(( _total / 1024 / 1024 * _percent / 100 ))
 }
 
+# ── ds4 batched sessions default (#19) ─────────────────────────────────────────
+# mss_ds4_default_sessions <hw.memsize bytes>: 4 with 96 GiB or more, else 2.
+# One session means a second client evicts the first one's cached prompt.
+mss_ds4_default_sessions() {
+    if mss_match "${1:-}" '^[0-9]{1,15}$' && [ "$1" -ge 103079215104 ]; then
+        echo 4
+    else
+        echo 2
+    fi
+}
+
 # ── extra-args allowlist ───────────────────────────────────────────────────────
 # Returns "value" | "novalue" | "" (not allowlisted) for a canonical flag.
 mss_flag_kind() {
@@ -231,7 +242,8 @@ mss_flag_pattern() {
     elif [ "$_backend" = ds4 ]; then
         case $_flag in
             --threads|--mixed-prefill-quantum) echo '^[0-9]+$'; return ;;
-            --power|--prefill-chunk) echo '^[0-9]+$'; return ;;
+            --power) echo '^[0-9]+$'; return ;;
+            --prefill-chunk) echo '^[1-9][0-9]*$'; return ;;
             --mtp-draft) echo '^[1-3]$'; return ;;
         esac
     fi
