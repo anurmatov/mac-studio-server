@@ -1,0 +1,8 @@
+#!/bin/sh
+# stub ifconfig: claims 192.0.2.10 (RFC 5737) is assigned to en0.
+cat <<'OUT'
+lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
+	inet 127.0.0.1 netmask 0xff000000
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	inet 192.0.2.10 netmask 0xffffff00 broadcast 192.0.2.255
+OUT

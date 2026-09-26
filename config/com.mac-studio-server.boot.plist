@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Installed only when a backend has a pf policy (a LAN-bound port). -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mac-studio-server.boot</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/libexec/mac-studio-server/mss-boot.sh</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>

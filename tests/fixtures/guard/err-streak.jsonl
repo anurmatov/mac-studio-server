@@ -1,0 +1,3 @@
+{"ts":"2026-01-01T00:00:01Z","event":"sample","backend":"ds4","pid":10,"free_pct":8,"swap_used_mb":100,"swap_baseline_mb":100,"rss_mb":100}
+{"ts":"2026-01-01T00:00:06Z","event":"sample_error","backend":"ds4","detail":"probe"}
+{"ts":"2026-01-01T00:00:02Z","event":"sample","backend":"ds4","pid":10,"free_pct":8,"swap_used_mb":100,"swap_baseline_mb":100,"rss_mb":100}
