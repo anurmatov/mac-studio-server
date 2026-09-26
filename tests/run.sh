@@ -165,8 +165,8 @@ grep -q "^$PTMP/fix/ds4/model.gguf [0-9]* [0-9]* [0-9]* $(cat "$TMP/fix/ds4/mode
     && ok "ds4 stamp is path size inode mtime sha" || fail "ds4 stamp format"
 
 echo "== phase A: golden ollama render =="
-sed -e 's|<OLLAMA_USER>|mssgolden|g' -e 's|<OLLAMA_BIND>|0.0.0.0|g' \
-    "$ROOT/config/com.ollama.service.plist" > "$TMP/ollama-rendered.plist"
+mss_render_ollama_plist "$ROOT/config/com.ollama.service.plist" mssgolden 0.0.0.0 /usr/local/bin/ollama \
+    > "$TMP/ollama-rendered.plist"
 if cmp -s "$TMP/ollama-rendered.plist" "$ROOT/tests/golden/com.ollama.service.v1.2.0.plist"; then
     ok "ollama default render byte-identical to v1.2.0 golden"
 else

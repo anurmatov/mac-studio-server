@@ -83,7 +83,12 @@ esac
 # Optional backend
 _opt=$(conf_get MSS_GUARD_BACKEND)
 if [ -n "$_opt" ]; then
-    check_backend "$_opt"
+    # Installed without a model (M3): no backend or guard job exists yet.
+    if [ "$(conf_get MSS_MODEL_STATE)" = waiting ]; then
+        echo "$_opt: waiting for a model (run scripts/model.sh)"
+    else
+        check_backend "$_opt"
+    fi
 
     # pf checks (sudo only): enabled, referenced by the main ruleset, and the
     # anchor rule count equals the rendered MSS_PF_RULE_COUNT.

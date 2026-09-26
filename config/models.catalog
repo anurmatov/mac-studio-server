@@ -1,0 +1,12 @@
+# Model catalogue (#15). Tab-separated, parsed with awk -F'\t', never sourced.
+# Columns: backend id repo revision file size sha256 role license
+# role: starter (menu default), more (listed under "more"), test (never shown in menus).
+# URL: https://huggingface.co/<repo>/resolve/<revision>/<file>. Ollama rows use the registry
+# name and are verified by ollama pull, so revision, file and sha256 are "-".
+llamacpp	qwen3-4b	ggml-org/Qwen3-4B-GGUF	2f3b082b1356a6123f7ed71e65aea340da25d53c	Qwen3-4B-Q4_K_M.gguf	2497280640	ab27b9bfa375a178d6cba48f3ad892b94b7739659dcc7aae8058ce0ffed6b328	starter	apache-2.0
+llamacpp	gpt-oss-20b-mxfp4	ggml-org/gpt-oss-20b-GGUF	ef9b12f2ff56c69cf32153a02784e7a3c88bf524	gpt-oss-20b-MXFP4.gguf	12109566624	27cd6c432c7672cb812a92f611cf3ba7bbc35928262bb1e1253ff4ee6ae35901	more	apache-2.0
+llamacpp	stories260k	ggml-org/models-moved	499bc8821c6b12b4e53c5bffcb21ec206f212d81	tinyllamas/stories260K.gguf	1185376	270cba1bd5109f42d03350f60406024560464db173c0e387d91f0426d3bd256d	test	-
+ds4	qwen38-q2	antirez/qwen3.8-flash-next-gguf	d600fe1a43d2e1cdcadb85144ce3142f66f9eefe	Qwen3.8-Flash-Next-Q2.gguf	147207127040	b1b93fa69aca5f187b0fb813aca8f3ec1beb5cf8cf0bd38cf041b93e0b6ccac9	more	see-model-card
+ds4	qwen38-q4	antirez/qwen3.8-flash-next-gguf	d600fe1a43d2e1cdcadb85144ce3142f66f9eefe	Qwen3.8-Flash-Next-Q4.gguf	177280286720	680944460a8cbe93ba8b6d7b6107213ffb7e22320bd913000e563ca0a0f25a8a	more	see-model-card
+ollama	qwen3:4b	library/qwen3:4b	-	-	2497293444	-	starter	-
+ollama	smollm2:135m	library/smollm2:135m	-	-	270898111	-	test	-
