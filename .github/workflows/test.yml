@@ -111,8 +111,9 @@ jobs:
 
   acquire:
     # 1.5.0 acquisition against the real network: the pinned ds4 build, brew llama.cpp through the
-    # picker, and the resumable, size- and sha-checked download.
-    runs-on: macos-14
+    # picker, and the resumable, size- and sha-checked download. macOS 15: the pinned ds4 commit
+    # uses Metal APIs from the macOS 15 SDK (MTLResidencySet, MTLMathModeSafe).
+    runs-on: macos-15
     timeout-minutes: 60
     env:
       CAT: tests/fixtures/catalog/more.tsv
@@ -161,11 +162,12 @@ jobs:
           T=$(printf '\t')
           printf '%s\n' "Choose [1]: ${T}4" "brew install llama.cpp)? [y/N]: ${T}y" "later [1]: ${T}2" \
             "Save the model to [${HOME}/models/stories260K.gguf]: ${T}@ENTER" "free)? [y/N]: ${T}y" \
-            "LAN access to llamacpp? [y/N]: ${T}@ENTER" "auto-updates)? [y/N]: ${T}n" \
+            "LAN access to llamacpp? [y/N]: ${T}@ENTER" "auto-updates)? ${T}n" \
             "Install with these settings? [Y/n]: ${T}@ENTER" > "$RUNNER_TEMP/a4.steps"
+          rc=0
           MSS_CATALOG="$PWD/$CAT" MSS_ENV_FILE="$RUNNER_TEMP/a4.env" LLAMACPP_PORT=18080 MSS_EXPECT_TIMEOUT=600 \
-            expect tests/expect/drive.exp "$RUNNER_TEMP/a4.steps" "$RUNNER_TEMP/a4.transcript" /bin/bash scripts/install.sh
-          rc=$?; tr -d '\r' < "$RUNNER_TEMP/a4.transcript"
+            expect tests/expect/drive.exp "$RUNNER_TEMP/a4.steps" "$RUNNER_TEMP/a4.transcript" /bin/bash scripts/install.sh || rc=$?
+          tr -d '\r' < "$RUNNER_TEMP/a4.transcript"
           test "$rc" = 0
           test "$(tr -d '\r' < "$RUNNER_TEMP/a4.transcript" | grep -c '^hashing llamacpp model')" = 1
           for i in $(seq 1 60); do nc -z 127.0.0.1 18080 && break; sleep 2; done
@@ -215,8 +217,9 @@ jobs:
       - name: No terminal (B1b)
         run: |
           set -u
-          out=$(curl -fsSL "https://raw.githubusercontent.com/anurmatov/mac-studio-server/$REF/bootstrap.sh" | sh -s -- --ref "$REF" 2>&1)
-          rc=$?; echo "$out"
+          rc=0
+          out=$(curl -fsSL "https://raw.githubusercontent.com/anurmatov/mac-studio-server/$REF/bootstrap.sh" | sh -s -- --ref "$REF" 2>&1) || rc=$?
+          echo "$out"
           test "$rc" = 1
           echo "$out" | grep -q '^no terminal: git clone https://github.com/anurmatov/mac-studio-server.git'
           test ! -e "$HOME/mac-studio-server"
@@ -226,9 +229,10 @@ jobs:
           set -u
           T=$(printf '\t')
           printf '%s\n' "(needed for git)? [y/N]: ${T}n" > "$RUNNER_TEMP/b3.steps"
+          rc=0
           MSS_XCODE_SELECT="$PWD/tests/stubs/xcode-select-missing" expect tests/expect/drive.exp "$RUNNER_TEMP/b3.steps" \
-            "$RUNNER_TEMP/b3.transcript" sh -c "curl -fsSL https://raw.githubusercontent.com/anurmatov/mac-studio-server/$REF/bootstrap.sh | sh -s -- --ref $REF"
-          rc=$?; tr -d '\r' < "$RUNNER_TEMP/b3.transcript"
+            "$RUNNER_TEMP/b3.transcript" sh -c "curl -fsSL https://raw.githubusercontent.com/anurmatov/mac-studio-server/$REF/bootstrap.sh | sh -s -- --ref $REF" || rc=$?
+          tr -d '\r' < "$RUNNER_TEMP/b3.transcript"
           test "$rc" = 1
           grep -q '^xcode-select --install' "$RUNNER_TEMP/b3.transcript"
           test ! -e "$HOME/mac-studio-server"
@@ -239,7 +243,7 @@ jobs:
           T=$(printf '\t'); run() { # run <dir> <transcript>: bootstrap into MSS_DIR, Ctrl-C at the menu
             printf '%s\n' "Choose [1]: ${T}@INTR" > "$RUNNER_TEMP/b4.steps"
             MSS_DIR=$1 expect tests/expect/drive.exp "$RUNNER_TEMP/b4.steps" "$2" \
-              sh -c "curl -fsSL https://raw.githubusercontent.com/anurmatov/mac-studio-server/$REF/bootstrap.sh | sh -s -- --ref $REF"; }
+              sh -c "curl -fsSL https://raw.githubusercontent.com/anurmatov/mac-studio-server/$REF/bootstrap.sh | sh -s -- --ref $REF" || true; }
           git clone -q https://github.com/anurmatov/mac-studio-server.git "$RUNNER_TEMP/old"
           git -C "$RUNNER_TEMP/old" checkout -q --detach 66c9d35
           run "$RUNNER_TEMP/old" "$RUNNER_TEMP/b4a.transcript"; tr -d '\r' < "$RUNNER_TEMP/b4a.transcript"
@@ -264,12 +268,13 @@ jobs:
           T=$(printf '\t')
           printf '%s\n' "Choose [1]: ${T}2" "(brew install ollama)? [y/N]: ${T}y" "brew install llama.cpp)? [y/N]: ${T}y" \
             "later [1]: ${T}2" "Save the model to [${HOME}/models/stories260K.gguf]: ${T}@ENTER" "free)? [y/N]: ${T}y" \
-            "LAN access to llamacpp? [y/N]: ${T}@ENTER" "auto-updates)? [y/N]: ${T}n" \
+            "LAN access to llamacpp? [y/N]: ${T}@ENTER" "auto-updates)? ${T}n" \
             "Install with these settings? [Y/n]: ${T}@ENTER" "(starter) 2) later [1]: ${T}1" > "$RUNNER_TEMP/b2.steps"
+          rc=0
           PATH="${P%:}" MSS_CATALOG="$HOME/mac-studio-server/tests/fixtures/catalog/more.tsv" LLAMACPP_PORT=18080 \
             MSS_EXPECT_TIMEOUT=900 expect tests/expect/drive.exp "$RUNNER_TEMP/b2.steps" "$RUNNER_TEMP/b2.transcript" \
-            sh -c "curl -fsSL https://raw.githubusercontent.com/anurmatov/mac-studio-server/$REF/bootstrap.sh | sh -s -- --ref $REF"
-          rc=$?; tr -d '\r' < "$RUNNER_TEMP/b2.transcript" > "$RUNNER_TEMP/b2.txt"; cat "$RUNNER_TEMP/b2.txt"
+            sh -c "curl -fsSL https://raw.githubusercontent.com/anurmatov/mac-studio-server/$REF/bootstrap.sh | sh -s -- --ref $REF" || rc=$?
+          tr -d '\r' < "$RUNNER_TEMP/b2.transcript" > "$RUNNER_TEMP/b2.txt"; cat "$RUNNER_TEMP/b2.txt"
           test "$rc" = 0
           test "$(git -C "$HOME/mac-studio-server" rev-parse HEAD)" = "$REF"
           grep -q "at commit $REF" "$RUNNER_TEMP/b2.txt"
@@ -321,8 +326,8 @@ jobs:
           commit=$GITHUB_SHA
           for attempt in 1 2; do
             rm -rf "$HOME/mac-studio-server"
-            expect tests/expect/drive.exp "$RUNNER_TEMP/b6.steps" "$RUNNER_TEMP/b6.transcript" sh -c "$line"
-            rc=$?
+            rc=0
+            expect tests/expect/drive.exp "$RUNNER_TEMP/b6.steps" "$RUNNER_TEMP/b6.transcript" sh -c "$line" || rc=$?
             if grep -q "at commit $commit" "$RUNNER_TEMP/b6.transcript" && grep -q 'Which backends' "$RUNNER_TEMP/b6.transcript"; then
               tr -d '\r' < "$RUNNER_TEMP/b6.transcript"; echo "exit $rc (130 is the Ctrl-C at the menu)"; exit 0
             fi

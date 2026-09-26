@@ -54,7 +54,7 @@ Ollama listens on all interfaces (0.0.0.0) by default and has no password; set O
 
 - A Mac with Apple silicon on macOS Sonoma or later, and an administrator account.
 - Remote Login (SSH) on for headless use: System Settings → General → Sharing.
-- Disk space for models: 2.5 GB for the starter; ds4 models need 137 GiB or more.
+- Disk space for models: 2.5 GB for the starter; ds4 needs macOS 15 and 137 GiB or more.
 
 ## Updates
 

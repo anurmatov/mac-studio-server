@@ -5,7 +5,7 @@
 #
 # bash 3.2, sourced after mss-common.sh. Everything runs as the user: the only
 # sudo calls are the CLT install (softwareupdate) and the Homebrew installer's
-# own. Test overrides: MSS_CATALOG, MSS_DF, MSS_XCODE_SELECT.
+# own. Test overrides: MSS_CATALOG, MSS_DF, MSS_XCODE_SELECT, MSS_SW_VERS.
 
 MSS_DS4_COMMIT=0aaea5a238fb41a35106a551e73c8409dfb751ac
 MSS_DS4_REMOTE=https://github.com/antirez/ds4.git
@@ -207,12 +207,18 @@ mss_ds4_manual_cmd() {
     printf '%s\n' "git clone $MSS_DS4_REMOTE ~/ds4 && cd ~/ds4 && git checkout ${MSS_DS4_COMMIT:0:12} && make ds4-server"
 }
 
-# What the build needs and lacks, space-separated; empty when ready.
+# What the build needs and lacks, comma-separated; empty when ready. The pinned ds4
+# uses Metal APIs from the macOS 15 SDK (MTLResidencySet, MTLMathModeSafe).
 mss_ds4_missing_prereqs() {
-    local m="" t
-    mss_clt_present || m="$m Xcode-Command-Line-Tools"
-    for t in git make cc; do command -v "$t" >/dev/null 2>&1 || m="$m $t"; done
-    printf '%s\n' "${m# }"
+    local m="" t ver
+    ver=$("${MSS_SW_VERS:-sw_vers}" -productVersion 2>/dev/null)
+    case ${ver%%.*} in
+        ''|*[!0-9]*) ;;
+        *) [ "${ver%%.*}" -ge 15 ] || m="$m, macOS 15 or later (this Mac runs $ver)" ;;
+    esac
+    mss_clt_present || m="$m, Xcode Command Line Tools"
+    for t in git make cc; do command -v "$t" >/dev/null 2>&1 || m="$m, $t"; done
+    printf '%s\n' "${m#, }"
 }
 
 # mss_ds4_dir_state <dir>: new, reuse (its own clean checkout at the pin) or refuse.
