@@ -205,7 +205,10 @@ mss_flag_kind() {
         esac
     elif [ "$_backend" = ds4 ]; then
         case $_flag in
-            --threads|--power|--mixed-prefill-quantum) echo value; return ;;
+            --threads|--power|--mixed-prefill-quantum|--mtp-draft|--prefill-chunk) echo value; return ;;
+            # --mtp uses the MTP weights embedded in the verified model; the
+            # file-loading --mtp-model and --dspark* stay rejected.
+            --mtp|--mtp-exact-sampling|--warm-weights) echo novalue; return ;;
         esac
     fi
     echo ""
@@ -228,7 +231,8 @@ mss_flag_pattern() {
     elif [ "$_backend" = ds4 ]; then
         case $_flag in
             --threads|--mixed-prefill-quantum) echo '^[0-9]+$'; return ;;
-            --power) echo '^[0-9]+$'; return ;;
+            --power|--prefill-chunk) echo '^[0-9]+$'; return ;;
+            --mtp-draft) echo '^[1-3]$'; return ;;
         esac
     fi
     echo ""
@@ -296,6 +300,9 @@ mss_validate_extra_args() {
             mss_match "$_value" "$_pattern" || { mss_error "$_var: value '$_value' for $_canonical does not match $_pattern"; return 1; }
             if [ "$_canonical" = "--power" ]; then
                 [ "$_value" -ge 1 ] && [ "$_value" -le 100 ] || { mss_error "$_var: --power must be 1..100"; return 1; }
+            fi
+            if [ "$_canonical" = "--prefill-chunk" ]; then
+                [ "$_value" -ge 512 ] && [ "$_value" -le 65536 ] || { mss_error "$_var: --prefill-chunk must be 512..65536"; return 1; }
             fi
             _out="$_out $_canonical $_value"
         else

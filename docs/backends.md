@@ -35,8 +35,9 @@ rejected before any system change.
   instead; then there is no pf policy and the key is the sole protection.
 - **Extra args are allowlisted.** `LLAMACPP_EXTRA_ARGS` / `DS4_EXTRA_ARGS`
   accept only reviewed performance flags; anything that serves files, loads
-  extra artifacts or persists state is rejected. ds4's `--mtp*` flags are not
-  accepted in 1.3.0.
+  extra artifacts or persists state is rejected. ds4 also accepts `--mtp`,
+  `--mtp-draft 1..3`, `--mtp-exact-sampling`, `--prefill-chunk 512..65536` and
+  `--warm-weights`; `--mtp-model` and `--dspark*` stay rejected.
 - **Inputs are validated, not escaped.** Paths must be absolute with no spaces
   or special characters, numbers must be integers, and a value containing a
   newline is refused. The service user defaults to the user who ran `sudo` and

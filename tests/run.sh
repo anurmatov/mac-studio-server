@@ -74,7 +74,14 @@ check "ds4 args" "--power 60 --threads 8" "$(mss_validate_extra_args ds4 '--powe
 for bad in '-ngl99' '-t=8' '--slot-save-path /tmp' '--path /' '--lora-scaled a 1' '--control-vector x' '--kv-disk-dir d' '--trace f' '--cors' '--flash-attn yes'; do
     check_fail "reject extra arg: $bad" mss_validate_extra_args llamacpp "$bad" T
 done
-for bad in '--mtp-model x' '--trace f' '--mtp' '--mtp-draft 2' '--mtp-exact-sampling' '--power 0' '--power 101'; do
+check "ds4 MTP, prefill and warm-up args (#16)" "--mtp --mtp-draft 3 --mtp-exact-sampling --prefill-chunk 4096 --warm-weights" \
+    "$(mss_validate_extra_args ds4 '--mtp --mtp-draft 3 --mtp-exact-sampling --prefill-chunk=4096 --warm-weights' T)"
+check "ds4 range edges (#16)" "--mtp-draft 1 --prefill-chunk 512 --prefill-chunk 65536" \
+    "$(mss_validate_extra_args ds4 '--mtp-draft 1 --prefill-chunk 512 --prefill-chunk 65536' T)"
+for bad in '--mtp-model x' '--trace f' '--power 0' '--power 101' \
+    '--mtp-draft 9' '--mtp-draft 0' '--mtp-draft=4' '--mtp-draft' '--mtp=1' '--warm-weights=1' '--warm-weights x' \
+    '--prefill-chunk=abc' '--prefill-chunk 511' '--prefill-chunk 65537' '--prefill-chunk' '-mtp' \
+    '--dspark' '--dspark-confidence 0.5' '--dspark-strict' '--mtp-timing' '--mtp-margin 3'; do
     check_fail "reject ds4 extra arg: $bad" mss_validate_extra_args ds4 "$bad" T
 done
 
