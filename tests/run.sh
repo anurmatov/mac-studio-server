@@ -233,14 +233,15 @@ make_fixture() { # make_fixture <backend> <dir>: stub bin + fake gguf + sha
 render() { # render <backends> <dir> [extra env...]
     _sel=$1; _dir=$2; shift 2
     mkdir -p "$_dir"
-    env MSS_BACKENDS="$_sel" OLLAMA_USER=testuser "$@" \
+    # The extra env comes last: env keeps the last value, so a test's override wins.
+    env MSS_BACKENDS="$_sel" OLLAMA_USER=testuser \
         LLAMACPP_BIN="$TMP/fix/llamacpp/llamacpp-server" \
         LLAMACPP_MODEL="$TMP/fix/llamacpp/model.gguf" \
         LLAMACPP_MODEL_SHA256="$(cat "$TMP/fix/llamacpp/model.sha")" \
         DS4_BIN="$TMP/fix/ds4/ds4-server" \
         DS4_MODEL="$TMP/fix/ds4/model.gguf" \
         DS4_MODEL_SHA256="$(cat "$TMP/fix/ds4/model.sha")" \
-        sh "$ROOT/scripts/install-backends.sh" --render-only "$_dir"
+        "$@" sh "$ROOT/scripts/install-backends.sh" --render-only "$_dir"
 }
 make_fixture llamacpp "$TMP/fix/llamacpp"
 make_fixture ds4 "$TMP/fix/ds4"
@@ -609,8 +610,9 @@ b5 "$BS/same.sh" "$B5SHA" "$BS/same.sh" "$(printf 'f%.0s' $(seq 40))" && fail "B
 echo "== phase A: waiting for a model (M4, M6) =="
 check_fail "an empty model is the 1.4.0 error without MSS_DEFER_MODEL (M6)" \
     render llamacpp "$TMP/m6-unset" LLAMACPP_MODEL= LLAMACPP_MODEL_SHA256=
-render llamacpp "$TMP/m6-unset" LLAMACPP_MODEL= LLAMACPP_MODEL_SHA256= 2>&1 | grep -q '^ERROR: LLAMACPP_MODEL is required' \
-    && ok "an empty model fails on LLAMACPP_MODEL (#21)" || fail "an empty model failed for another reason"
+OUT=$(render llamacpp "$TMP/m6-unset" LLAMACPP_MODEL= LLAMACPP_MODEL_SHA256= 2>&1)
+printf '%s\n' "$OUT" | grep -q '^ERROR: LLAMACPP_MODEL is required' \
+    && ok "an empty model fails on LLAMACPP_MODEL (#21)" || fail "an empty model failed for another reason: $OUT"
 if render llamacpp "$TMP/m6-yes" MSS_DEFER_MODEL=yes LLAMACPP_MODEL= LLAMACPP_MODEL_SHA256= >/dev/null 2>&1; then
     ok "MSS_DEFER_MODEL=yes renders without a model (M6)"
     grep -qx 'MSS_MODEL_STATE=waiting' "$TMP/m6-yes/backends.conf" && grep -qx 'MSS_GUARD_BACKEND=llamacpp' "$TMP/m6-yes/backends.conf" \
