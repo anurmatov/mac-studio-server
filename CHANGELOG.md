@@ -5,15 +5,13 @@ All notable changes to this project will be documented in this file.
 ## [1.5.0] - 2026-09-26
 
 ### Added
-- One-line install with curl that fetches a verified copy of this repository
-- The installer offers to install Homebrew, Ollama, llama.cpp or build DwarfStar when missing
-- A model menu with a small starter model, resumable downloads, or a model later
-- A command to add or switch the llama.cpp or DwarfStar model after installation
+- One-line curl install that verifies the download and offers to install or build what is missing
+- A model menu with a starter model and resumable downloads, and a command to switch models later
 - DS4_EXTRA_ARGS accepts ds4's MTP speculative decoding, prefill chunk and weight warm-up flags
 
 ### Changed
 - Headless macOS tweaks are now asked once instead of always applied; the answer is saved
-- ds4 serves several sessions by default (4 with 96 GB of RAM or more, otherwise 2); existing installs change on re-install unless DS4_BATCHED_SESSIONS is set
+- ds4 now serves 4 sessions at 96 GB of RAM or more, else 2, unless DS4_BATCHED_SESSIONS is set
 
 ## [1.4.0] - 2026-09-26
 
