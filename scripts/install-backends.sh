@@ -6,7 +6,10 @@
 # Validates EVERYTHING first, including the model sha256: a bad variable or
 # model must abort before any system change. Then writes the model stamp,
 # renders backends.conf, pf.conf and plists, installs files with the ownership
-# table from the issue, and bootstraps boot -> backend -> guard.
+# table from the issue, and bootstraps boot -> backend -> guard. Before any
+# bootstrap it stops every job and waits for launchd to release its label (#18),
+# and with a pf policy the backend starts only after this run's boot job has
+# verified pf.
 #
 # --check-only runs only the validation and the hash; install.sh calls it before
 # touching Ollama. As root, and only on a matching hash, it writes the model
@@ -18,6 +21,10 @@
 #
 # MSS_DEFER_MODEL=yes installs the optional backend without a model: the conf
 # says MSS_MODEL_STATE=waiting and no backend or guard job is installed.
+#
+# MSS_LAUNCHD_TIMEOUT (seconds, default 60) bounds each wait for a job to stop
+# and for the boot job's pf marker. It exists for tests and for Macs that are
+# unusually slow to stop the backend.
 
 set -u
 # sudo inherits the caller's umask; with 077, mkdir -p would create a missing
@@ -82,6 +89,7 @@ MSS_PFCTL=${MSS_PFCTL:-/sbin/pfctl}
 MSS_REPLACE_BACKEND=${MSS_REPLACE_BACKEND:-}
 MSS_DEFER_MODEL=${MSS_DEFER_MODEL:-}
 MSS_PROGRESS_SECONDS=${MSS_PROGRESS_SECONDS:-10}
+MSS_LAUNCHD_TIMEOUT=${MSS_LAUNCHD_TIMEOUT:-60}
 
 LIBEXEC_DIR="/usr/local/libexec/mac-studio-server"
 ETC_DIR="/usr/local/etc/mac-studio-server"
@@ -106,6 +114,7 @@ fi
 mss_validate_path_chars MSS_PFCTL "$MSS_PFCTL" || exit 1
 case $MSS_DEFER_MODEL in ''|yes) ;; *) mss_die "MSS_DEFER_MODEL must be yes or unset" ;; esac
 mss_validate_uint MSS_PROGRESS_SECONDS "$MSS_PROGRESS_SECONDS" 1 60 || exit 1
+mss_validate_uint MSS_LAUNCHD_TIMEOUT "$MSS_LAUNCHD_TIMEOUT" 1 600 || exit 1
 
 # The optional backend already installed (backends.conf is world-readable).
 # A root pass reads the installed conf. Without root (--render-only or
@@ -605,13 +614,67 @@ BOOTSTRAP=""
 [ "$HAS_PF_POLICY" = 1 ] && BOOTSTRAP="$BOOTSTRAP boot"
 [ "$_JOBS" = 1 ] && BOOTSTRAP="$BOOTSTRAP $_optional guard"
 
-for label in $BOOTSTRAP; do
-    launchctl bootout "system/com.mac-studio-server.$label" 2>/dev/null || true
+bootstrap_label() {
+    launchctl bootstrap system "$PLIST_DIR/com.mac-studio-server.$1.plist" \
+        || mss_die "launchctl bootstrap failed for com.mac-studio-server.$1"
+    echo "bootstrapped com.mac-studio-server.$1"
+}
+
+# 1. Stop everything first, the watcher first.
+_STOPPED=""
+for label in guard $_optional boot; do
+    case " $BOOTSTRAP " in
+        *" $label "*)
+            launchctl bootout "system/com.mac-studio-server.$label" 2>/dev/null || true
+            _STOPPED="$_STOPPED $label"
+            ;;
+    esac
 done
-for label in $BOOTSTRAP; do
-    launchctl bootstrap system "$PLIST_DIR/com.mac-studio-server.$label.plist" \
-        || mss_die "launchctl bootstrap failed for com.mac-studio-server.$label"
-    echo "bootstrapped com.mac-studio-server.$label"
+# A deferred re-install booted out the backend and guard above. With a pf
+# policy, wait for them too: boot must not load the new anchor while the old
+# backend still serves.
+if [ "$HAS_PF_POLICY" = 1 ] && [ -n "$_optional" ] && [ "$_JOBS" = 0 ]; then
+    _STOPPED="$_STOPPED $_optional guard"
+fi
+
+# 2. Wait until launchd has released every stopped label. Nothing is started
+#    before this: bootstrapping a label it still holds fails with I/O error 5.
+for label in $_STOPPED; do
+    mss_launchd_wait_gone "com.mac-studio-server.$label" "$MSS_LAUNCHD_TIMEOUT" \
+        || mss_die "com.mac-studio-server.$label did not stop within ${MSS_LAUNCHD_TIMEOUT}s; nothing was started; re-run the install once it has stopped"
 done
+
+# 3. With a pf policy the backend starts only after boot has written a marker
+#    for this kern.boottime in this run. A marker left by an earlier install in
+#    the same boot would let the backend start under the old anchor.
+if [ "$HAS_PF_POLICY" = 1 ]; then
+    BOOT_MARKER=/var/run/com.mac-studio-server.boot.ok
+    rm -f "$BOOT_MARKER"
+    bootstrap_label boot
+    _boottime=$(sysctl -n kern.boottime 2>/dev/null)
+    _n=0; _why=""
+    while :; do
+        if [ -n "$_boottime" ] && [ -r "$BOOT_MARKER" ] && [ "$(cat "$BOOT_MARKER" 2>/dev/null)" = "$_boottime" ]; then
+            break
+        fi
+        _rc=$(launchctl print system/com.mac-studio-server.boot 2>/dev/null \
+            | sed -n 's/^[[:space:]]*last exit code = \([0-9][0-9]*\).*/\1/p' | head -n 1)
+        if [ -n "$_rc" ] && [ "$_rc" != 0 ]; then _why="exit code $_rc"; break; fi
+        if [ "$_n" -ge $((MSS_LAUNCHD_TIMEOUT * 2)) ]; then _why="no marker within ${MSS_LAUNCHD_TIMEOUT}s"; break; fi
+        sleep 0.5
+        _n=$((_n + 1))
+    done
+    [ -z "$_why" ] || mss_die "pf boot check failed ($_why); com.mac-studio-server.$_optional was not started; sudo /usr/local/libexec/mac-studio-server/mss-boot.sh shows the reason"
+    echo "pf verified by com.mac-studio-server.boot"
+fi
+
+# 4. The backend, then guard, each only once launchd no longer holds its label.
+if [ "$_JOBS" = 1 ]; then
+    for label in $_optional guard; do
+        mss_launchd_wait_gone "com.mac-studio-server.$label" "$MSS_LAUNCHD_TIMEOUT" \
+            || mss_die "com.mac-studio-server.$label is still loaded; re-run the install once it has stopped"
+        bootstrap_label "$label"
+    done
+fi
 
 echo "install-backends: done (backends: $MSS_BACKENDS; pf rules: $PF_RULE_COUNT)"

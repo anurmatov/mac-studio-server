@@ -208,6 +208,33 @@ for bad in '' 'foo' 'llamacpp,ds4' 'ollama,llamacpp,ds4' 'ollama,ollama' 'llamac
     check_fail "selection rejected: '$bad'" mss_validate_selection "$bad"
 done
 
+echo "== phase A: waiting for launchd to release a label (#18) =="
+mkdir -p "$TMP/lc-twice" "$TMP/lc-always"
+# launchctl stubs: print succeeds twice and then fails, or always succeeds.
+cat > "$TMP/lc-twice/launchctl" <<STUB
+#!/bin/sh
+n=\$(cat '$TMP/lc-twice/n' 2>/dev/null || echo 0)
+echo \$((n + 1)) > '$TMP/lc-twice/n'
+[ "\$n" -lt 2 ]
+STUB
+printf '#!/bin/sh\nexit 0\n' > "$TMP/lc-always/launchctl"
+chmod +x "$TMP/lc-twice/launchctl" "$TMP/lc-always/launchctl"
+OUT=$( (PATH="$TMP/lc-twice:$PATH"; mss_launchd_wait_gone com.mac-studio-server.test 5) 2>&1); RC=$?
+check "mss_launchd_wait_gone returns 0 once the label goes" 0 "$RC"
+printf '%s' "$OUT" | grep -q 'waiting for com.mac-studio-server.test to stop' \
+    && printf '%s' "$OUT" | grep -q 'com.mac-studio-server.test stopped after' \
+    && ok "mss_launchd_wait_gone logs the wait and the stop" || fail "mss_launchd_wait_gone output: $OUT"
+OUT=$( (PATH="$TMP/lc-always:$PATH"; mss_launchd_wait_gone com.mac-studio-server.test 1) 2>&1); RC=$?
+check "mss_launchd_wait_gone returns 1 at the timeout" 1 "$RC"
+printf '%s' "$OUT" | grep -q 'did not stop within 1s' && ok "mss_launchd_wait_gone names the timeout" \
+    || fail "mss_launchd_wait_gone timeout output: $OUT"
+BOOTS=$(cd "$ROOT" && grep -rl 'launchctl bootstrap' scripts libexec bootstrap.sh | sort | tr '\n' ' ' | sed 's/ $//')
+check "launchctl bootstrap appears only in install-backends.sh and mss-enable.sh" \
+    "libexec/mss-enable.sh scripts/install-backends.sh" "$BOOTS"
+for f in libexec/mss-enable.sh scripts/install-backends.sh; do
+    grep -q 'mss_launchd_wait_gone "' "$ROOT/$f" && ok "$f calls mss_launchd_wait_gone" || fail "$f never calls mss_launchd_wait_gone"
+done
+
 echo "== phase A: guard --evaluate fixtures =="
 E="$ROOT/libexec/mss-guard.sh"
 check "free3" "trip:free"  "$($E --evaluate $ROOT/tests/fixtures/guard/free3.jsonl)"
@@ -1308,6 +1335,149 @@ head -n 1 "$PB/sudo.log" | grep -q ' -v -p \[sudo\] password (asked once): ' && 
     || fail "U1 first sudo call: $(head -n 1 "$PB/sudo.log")"
 sleep 60
 pgrep -f 'sudo -n true' >/dev/null && fail "U4 the keep-alive is still running" || ok "U4 no keep-alive 60 s after the run"
+
+echo "== phase B: re-install and enable while the backend is stopping (#18) =="
+# On TERM the stub sleeps for the seconds in $DELAY, like ds4 releasing a large
+# model. launchd keeps the label until the job has exited. Each test deletes its
+# /tmp/mss-stub-* flags at its start and at its end.
+DELAY=/tmp/mss-stub-term-delay
+RB="$TMP/stopping"; mkdir -p "$RB"
+jobpid() { launchctl print "system/$1" 2>/dev/null | sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\).*/\1/p' | head -n 1; }
+# wait_newpid <label> <old pid> <seconds>: prints the job's PID once it has one other than old.
+wait_newpid() {
+    _i=0
+    while [ "$_i" -lt "$3" ]; do
+        _wp=$(jobpid "$1"); [ -n "$_wp" ] && [ "$_wp" != "$2" ] && { echo "$_wp"; return 0; }
+        sleep 1; _i=$((_i + 1))
+    done
+    return 1
+}
+# rbinstall <log> [env...]: ds4 on loopback 18000, output to log.
+rbinstall() {
+    _log=$1; shift
+    sudo env MSS_BACKENDS=ds4 OLLAMA_USER="$(id -un)" DS4_BIN="$DS4B" DS4_MODEL="$DS4M" DS4_MODEL_SHA256="$DS4S" \
+        DS4_HOST=127.0.0.1 DS4_PORT=18000 "$@" sh "$ROOT/scripts/install-backends.sh" >"$_log" 2>&1
+}
+sudo sh "$ROOT/scripts/uninstall.sh" --all >/dev/null 2>&1
+rm -f "$DELAY"
+rbinstall "$RB/setup.log" && wait_listen 18000 && ok "loopback ds4 running on 18000" || fail "ds4 setup: $(tail -3 "$RB/setup.log")"
+
+# B1: re-install while ds4 takes 8 s to stop succeeds on the first run.
+rm -f "$DELAY"; echo 8 > "$DELAY"
+OLD=$(jobpid com.mac-studio-server.ds4)
+if rbinstall "$RB/b1.log" DS4_BATCHED_SESSIONS=3; then ok "B1 re-install while ds4 is stopping exits 0 on the first run"
+else fail "B1 re-install while ds4 is stopping: $(tail -3 "$RB/b1.log")"; fi
+grep -q 'waiting for com.mac-studio-server.ds4 to stop' "$RB/b1.log" && grep -q 'com.mac-studio-server.ds4 stopped' "$RB/b1.log" \
+    && ok "B1 the installer waited for ds4 to stop" || fail "B1 no wait logged: $(grep -i ds4 "$RB/b1.log" | tail -3)"
+NEW=$(wait_newpid com.mac-studio-server.ds4 "$OLD" 30)
+[ -n "$NEW" ] && ok "B1 ds4 runs as a new pid ($OLD -> $NEW)" || fail "B1 no new ds4 pid (old $OLD)"
+wait_listen 18000 >/dev/null
+tail -n 1 /tmp/mss-stub-argv | grep -q -- '--batched-session 3' && ok "B1 the new argv has --batched-session 3" \
+    || fail "B1 argv: $(tail -n 1 /tmp/mss-stub-argv)"
+rm -f "$DELAY"
+
+# B5: a trip, then mss-enable at once while ds4 takes 8 s to stop.
+rm -f "$DELAY"; wait_listen 18000 >/dev/null; echo 8 > "$DELAY"
+OLD=$(jobpid com.mac-studio-server.ds4)
+sudo "$ROOT/libexec/mss-guard.sh" --simulate-trip >/dev/null 2>&1
+if sudo /usr/local/libexec/mac-studio-server/mss-enable.sh >"$RB/b5.log" 2>&1; then ok "B5 mss-enable right after a trip exits 0"
+else fail "B5 mss-enable right after a trip: $(tail -3 "$RB/b5.log")"; fi
+wait_newpid com.mac-studio-server.ds4 "$OLD" 10 >/dev/null && ok "B5 ds4 has a new pid within 10 s" || fail "B5 no new ds4 pid within 10 s (old $OLD)"
+[ ! -e /var/db/mac-studio-server/guard.tripped ] && ok "B5 guard.tripped removed" || fail "B5 guard.tripped still present"
+rm -f "$DELAY"
+
+# B2: ds4 takes 30 s to stop and the installer waits 3 s: it stops before starting
+# anything, and a re-install succeeds once the old job has gone.
+rm -f "$DELAY"; wait_listen 18000 >/dev/null; echo 30 > "$DELAY"
+rbinstall "$RB/b2.log" MSS_LAUNCHD_TIMEOUT=3 && fail "B2 a 3 s timeout accepted a backend that was still stopping" \
+    || { grep -q 'com.mac-studio-server.ds4 did not stop within 3s' "$RB/b2.log" && ok "B2 the install stops and names ds4 and 3s" \
+        || fail "B2: $(tail -3 "$RB/b2.log")"; }
+_i=0; while loaded com.mac-studio-server.ds4 && [ "$_i" -lt 45 ]; do sleep 1; _i=$((_i + 1)); done
+! loaded com.mac-studio-server.ds4 && ! loaded com.mac-studio-server.guard \
+    && ok "B2 neither ds4 nor guard is loaded after the old job exits" || fail "B2 ds4 or guard is loaded after the timeout"
+rm -f "$DELAY"
+rbinstall "$RB/b2-again.log" && loaded com.mac-studio-server.ds4 && ok "B2 a re-install after the old job exits succeeds" \
+    || fail "B2 re-install: $(tail -3 "$RB/b2-again.log")"
+
+# B3: ds4 on a LAN address with an allowlist. pf goes through a copy of the
+# pfctl-ok stub, so the runner's pf is never changed. In each run the boot job
+# verifies pf before ds4 is bootstrapped, and the marker is this run's.
+MARKER=/var/run/com.mac-studio-server.boot.ok
+PFSTUB="$RB/pfctl-ok"; cp "$ROOT/tests/stubs/pfctl-ok" "$PFSTUB"; chmod 0755 "$PFSTUB"
+# laninstall <log> [env...]
+laninstall() {
+    _log=$1; shift
+    sudo env MSS_BACKENDS=ds4 OLLAMA_USER="$(id -un)" DS4_BIN="$DS4B" DS4_MODEL="$DS4M" DS4_MODEL_SHA256="$DS4S" \
+        DS4_HOST=192.0.2.10 DS4_ALLOW_FROM=192.0.2.99 DS4_PORT=18001 \
+        MSS_IFCONFIG="$ROOT/tests/stubs/ifconfig-lan" MSS_PFCTL="$PFSTUB" "$@" \
+        sh "$ROOT/scripts/install-backends.sh" >"$_log" 2>&1
+}
+# precedes <log> <first> <second>: the first line matching <first> comes before
+# the first line matching <second>.
+precedes() {
+    _pa=$(grep -n -- "$2" "$1" | head -n 1 | cut -d: -f1)
+    _pb=$(grep -n -- "$3" "$1" | head -n 1 | cut -d: -f1)
+    [ -n "$_pa" ] && [ -n "$_pb" ] && [ "$_pa" -lt "$_pb" ]
+}
+# The stub writes one argv line when it starts. wait_argv <count> waits up to
+# 30 s for a line after <count>, so a test never reads the count while a job it
+# just bootstrapped is still starting.
+argv_lines() { cat /tmp/mss-stub-argv 2>/dev/null | wc -l | tr -d ' '; }
+wait_argv() {
+    _i=0
+    while [ "$(argv_lines)" -le "$1" ] && [ "$_i" -lt 30 ]; do sleep 1; _i=$((_i + 1)); done
+    [ "$(argv_lines)" -gt "$1" ]
+}
+PFV='pf verified by com.mac-studio-server.boot'
+sudo rm -f "$DELAY" /tmp/mss-stub-pfctl-fail /tmp/mss-stub-pf.rules
+sudo sh "$ROOT/scripts/uninstall.sh" --all >/dev/null 2>&1
+N=$(argv_lines)
+if laninstall "$RB/b3.log"; then ok "B3 LAN install"; else fail "B3 LAN install: $(tail -3 "$RB/b3.log")"; fi
+precedes "$RB/b3.log" "$PFV" 'bootstrapped com.mac-studio-server.ds4' && ok "B3 install: pf verified before ds4 was bootstrapped" \
+    || fail "B3 install order: $(grep -E 'pf verified|bootstrapped' "$RB/b3.log" | tr '\n' ' ')"
+wait_argv "$N" && ok "B3 ds4 started after the install" || fail "B3 ds4 did not start after the install"
+echo 5 > "$DELAY"
+START=$(date +%s)
+N=$(argv_lines)
+if laninstall "$RB/b3-again.log"; then ok "B3 LAN re-install while ds4 takes 5 s to stop"; else fail "B3 LAN re-install: $(tail -3 "$RB/b3-again.log")"; fi
+precedes "$RB/b3-again.log" 'com.mac-studio-server.ds4 stopped after' 'bootstrapped com.mac-studio-server.boot' \
+    && ok "B3 re-install: the old ds4 stopped before boot was bootstrapped" \
+    || fail "B3 re-install stop order: $(grep -E 'stopped after|bootstrapped' "$RB/b3-again.log" | tr '\n' ' ')"
+precedes "$RB/b3-again.log" "$PFV" 'bootstrapped com.mac-studio-server.ds4' && ok "B3 re-install: pf verified before ds4 was bootstrapped" \
+    || fail "B3 re-install order: $(grep -E 'pf verified|bootstrapped' "$RB/b3-again.log" | tr '\n' ' ')"
+check "B3 the marker holds this kern.boottime" "$(sysctl -n kern.boottime)" "$(cat "$MARKER" 2>/dev/null)"
+MT=$(stat -f %m "$MARKER" 2>/dev/null || echo 0)
+[ "$MT" -ge "$START" ] && ok "B3 the re-install wrote the marker" || fail "B3 marker mtime $MT is before the re-install ($START)"
+wait_argv "$N" && ok "B3 ds4 started after the re-install" || fail "B3 ds4 did not start after the re-install"
+sudo rm -f "$DELAY" /tmp/mss-stub-pf.rules
+
+# B4: pf fails to enable. The re-install stops before ds4 and guard, and leaves no marker.
+sudo rm -f "$DELAY" /tmp/mss-stub-pfctl-fail; touch /tmp/mss-stub-pfctl-fail
+ARGV_BEFORE=$(argv_lines)
+laninstall "$RB/b4.log" && fail "B4 the re-install passed with pf failing" \
+    || { grep -q 'pf boot check failed' "$RB/b4.log" && ok "B4 the re-install stops at the pf boot check" || fail "B4: $(tail -3 "$RB/b4.log")"; }
+! loaded com.mac-studio-server.ds4 && ! loaded com.mac-studio-server.guard && ok "B4 ds4 and guard are not loaded" \
+    || fail "B4 ds4 or guard is loaded"
+[ ! -e "$MARKER" ] && ok "B4 no pf marker" || fail "B4 the pf marker exists"
+sleep 2
+check "B4 ds4 did not start (no new argv line)" "$ARGV_BEFORE" "$(argv_lines)"
+sudo rm -f /tmp/mss-stub-pfctl-fail
+N=$(argv_lines)
+if laninstall "$RB/b4-again.log"; then ok "B4 re-install once pf works again"; else fail "B4 re-install: $(tail -3 "$RB/b4-again.log")"; fi
+wait_argv "$N" && ok "B4 ds4 started after pf works again" || fail "B4 ds4 did not start after pf works again"
+sudo rm -f "$DELAY" /tmp/mss-stub-pfctl-fail /tmp/mss-stub-pf.rules
+
+# B3 (deferred): a LAN re-install without a model boots ds4 out and waits for it
+# before boot loads the new anchor (MUST NOT 3).
+sudo rm -f "$DELAY" /tmp/mss-stub-pf.rules; echo 5 > "$DELAY"
+if laninstall "$RB/b3-defer.log" MSS_DEFER_MODEL=yes DS4_MODEL= DS4_MODEL_SHA256=; then ok "B3 deferred LAN re-install"
+else fail "B3 deferred LAN re-install: $(tail -3 "$RB/b3-defer.log")"; fi
+precedes "$RB/b3-defer.log" 'com.mac-studio-server.ds4 stopped after' 'bootstrapped com.mac-studio-server.boot' \
+    && ok "B3 deferred: the old ds4 stopped before boot was bootstrapped" \
+    || fail "B3 deferred stop order: $(grep -E 'stopped after|bootstrapped' "$RB/b3-defer.log" | tr '\n' ' ')"
+! loaded com.mac-studio-server.ds4 && ! loaded com.mac-studio-server.guard && ok "B3 deferred: ds4 and guard are not loaded" \
+    || fail "B3 deferred: ds4 or guard is loaded"
+sudo rm -f "$DELAY" /tmp/mss-stub-pf.rules
 
 sudo sh "$ROOT/scripts/uninstall.sh" --all >/dev/null 2>&1
 

@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 - Model hashing works in SSH sessions that set an unsupported locale such as C.UTF-8
+- Re-installing while a backend is running no longer fails with 'Bootstrap failed: 5'
 
 ## [1.5.0] - 2026-09-26
 
