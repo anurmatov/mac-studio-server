@@ -1309,6 +1309,56 @@ head -n 1 "$PB/sudo.log" | grep -q ' -v -p \[sudo\] password (asked once): ' && 
 sleep 60
 pgrep -f 'sudo -n true' >/dev/null && fail "U4 the keep-alive is still running" || ok "U4 no keep-alive 60 s after the run"
 
+echo "== phase B: re-install and enable while the backend is stopping (#18) =="
+# On TERM the stub sleeps for the seconds in $DELAY, like ds4 releasing a large
+# model. launchd keeps the label until the job has exited. Each test deletes its
+# /tmp/mss-stub-* flags at its start and at its end.
+DELAY=/tmp/mss-stub-term-delay
+RB="$TMP/stopping"; mkdir -p "$RB"
+jobpid() { launchctl print "system/$1" 2>/dev/null | sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\).*/\1/p' | head -n 1; }
+# wait_newpid <label> <old pid> <seconds>: prints the job's PID once it has one other than old.
+wait_newpid() {
+    _i=0
+    while [ "$_i" -lt "$3" ]; do
+        _wp=$(jobpid "$1"); [ -n "$_wp" ] && [ "$_wp" != "$2" ] && { echo "$_wp"; return 0; }
+        sleep 1; _i=$((_i + 1))
+    done
+    return 1
+}
+# rbinstall <log> [env...]: ds4 on loopback 18000, output to log.
+rbinstall() {
+    _log=$1; shift
+    sudo env MSS_BACKENDS=ds4 OLLAMA_USER="$(id -un)" DS4_BIN="$DS4B" DS4_MODEL="$DS4M" DS4_MODEL_SHA256="$DS4S" \
+        DS4_HOST=127.0.0.1 DS4_PORT=18000 "$@" sh "$ROOT/scripts/install-backends.sh" >"$_log" 2>&1
+}
+sudo sh "$ROOT/scripts/uninstall.sh" --all >/dev/null 2>&1
+rm -f "$DELAY"
+rbinstall "$RB/setup.log" && wait_listen 18000 && ok "loopback ds4 running on 18000" || fail "ds4 setup: $(tail -3 "$RB/setup.log")"
+
+# B1: re-install while ds4 takes 8 s to stop succeeds on the first run.
+rm -f "$DELAY"; echo 8 > "$DELAY"
+OLD=$(jobpid com.mac-studio-server.ds4)
+if rbinstall "$RB/b1.log" DS4_BATCHED_SESSIONS=3; then ok "B1 re-install while ds4 is stopping exits 0 on the first run"
+else fail "B1 re-install while ds4 is stopping: $(tail -3 "$RB/b1.log")"; fi
+grep -q 'waiting for com.mac-studio-server.ds4 to stop' "$RB/b1.log" && grep -q 'com.mac-studio-server.ds4 stopped' "$RB/b1.log" \
+    && ok "B1 the installer waited for ds4 to stop" || fail "B1 no wait logged: $(grep -i ds4 "$RB/b1.log" | tail -3)"
+NEW=$(wait_newpid com.mac-studio-server.ds4 "$OLD" 30)
+[ -n "$NEW" ] && ok "B1 ds4 runs as a new pid ($OLD -> $NEW)" || fail "B1 no new ds4 pid (old $OLD)"
+wait_listen 18000 >/dev/null
+tail -n 1 /tmp/mss-stub-argv | grep -q -- '--batched-session 3' && ok "B1 the new argv has --batched-session 3" \
+    || fail "B1 argv: $(tail -n 1 /tmp/mss-stub-argv)"
+rm -f "$DELAY"
+
+# B5: a trip, then mss-enable at once while ds4 takes 8 s to stop.
+rm -f "$DELAY"; wait_listen 18000 >/dev/null; echo 8 > "$DELAY"
+OLD=$(jobpid com.mac-studio-server.ds4)
+sudo "$ROOT/libexec/mss-guard.sh" --simulate-trip >/dev/null 2>&1
+if sudo /usr/local/libexec/mac-studio-server/mss-enable.sh >"$RB/b5.log" 2>&1; then ok "B5 mss-enable right after a trip exits 0"
+else fail "B5 mss-enable right after a trip: $(tail -3 "$RB/b5.log")"; fi
+wait_newpid com.mac-studio-server.ds4 "$OLD" 10 >/dev/null && ok "B5 ds4 has a new pid within 10 s" || fail "B5 no new ds4 pid within 10 s (old $OLD)"
+[ ! -e /var/db/mac-studio-server/guard.tripped ] && ok "B5 guard.tripped removed" || fail "B5 guard.tripped still present"
+rm -f "$DELAY"
+
 sudo sh "$ROOT/scripts/uninstall.sh" --all >/dev/null 2>&1
 
 [ "$FAIL" -eq 0 ] || exit 1

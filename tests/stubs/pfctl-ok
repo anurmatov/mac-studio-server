@@ -1,0 +1,18 @@
+#!/bin/sh
+# pfctl-ok — a pfctl stand-in for phase B that never changes pf (#18).
+# The "loaded" anchor is kept in /tmp/mss-stub-pf.rules. When
+# /tmp/mss-stub-pfctl-fail exists, -E fails.
+
+RULES=/tmp/mss-stub-pf.rules
+
+case ${1:-} in
+    -E) [ ! -e /tmp/mss-stub-pfctl-fail ] ;;
+    -s) [ "${2:-}" = info ] && echo 'Status: Enabled' ;;
+    -sr) echo 'anchor "com.apple/*" all' ;;
+    -a)
+        case ${3:-} in
+            -f) cp "$4" "$RULES" ;;
+            -sr) grep -v -e '^[[:space:]]*$' -e '^[[:space:]]*#' "$RULES" 2>/dev/null || true ;;
+        esac
+        ;;
+esac
