@@ -1412,40 +1412,72 @@ laninstall() {
         MSS_IFCONFIG="$ROOT/tests/stubs/ifconfig-lan" MSS_PFCTL="$PFSTUB" "$@" \
         sh "$ROOT/scripts/install-backends.sh" >"$_log" 2>&1
 }
-# pf_first <log>: "pf verified" is logged before ds4 is bootstrapped.
-pf_first() {
-    _pv=$(grep -n 'pf verified by com.mac-studio-server.boot' "$1" | head -n 1 | cut -d: -f1)
-    _bd=$(grep -n 'bootstrapped com.mac-studio-server.ds4' "$1" | head -n 1 | cut -d: -f1)
-    [ -n "$_pv" ] && [ -n "$_bd" ] && [ "$_pv" -lt "$_bd" ]
+# precedes <log> <first> <second>: the first line matching <first> comes before
+# the first line matching <second>.
+precedes() {
+    _pa=$(grep -n -- "$2" "$1" | head -n 1 | cut -d: -f1)
+    _pb=$(grep -n -- "$3" "$1" | head -n 1 | cut -d: -f1)
+    [ -n "$_pa" ] && [ -n "$_pb" ] && [ "$_pa" -lt "$_pb" ]
 }
+# The stub writes one argv line when it starts. wait_argv <count> waits up to
+# 30 s for a line after <count>, so a test never reads the count while a job it
+# just bootstrapped is still starting.
+argv_lines() { cat /tmp/mss-stub-argv 2>/dev/null | wc -l | tr -d ' '; }
+wait_argv() {
+    _i=0
+    while [ "$(argv_lines)" -le "$1" ] && [ "$_i" -lt 30 ]; do sleep 1; _i=$((_i + 1)); done
+    [ "$(argv_lines)" -gt "$1" ]
+}
+PFV='pf verified by com.mac-studio-server.boot'
 sudo rm -f "$DELAY" /tmp/mss-stub-pfctl-fail /tmp/mss-stub-pf.rules
 sudo sh "$ROOT/scripts/uninstall.sh" --all >/dev/null 2>&1
+N=$(argv_lines)
 if laninstall "$RB/b3.log"; then ok "B3 LAN install"; else fail "B3 LAN install: $(tail -3 "$RB/b3.log")"; fi
-pf_first "$RB/b3.log" && ok "B3 install: pf verified before ds4 was bootstrapped" \
+precedes "$RB/b3.log" "$PFV" 'bootstrapped com.mac-studio-server.ds4' && ok "B3 install: pf verified before ds4 was bootstrapped" \
     || fail "B3 install order: $(grep -E 'pf verified|bootstrapped' "$RB/b3.log" | tr '\n' ' ')"
+wait_argv "$N" && ok "B3 ds4 started after the install" || fail "B3 ds4 did not start after the install"
 echo 5 > "$DELAY"
 START=$(date +%s)
+N=$(argv_lines)
 if laninstall "$RB/b3-again.log"; then ok "B3 LAN re-install while ds4 takes 5 s to stop"; else fail "B3 LAN re-install: $(tail -3 "$RB/b3-again.log")"; fi
-pf_first "$RB/b3-again.log" && ok "B3 re-install: pf verified before ds4 was bootstrapped" \
+precedes "$RB/b3-again.log" 'com.mac-studio-server.ds4 stopped after' 'bootstrapped com.mac-studio-server.boot' \
+    && ok "B3 re-install: the old ds4 stopped before boot was bootstrapped" \
+    || fail "B3 re-install stop order: $(grep -E 'stopped after|bootstrapped' "$RB/b3-again.log" | tr '\n' ' ')"
+precedes "$RB/b3-again.log" "$PFV" 'bootstrapped com.mac-studio-server.ds4' && ok "B3 re-install: pf verified before ds4 was bootstrapped" \
     || fail "B3 re-install order: $(grep -E 'pf verified|bootstrapped' "$RB/b3-again.log" | tr '\n' ' ')"
 check "B3 the marker holds this kern.boottime" "$(sysctl -n kern.boottime)" "$(cat "$MARKER" 2>/dev/null)"
 MT=$(stat -f %m "$MARKER" 2>/dev/null || echo 0)
 [ "$MT" -ge "$START" ] && ok "B3 the re-install wrote the marker" || fail "B3 marker mtime $MT is before the re-install ($START)"
+wait_argv "$N" && ok "B3 ds4 started after the re-install" || fail "B3 ds4 did not start after the re-install"
 sudo rm -f "$DELAY" /tmp/mss-stub-pf.rules
 
 # B4: pf fails to enable. The re-install stops before ds4 and guard, and leaves no marker.
 sudo rm -f "$DELAY" /tmp/mss-stub-pfctl-fail; touch /tmp/mss-stub-pfctl-fail
-ARGV_BEFORE=$(wc -l < /tmp/mss-stub-argv | tr -d ' ')
+ARGV_BEFORE=$(argv_lines)
 laninstall "$RB/b4.log" && fail "B4 the re-install passed with pf failing" \
     || { grep -q 'pf boot check failed' "$RB/b4.log" && ok "B4 the re-install stops at the pf boot check" || fail "B4: $(tail -3 "$RB/b4.log")"; }
 ! loaded com.mac-studio-server.ds4 && ! loaded com.mac-studio-server.guard && ok "B4 ds4 and guard are not loaded" \
     || fail "B4 ds4 or guard is loaded"
 [ ! -e "$MARKER" ] && ok "B4 no pf marker" || fail "B4 the pf marker exists"
 sleep 2
-check "B4 ds4 did not start (no new argv line)" "$ARGV_BEFORE" "$(wc -l < /tmp/mss-stub-argv | tr -d ' ')"
+check "B4 ds4 did not start (no new argv line)" "$ARGV_BEFORE" "$(argv_lines)"
 sudo rm -f /tmp/mss-stub-pfctl-fail
+N=$(argv_lines)
 if laninstall "$RB/b4-again.log"; then ok "B4 re-install once pf works again"; else fail "B4 re-install: $(tail -3 "$RB/b4-again.log")"; fi
+wait_argv "$N" && ok "B4 ds4 started after pf works again" || fail "B4 ds4 did not start after pf works again"
 sudo rm -f "$DELAY" /tmp/mss-stub-pfctl-fail /tmp/mss-stub-pf.rules
+
+# B3 (deferred): a LAN re-install without a model boots ds4 out and waits for it
+# before boot loads the new anchor (MUST NOT 3).
+sudo rm -f "$DELAY" /tmp/mss-stub-pf.rules; echo 5 > "$DELAY"
+if laninstall "$RB/b3-defer.log" MSS_DEFER_MODEL=yes DS4_MODEL= DS4_MODEL_SHA256=; then ok "B3 deferred LAN re-install"
+else fail "B3 deferred LAN re-install: $(tail -3 "$RB/b3-defer.log")"; fi
+precedes "$RB/b3-defer.log" 'com.mac-studio-server.ds4 stopped after' 'bootstrapped com.mac-studio-server.boot' \
+    && ok "B3 deferred: the old ds4 stopped before boot was bootstrapped" \
+    || fail "B3 deferred stop order: $(grep -E 'stopped after|bootstrapped' "$RB/b3-defer.log" | tr '\n' ' ')"
+! loaded com.mac-studio-server.ds4 && ! loaded com.mac-studio-server.guard && ok "B3 deferred: ds4 and guard are not loaded" \
+    || fail "B3 deferred: ds4 or guard is loaded"
+sudo rm -f "$DELAY" /tmp/mss-stub-pf.rules
 
 sudo sh "$ROOT/scripts/uninstall.sh" --all >/dev/null 2>&1
 
