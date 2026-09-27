@@ -26,7 +26,93 @@ check_fail() { # check_fail <desc> <cmd...>
 
 . "$ROOT/scripts/lib/mss-common.sh"
 
+# ── live-state guard and hash audit (#21) ─────────────────────────────────────
+# The installed paths phase A must leave alone. A glob that matches nothing
+# stays literal and is recorded as absent.
+live_paths() {
+    printf '%s\n' /usr/local/etc/mac-studio-server/backends.conf /usr/local/etc/mac-studio-server/pf.conf
+    for _lp in /var/db/mac-studio-server/*.model.verified /usr/local/libexec/mac-studio-server/* \
+        /Library/LaunchDaemons/com.mac-studio-server.*.plist; do
+        printf '%s\n' "$_lp"
+    done
+    printf '%s\n' /usr/local/bin/ollama /Library/LaunchDaemons/com.ollama.service.plist \
+        /Library/LaunchDaemons/com.ollama.gpumemory.plist "$ROOT/backends.env"
+}
+# live_snap: paths on stdin, "path<TAB>state" out. Only stat, without -L; the
+# contents of a file are never read.
+live_snap() {
+    while IFS= read -r _lp; do
+        if [ -e "$_lp" ] || [ -L "$_lp" ]; then
+            _ls=$(stat -f '%N %d %i %z %m %c %p %u %g %Y' "$_lp" 2>/dev/null) || _ls=unstatable
+        else
+            _ls=absent
+        fi
+        printf '%s\t%s\n' "$_lp" "$_ls"
+    done
+}
+# live_diff <before> <after>: "path<TAB>same|changed" for each path in either.
+live_diff() {
+    awk -F'\t' 'NR == FNR { b[$1] = $2; seen[$1] = 1; next } { a[$1] = $2; seen[$1] = 1 }
+        END { for (p in seen) { x = (p in b) ? b[p] : "absent"; y = (p in a) ? a[p] : "absent"
+                                print p "\t" (x == y ? "same" : "changed") } }' "$1" "$2" | sort
+}
+# audit_bad <log>: logged dd and shasum inputs that are not under the test directory.
+audit_bad() {
+    awk -v t="$TMP/" -v p="$PTMP/" '{ f = substr($0, index($0, " ") + 1)
+        if (f != "-" && index(f, t) != 1 && index(f, p) != 1) print }' "$1"
+}
+
 if [ "$PHASE" != B ]; then
+# As root, --check-only writes a stamp for a fixture model and the real model
+# is then refused at its next start (#21).
+if [ "$(id -u)" -eq 0 ]; then
+    echo "phase A must run as a non-root user" >&2
+    exit 2
+fi
+# Non-root lookups of the host go under a sysroot of our own: the conf does not
+# exist there, and HOME is empty. A test that sets MSS_CONF itself still wins.
+SAVED_HOME=$HOME; SAVED_PATH=$PATH
+mkdir -p "$TMP/sysroot" "$TMP/home" || { echo "cannot create the phase A sysroot" >&2; exit 2; }
+MSS_TEST_SYSROOT=$TMP/sysroot
+MSS_CONF=$TMP/sysroot/usr/local/etc/mac-studio-server/backends.conf
+HOME=$TMP/home
+export MSS_TEST_SYSROOT MSS_CONF HOME
+[ "$(uname)" != Darwin ] || live_paths | live_snap > "$TMP/live.before"
+# Hash audit: dd and shasum run through shims that log their input and exec the
+# real tool (the PID stays dd's, so SIGINFO progress still works).
+AUDIT_LOG="$TMP/audit.log"; : > "$AUDIT_LOG"
+REAL_DD=$(command -v dd 2>/dev/null); REAL_SHASUM=$(command -v shasum 2>/dev/null)
+AUDIT=0
+if [ -n "$REAL_DD" ] && [ -n "$REAL_SHASUM" ]; then
+    mkdir -p "$TMP/auditbin"
+    cat > "$TMP/auditbin/dd" <<SHIM
+#!/bin/sh
+for _a in "\$@"; do
+    case \$_a in if=*) printf 'dd %s\n' "\${_a#if=}" >> '$AUDIT_LOG' ;; esac
+done
+exec '$REAL_DD' "\$@"
+SHIM
+    cat > "$TMP/auditbin/shasum" <<SHIM
+#!/bin/sh
+_skip=0; _any=0
+for _a in "\$@"; do
+    if [ "\$_skip" = 1 ]; then _skip=0; continue; fi
+    case \$_a in
+        -a) _skip=1 ;;
+        -?*) ;;
+        *) printf 'shasum %s\n' "\$_a" >> '$AUDIT_LOG'; _any=1 ;;
+    esac
+done
+[ "\$_any" = 1 ] || printf 'shasum -\n' >> '$AUDIT_LOG'
+exec '$REAL_SHASUM' "\$@"
+SHIM
+    chmod +x "$TMP/auditbin/dd" "$TMP/auditbin/shasum"
+    PATH="$TMP/auditbin:$PATH"; export PATH
+    AUDIT=1
+else
+    fail "hash audit needs shasum and dd"
+fi
+
 echo "== phase A: static =="
 if command -v shellcheck >/dev/null 2>&1; then
     if shellcheck -S warning -s sh "$ROOT"/libexec/*.sh "$ROOT"/scripts/lib/mss-common.sh "$ROOT"/scripts/install-backends.sh "$ROOT"/scripts/status.sh "$ROOT"/scripts/uninstall.sh; then
@@ -46,6 +132,21 @@ ok "sh -n on all scripts"
 
 BAD=$(grep -nE 'stat -c|sha256sum|readlink -f|date -d' "$ROOT"/libexec/*.sh "$ROOT"/scripts/lib/*.sh "$ROOT"/scripts/install-backends.sh "$ROOT"/scripts/status.sh "$ROOT"/scripts/uninstall.sh 2>/dev/null || true)
 [ -z "$BAD" ] && ok "no GNU-only spellings" || fail "GNU-only spellings found: $BAD"
+# #21: shasum only through mss_shasum256, which forces its locale.
+BADSHA=$(grep -rnE '(^|[^_])shasum' "$ROOT/scripts" "$ROOT/libexec" "$ROOT/bootstrap.sh" \
+    | grep -v '^[^:]*:[0-9]*:[[:space:]]*#' | grep -vF 'mss_shasum256() { LC_ALL=C shasum -a 256 "$@"; }' || true)
+[ -z "$BADSHA" ] && ok "shasum runs only through mss_shasum256 (#21)" || fail "shasum outside mss_shasum256: $BADSHA"
+check "MSS_TEST_SYSROOT is read by exactly three files (#21)" \
+    "scripts/install-backends.sh scripts/lib/mss-picker.sh tests/run.sh" \
+    "$(cd "$ROOT" && grep -rl --exclude-dir=.git MSS_TEST_SYSROOT . | sed 's|^\./||' | sort | tr '\n' ' ' | sed 's/ $//')"
+# Every PATH= keeps $PATH, so the hash-audit shims stay first (#21). tests/run.sh
+# counts from the phase A header to its summary line.
+PATHRE='(^|[^A-Za-z0-9_])PATH='
+BADPATH=$( { grep -rnE "$PATHRE" "$ROOT/scripts" "$ROOT/libexec" "$ROOT/bootstrap.sh"
+    awk '/^if \[ "\$PHASE" != B \]; then$/ { a = 1 } a { print FILENAME ":" FNR ":" $0 } /^echo "phase A: \$PASS passed/ { a = 0 }' \
+        "$ROOT/tests/run.sh" | grep -E "$PATHRE"
+    } | grep -Ev '\$(PATH|\{PATH\})([^A-Za-z0-9_]|$)' | grep -vF "PATHRE='" || true)
+[ -z "$BADPATH" ] && ok "every PATH= assignment keeps \$PATH (#21)" || fail "PATH= without \$PATH: $BADPATH"
 
 echo "== phase A: mss_resolve_path =="
 ln -s target2 "$TMP/link1" 2>/dev/null || true
@@ -127,19 +228,20 @@ make_fixture() { # make_fixture <backend> <dir>: stub bin + fake gguf + sha
     cp "$ROOT/tests/stubs/fake-server.sh" "$_d/$_b-server"
     chmod +x "$_d/$_b-server"
     printf 'fake-gguf-for-tests-%s' "$_b" > "$_d/model.gguf"
-    shasum -a 256 "$_d/model.gguf" | awk '{print $1}' > "$_d/model.sha"
+    mss_shasum256 "$_d/model.gguf" | awk '{print $1}' > "$_d/model.sha"
 }
 render() { # render <backends> <dir> [extra env...]
     _sel=$1; _dir=$2; shift 2
     mkdir -p "$_dir"
-    env MSS_BACKENDS="$_sel" OLLAMA_USER=testuser "$@" \
+    # The extra env comes last: env keeps the last value, so a test's override wins.
+    env MSS_BACKENDS="$_sel" OLLAMA_USER=testuser \
         LLAMACPP_BIN="$TMP/fix/llamacpp/llamacpp-server" \
         LLAMACPP_MODEL="$TMP/fix/llamacpp/model.gguf" \
         LLAMACPP_MODEL_SHA256="$(cat "$TMP/fix/llamacpp/model.sha")" \
         DS4_BIN="$TMP/fix/ds4/ds4-server" \
         DS4_MODEL="$TMP/fix/ds4/model.gguf" \
         DS4_MODEL_SHA256="$(cat "$TMP/fix/ds4/model.sha")" \
-        sh "$ROOT/scripts/install-backends.sh" --render-only "$_dir"
+        "$@" sh "$ROOT/scripts/install-backends.sh" --render-only "$_dir"
 }
 make_fixture llamacpp "$TMP/fix/llamacpp"
 make_fixture ds4 "$TMP/fix/ds4"
@@ -193,7 +295,7 @@ check_fail "port collision 11434" render 'ollama,ds4' "$TMP/bad-port" DS4_PORT=1
 check_fail "IPv6 host" render 'ds4' "$TMP/bad-v6" DS4_HOST='::1'
 # split gguf
 mkdir -p "$TMP/split"; printf 'x' > "$TMP/split/model-00001-of-00002.gguf"
-SPSHA=$(shasum -a 256 "$TMP/split/model-00001-of-00002.gguf" | awk '{print $1}')
+SPSHA=$(mss_shasum256 "$TMP/split/model-00001-of-00002.gguf" | awk '{print $1}')
 check_fail "split gguf" env MSS_BACKENDS=ds4 OLLAMA_USER=testuser DS4_BIN="$TMP/fix/ds4/ds4-server" DS4_MODEL="$TMP/split/model-00001-of-00002.gguf" DS4_MODEL_SHA256="$SPSHA" sh "$ROOT/scripts/install-backends.sh" --render-only "$TMP/bad-split"
 # wrong sha
 check_fail "wrong sha" render 'ds4' "$TMP/bad-sha" DS4_MODEL_SHA256="$(printf '0%.0s' $(seq 64))"
@@ -206,9 +308,11 @@ check_fail "DS4_CTX with newline" render 'ds4' "$TMP/bad-ctx" DS4_CTX="$(printf 
 check_fail "DS4_BATCHED_SESSIONS non-numeric" render 'ds4' "$TMP/bad-bs" DS4_BATCHED_SESSIONS=four
 check_fail "DS4_WORKDIR relative" render 'ds4' "$TMP/bad-wd" DS4_WORKDIR=relative/dir
 check_fail "LLAMACPP_PARALLEL non-numeric" render 'llamacpp' "$TMP/bad-np" LLAMACPP_PARALLEL=2x
+render 'llamacpp' "$TMP/bad-np" LLAMACPP_PARALLEL=2x 2>&1 | grep -q '^ERROR: LLAMACPP_PARALLEL' \
+    && ok "LLAMACPP_PARALLEL non-numeric fails on LLAMACPP_PARALLEL (#21)" || fail "LLAMACPP_PARALLEL non-numeric failed for another reason"
 check_fail "OLLAMA_USER root" env MSS_BACKENDS=ollama OLLAMA_USER=root sh "$ROOT/scripts/install-backends.sh" --render-only "$TMP/bad-root"
 mkdir -p "$TMP/sp ace"; printf 'x' > "$TMP/sp ace/model.gguf"
-SPC=$(shasum -a 256 "$TMP/sp ace/model.gguf" | awk '{print $1}')
+SPC=$(mss_shasum256 "$TMP/sp ace/model.gguf" | awk '{print $1}')
 check_fail "model path with a space" render 'ds4' "$TMP/bad-space" DS4_MODEL="$TMP/sp ace/model.gguf" DS4_MODEL_SHA256="$SPC"
 # a CIDR allowlist renders (LAN host needs the stub ifconfig)
 if render 'ds4' "$TMP/render-cidr" DS4_HOST=192.0.2.10 DS4_ALLOW_FROM='192.0.2.0/24 198.51.100.7' \
@@ -234,6 +338,9 @@ else
 fi
 check_fail "llamacpp LAN with neither allowlist nor key" render 'llamacpp' "$TMP/bad-lan-llama" LLAMACPP_HOST=192.0.2.10 \
     MSS_IFCONFIG="$ROOT/tests/stubs/ifconfig-lan"
+render 'llamacpp' "$TMP/bad-lan-llama" LLAMACPP_HOST=192.0.2.10 MSS_IFCONFIG="$ROOT/tests/stubs/ifconfig-lan" 2>&1 \
+    | grep -q '^ERROR: LLAMACPP_ALLOW_FROM' && ok "llamacpp LAN without allowlist or key fails on LLAMACPP_ALLOW_FROM (#21)" \
+    || fail "llamacpp LAN without allowlist or key failed for another reason"
 
 echo "== phase A: ds4 batched sessions default (#19) =="
 check "96 GiB exactly defaults to 4" 4 "$(mss_ds4_default_sessions 103079215104)"
@@ -353,17 +460,39 @@ fi
 
 echo "== phase A: render parity with 1.3.0 (A1) =="
 OLD_REF=1f9473e84ca592b04a4884a913581fbbd82b0b45
+OLD_ISOLATED=0
 if git -C "$ROOT" cat-file -e "$OLD_REF^{commit}" 2>/dev/null; then
     mkdir -p "$TMP/old"
     git -C "$ROOT" archive "$OLD_REF" | tar -x -C "$TMP/old"
+    # 1.3.0 reads the installed conf at a fixed path. In this extracted copy only,
+    # that path moves under the sysroot, so an installed Mac cannot decide the result (#21).
+    OLDIB="$TMP/old/scripts/install-backends.sh"
+    sed 's|^ETC_DIR="/usr/local/etc/mac-studio-server"$|ETC_DIR="$MSS_TEST_SYSROOT/usr/local/etc/mac-studio-server"|' \
+        "$OLDIB" > "$OLDIB.iso"
+    if [ "$(diff "$OLDIB" "$OLDIB.iso" | grep -c '^<')" = 1 ] && [ "$(diff "$OLDIB" "$OLDIB.iso" | grep -c '^>')" = 1 ]; then
+        mv "$OLDIB.iso" "$OLDIB"
+        ok "the 1.3.0 tree reads its conf under the sysroot (one line changed)"
+        OLD_ISOLATED=1
+    else
+        fail "cannot isolate the 1.3.0 tree"
+        OLD_ISOLATED=0
+    fi
+fi
+if [ ! -d "$TMP/old" ]; then
+    fail "render parity needs commit $OLD_REF (fetch full history: actions/checkout fetch-depth 0)"
+elif [ "$OLD_ISOLATED" = 1 ]; then
     for sel in ollama llamacpp ds4 'ollama,llamacpp' 'ollama,ds4' 'llamacpp,ds4'; do
         tag=$(echo "$sel" | tr , -)
         for tree in old new; do
-            [ "$tree" = old ] && src="$TMP/old" || src="$ROOT"
+            # The 1.3.0 tree is a fixture that hashes with a bare shasum (Perl), which
+            # fails under a locale Perl cannot load, so it alone runs under C (#21).
+            # The new tree keeps the inherited locale.
+            if [ "$tree" = old ]; then src="$TMP/old"; loc="LC_ALL=C LANG=C"; else src="$ROOT"; loc=""; fi
             d="$TMP/parity-$tree-$tag"
             # DS4_BATCHED_SESSIONS is explicit: its RAM-based default (#19) is
             # the one documented difference from 1.3.0.
-            env MSS_BACKENDS="$sel" OLLAMA_USER=testuser DS4_BATCHED_SESSIONS=1 \
+            # shellcheck disable=SC2086  # $loc is a word list, empty for the new tree
+            env $loc MSS_BACKENDS="$sel" OLLAMA_USER=testuser DS4_BATCHED_SESSIONS=1 \
                 LLAMACPP_BIN="$TMP/fix/llamacpp/llamacpp-server" LLAMACPP_MODEL="$TMP/fix/llamacpp/model.gguf" \
                 LLAMACPP_MODEL_SHA256="$(cat "$TMP/fix/llamacpp/model.sha")" \
                 DS4_BIN="$TMP/fix/ds4/ds4-server" DS4_MODEL="$TMP/fix/ds4/model.gguf" \
@@ -371,7 +500,15 @@ if git -C "$ROOT" cat-file -e "$OLD_REF^{commit}" 2>/dev/null; then
                 sh "$src/scripts/install-backends.sh" --render-only "$d" >/dev/null 2>&1
             echo $? > "$d.rc"
         done
-        check "render '$sel' exit code matches 1.3.0" "$(cat "$TMP/parity-old-$tag.rc")" "$(cat "$TMP/parity-new-$tag.rc")"
+        OLDRC=$(cat "$TMP/parity-old-$tag.rc"); NEWRC=$(cat "$TMP/parity-new-$tag.rc")
+        check "render '$sel' exit code matches 1.3.0" "$OLDRC" "$NEWRC"
+        # Equal exit codes also hold when both trees fail; say which one is expected (#21).
+        case $sel in
+            llamacpp,ds4)
+                [ "$OLDRC" != 0 ] && [ "$NEWRC" != 0 ] && ok "render '$sel' fails in both trees" \
+                    || fail "render '$sel' exit codes: 1.3.0 $OLDRC, now $NEWRC" ;;
+            *) check "render '$sel' exits 0 in both trees" "0 0" "$OLDRC $NEWRC" ;;
+        esac
         # libexec copies are sources (mss-common.sh gains helpers); every
         # rendered conf, pf file, plist and stamp must be identical.
         if [ -d "$TMP/parity-old-$tag" ] || [ -d "$TMP/parity-new-$tag" ]; then
@@ -383,8 +520,6 @@ if git -C "$ROOT" cat-file -e "$OLD_REF^{commit}" 2>/dev/null; then
             fi
         fi
     done
-else
-    fail "render parity needs commit $OLD_REF (fetch full history: actions/checkout fetch-depth 0)"
 fi
 
 echo "== phase A: install.sh arguments and modes =="
@@ -479,6 +614,9 @@ b5 "$BS/same.sh" "$B5SHA" "$BS/same.sh" "$(printf 'f%.0s' $(seq 40))" && fail "B
 echo "== phase A: waiting for a model (M4, M6) =="
 check_fail "an empty model is the 1.4.0 error without MSS_DEFER_MODEL (M6)" \
     render llamacpp "$TMP/m6-unset" LLAMACPP_MODEL= LLAMACPP_MODEL_SHA256=
+OUT=$(render llamacpp "$TMP/m6-unset" LLAMACPP_MODEL= LLAMACPP_MODEL_SHA256= 2>&1)
+printf '%s\n' "$OUT" | grep -q '^ERROR: LLAMACPP_MODEL is required' \
+    && ok "an empty model fails on LLAMACPP_MODEL (#21)" || fail "an empty model failed for another reason: $OUT"
 if render llamacpp "$TMP/m6-yes" MSS_DEFER_MODEL=yes LLAMACPP_MODEL= LLAMACPP_MODEL_SHA256= >/dev/null 2>&1; then
     ok "MSS_DEFER_MODEL=yes renders without a model (M6)"
     grep -qx 'MSS_MODEL_STATE=waiting' "$TMP/m6-yes/backends.conf" && grep -qx 'MSS_GUARD_BACKEND=llamacpp' "$TMP/m6-yes/backends.conf" \
@@ -492,9 +630,12 @@ else
     fail "MSS_DEFER_MODEL=yes render: $(render llamacpp "$TMP/m6-yes" MSS_DEFER_MODEL=yes LLAMACPP_MODEL= 2>&1 | tail -1)"
 fi
 # the render-only output with the variable unset stays 1.4.0's (A3)
-render llamacpp "$TMP/m6-parity" >/dev/null 2>&1
-grep -q MSS_MODEL_STATE "$TMP/m6-parity/backends.conf" && fail "MSS_MODEL_STATE written without MSS_DEFER_MODEL" \
-    || ok "no MSS_MODEL_STATE without MSS_DEFER_MODEL"
+if render llamacpp "$TMP/m6-parity" >/dev/null 2>&1; then
+    grep -q MSS_MODEL_STATE "$TMP/m6-parity/backends.conf" && fail "MSS_MODEL_STATE written without MSS_DEFER_MODEL" \
+        || ok "no MSS_MODEL_STATE without MSS_DEFER_MODEL"
+else
+    fail "render llamacpp without MSS_DEFER_MODEL: $(render llamacpp "$TMP/m6-parity" 2>&1 | tail -n 1)"
+fi
 
 echo "== phase A: model.sh without a terminal (M7) =="
 M7="$TMP/m7"; mkdir -p "$M7"
@@ -505,21 +646,27 @@ grep -q 'model.sh needs a terminal' "$M7/out" && ok "M7 says it needs a terminal
 
 echo "== phase A: one hash, as root only a stamp (D6, U3) =="
 if [ "$(uname)" = Darwin ] && [ "$(id -u)" -ne 0 ]; then
-    U3="$TMP/u3"; mkdir -p "$U3"; mkfile 4g "$U3/big.gguf"
-    U3SHA=$(shasum -a 256 "$U3/big.gguf" | awk '{print $1}')
-    env MSS_BACKENDS=ds4 OLLAMA_USER="$(id -un)" MSS_PROGRESS_SECONDS=1 DS4_BIN="$TMP/fix/ds4/ds4-server" \
-        DS4_MODEL="$U3/big.gguf" DS4_MODEL_SHA256="$U3SHA" DS4_PORT=18999 \
-        sh "$ROOT/scripts/install-backends.sh" --check-only >"$U3/log" 2>&1
-    check "4 GiB check passes (U3)" 0 $?
-    PROG=$(grep -c '^hashing ds4 model: [0-9.]* / 4.0 GiB$' "$U3/log")
-    [ "$PROG" -ge 2 ] && ok "U3 $PROG progress lines at 1 s" || fail "U3 progress lines: $PROG ($(cat "$U3/log"))"
-    check "U3 exactly one done line" 1 "$(grep -c '^hashing ds4 model: done (4.0 GiB)$' "$U3/log")"
-    rm -f "$U3/big.gguf"
+    U3="$TMP/u3"; mkdir -p "$U3"
+    # A 4 GiB write and hash adds page-cache pressure; on a Mac serving a model, skip it (#21).
+    if [ "${MSS_TEST_BIG_FILES:-}" = 1 ]; then
+        mkfile 4g "$U3/big.gguf"
+        U3SHA=$(mss_shasum256 "$U3/big.gguf" | awk '{print $1}')
+        env MSS_BACKENDS=ds4 OLLAMA_USER="$(id -un)" MSS_PROGRESS_SECONDS=1 DS4_BIN="$TMP/fix/ds4/ds4-server" \
+            DS4_MODEL="$U3/big.gguf" DS4_MODEL_SHA256="$U3SHA" DS4_PORT=18999 \
+            sh "$ROOT/scripts/install-backends.sh" --check-only >"$U3/log" 2>&1
+        check "4 GiB check passes (U3)" 0 $?
+        PROG=$(grep -c '^hashing ds4 model: [0-9.]* / 4.0 GiB$' "$U3/log")
+        [ "$PROG" -ge 2 ] && ok "U3 $PROG progress lines at 1 s" || fail "U3 progress lines: $PROG ($(cat "$U3/log"))"
+        check "U3 exactly one done line" 1 "$(grep -c '^hashing ds4 model: done (4.0 GiB)$' "$U3/log")"
+        rm -f "$U3/big.gguf"
+    else
+        echo "skip - U3 writes and hashes a 4 GiB file (set MSS_TEST_BIG_FILES=1)"
+    fi
     env MSS_BACKENDS=ds4 OLLAMA_USER="$(id -un)" DS4_BIN="$TMP/fix/ds4/ds4-server" DS4_MODEL="$TMP/fix/ds4/model.gguf" \
         DS4_MODEL_SHA256="$(cat "$TMP/fix/ds4/model.sha")" DS4_PORT=18999 \
         sh "$ROOT/scripts/install-backends.sh" --check-only >"$U3/small" 2>&1
     check "a small model logs only the done line (U3)" "hashing ds4 model: done (0.0 GiB)" "$(grep '^hashing' "$U3/small")"
-    [ ! -e /var/db/mac-studio-server/ds4.model.verified ] || [ /var/db/mac-studio-server/ds4.model.verified -ot "$U3/small" ] \
+    [ ! -e "$MSS_TEST_SYSROOT/var/db/mac-studio-server/ds4.model.verified" ] \
         && ok "a non-root check writes no stamp (D6)" || fail "a non-root check wrote a stamp"
 else
     echo "skip - U3 needs macOS (mkfile, BSD dd) and a non-root user"
@@ -605,7 +752,8 @@ else
     check "the rejected key is never printed back" 1 "$(grep -o 'sk-test123' "$PK/keyfile.transcript" | wc -l | tr -d ' ')"
     # Saved and installed files must not hold it. The pty transcript records
     # the typed answer by design; the printed-back count above covers output.
-    LEAK=$(grep -l 'sk-test123' "$PK"/*.env "$ROOT/backends.env" /usr/local/etc/mac-studio-server/backends.conf 2>/dev/null || true)
+    # The installed conf and $ROOT/backends.env are the live-state guard's (#21).
+    LEAK=$(grep -l 'sk-test123' "$PK"/*.env "$MSS_CONF" 2>/dev/null || true)
     [ -z "$LEAK" ] && ok "the rejected key is in no file (A12)" || fail "sk-test123 found in: $LEAK"
 
     drive intr "Choose [1]: ${T}5" "later [4]: ${T}3" "path or https URL: ${T}@INTR" -- MSS_ENV_FILE="$PK/intr.env" DS4_BIN="$DS4B"
@@ -663,9 +811,68 @@ else
     LONG=$(cat "$PK"/found.transcript "$PK"/ds4menu.transcript "$PK"/tweaks.transcript | tr -d '\r' \
         | sed -n 's/^\(.*\]: \).*/\1/p' | awk 'length($0) > 100')
     [ -z "$LONG" ] && ok "prompts ≤ 100 characters (S4)" || fail "long prompt: $LONG"
+
+    # Every saved binary is one these tests made, never one found on the host (#21).
+    PKBIN=$(grep -h '^[A-Z0-9_]*_BIN=' "$PK"/*.env 2>/dev/null)
+    BADBIN=$(printf '%s\n' "$PKBIN" | awk -v t="$TMP/" -v p="$PTMP/" 'NF { v = substr($0, index($0, "=") + 1)
+        if (index(v, t) != 1 && index(v, p) != 1) print }')
+    [ -n "$PKBIN" ] && [ -z "$BADBIN" ] && ok "the picker saved only test binaries (#21)" \
+        || fail "picker binaries outside the test directory: ${BADBIN:-no *_BIN line saved}"
+fi
+
+echo "== phase A: an installed Mac and the hashing locale (#21) =="
+# D7 against a fixture conf: MSS_CONF decides in a non-root pass.
+printf 'MSS_GUARD_BACKEND=ds4\n' > "$TMP/installed-ds4.conf"
+OUT=$(render llamacpp "$TMP/d7-render" MSS_CONF="$TMP/installed-ds4.conf" 2>&1) && fail "D7 rendered llama.cpp over an installed ds4" \
+    || { printf '%s' "$OUT" | grep -q "installed optional backend is 'ds4'" && ok "D7 reads MSS_CONF without root" || fail "D7 with a fixture conf: $OUT"; }
+OUT=$(env MSS_BACKENDS=llamacpp OLLAMA_USER="$TUSER" MSS_CONF="$TMP/installed-ds4.conf" MSS_REPLACE_BACKEND=ds4 \
+    LLAMACPP_BIN="$TMP/fix/llamacpp/llamacpp-server" LLAMACPP_MODEL="$TMP/fix/llamacpp/model.gguf" \
+    LLAMACPP_MODEL_SHA256="$(cat "$TMP/fix/llamacpp/model.sha")" LLAMACPP_PORT=18998 \
+    sh "$ROOT/scripts/install-backends.sh" --check-only 2>&1) && ok "the switch check replaces the fixture's ds4" \
+    || fail "switch check with a fixture conf: $OUT"
+OUT=$(env MSS_BACKENDS=ds4 OLLAMA_USER="$TUSER" MSS_CONF="$TMP/installed-ds4.conf" MSS_REPLACE_BACKEND=llamacpp \
+    DS4_BIN="$TMP/fix/ds4/ds4-server" DS4_MODEL="$TMP/fix/ds4/model.gguf" DS4_MODEL_SHA256="$(cat "$TMP/fix/ds4/model.sha")" \
+    DS4_PORT=18999 sh "$ROOT/scripts/install-backends.sh" --check-only 2>&1) && fail "replace of a backend the fixture does not have accepted" \
+    || { printf '%s' "$OUT" | grep -q "('ds4')" && ok "a replace of a backend not in the fixture conf is refused" || fail "replace check: $OUT"; }
+# The hash under a locale Perl cannot load, the first field against FIPS 180-2 "abc".
+check "mss_shasum256 under C.UTF-8 gives the abc digest" "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" \
+    "$(printf abc | env LC_ALL=C.UTF-8 LANG=C.UTF-8 sh -c '. "$1/scripts/lib/mss-common.sh"; mss_shasum256' sh "$ROOT" | awk '{print $1}')"
+OUT=$(env LC_ALL=C.UTF-8 LANG=C.UTF-8 MSS_BACKENDS=ds4 OLLAMA_USER="$TUSER" DS4_BIN="$TMP/fix/ds4/ds4-server" \
+    DS4_MODEL="$TMP/fix/ds4/model.gguf" DS4_MODEL_SHA256="$(cat "$TMP/fix/ds4/model.sha")" DS4_PORT=18999 \
+    sh "$ROOT/scripts/install-backends.sh" --check-only 2>&1) && printf '%s' "$OUT" | grep -q 'hashing ds4 model: done' \
+    && ok "a ds4 --check-only under C.UTF-8 hashes the model" || fail "--check-only under C.UTF-8: $OUT"
+
+echo "== phase A: live state and hash audit (#21) =="
+if [ "$(uname)" = Darwin ]; then
+    live_paths | live_snap > "$TMP/live.after"
+    live_diff "$TMP/live.before" "$TMP/live.after" > "$TMP/live.diff"
+    while IFS="$(printf '\t')" read -r _lp _lr; do
+        [ "$_lr" = same ] && ok "live state unchanged: $_lp" || fail "live state changed: $_lp"
+    done < "$TMP/live.diff"
+    echo one > "$TMP/live-self"
+    printf '%s\n' "$TMP/live-self" | live_snap > "$TMP/live-self.before"
+    echo two >> "$TMP/live-self"
+    printf '%s\n' "$TMP/live-self" | live_snap > "$TMP/live-self.after"
+    check "the live-state guard reports a changed file (self-test)" "$(printf '%s\tchanged' "$TMP/live-self")" \
+        "$(live_diff "$TMP/live-self.before" "$TMP/live-self.after")"
+else
+    echo "skip - the live-state guard needs macOS (BSD stat)"
+fi
+if [ "$AUDIT" = 1 ]; then
+    NDD=$(awk '$1 == "dd" && $2 != "-"' "$AUDIT_LOG" | wc -l | tr -d ' ')
+    NSHA=$(awk '$1 == "shasum" && $2 != "-"' "$AUDIT_LOG" | wc -l | tr -d ' ')
+    BADH=$(audit_bad "$AUDIT_LOG")
+    [ "$NDD" -ge 1 ] && [ "$NSHA" -ge 1 ] && [ -z "$BADH" ] \
+        && ok "hash audit: $NDD dd and $NSHA shasum inputs, all under the test directory" \
+        || fail "hash audit: $NDD dd, $NSHA shasum; outside the test directory: $BADH"
+    printf 'dd /Users/example/models/x.gguf\n' > "$TMP/audit-self.log"
+    check "the hash audit flags a model outside the test directory (self-test)" "dd /Users/example/models/x.gguf" \
+        "$(audit_bad "$TMP/audit-self.log")"
 fi
 echo
 echo "phase A: $PASS passed, $FAIL failed"
+unset MSS_TEST_SYSROOT MSS_CONF
+HOME=$SAVED_HOME; PATH=$SAVED_PATH; export HOME PATH
 fi
 
 if [ "$PHASE" = A ]; then
@@ -687,7 +894,7 @@ mkdir -p "$SYST"
 cp "$ROOT/tests/stubs/fake-server.sh" "$SYST/ds4-server"
 chmod +x "$SYST/ds4-server"
 printf 'fake-gguf-system-test' > "$SYST/model.gguf"
-SYSSHA=$(shasum -a 256 "$SYST/model.gguf" | awk '{print $1}')
+SYSSHA=$(mss_shasum256 "$SYST/model.gguf" | awk '{print $1}')
 
 if sudo env MSS_BACKENDS=ds4 OLLAMA_USER="$(id -un)" \
     DS4_BIN="$SYST/ds4-server" DS4_MODEL="$SYST/model.gguf" DS4_MODEL_SHA256="$SYSSHA" \
@@ -764,8 +971,8 @@ for b in llamacpp ds4; do
     cp "$ROOT/tests/stubs/fake-server.sh" "$PB/$b-server"; chmod +x "$PB/$b-server"
     printf 'phase-b-model-%s' "$b" > "$PB/$b.gguf"
 done
-LLB="$PB/llamacpp-server"; LLM="$PB/llamacpp.gguf"; LLS=$(shasum -a 256 "$LLM" | awk '{print $1}')
-DS4B="$PB/ds4-server"; DS4M="$PB/ds4.gguf"; DS4S=$(shasum -a 256 "$DS4M" | awk '{print $1}')
+LLB="$PB/llamacpp-server"; LLM="$PB/llamacpp.gguf"; LLS=$(mss_shasum256 "$LLM" | awk '{print $1}')
+DS4B="$PB/ds4-server"; DS4M="$PB/ds4.gguf"; DS4S=$(mss_shasum256 "$DS4M" | awk '{print $1}')
 ZERO=$(printf '0%.0s' $(seq 64))
 EFB="$PB/backends.env"
 CONFB=/usr/local/etc/mac-studio-server/backends.conf
@@ -809,6 +1016,33 @@ has a3 'Which backends' && fail "A3 showed the menu" || ok "A3 no menu with MSS_
 env MSS_BACKENDS=ds4 OLLAMA_USER="$(id -un)" OLLAMA_BIND=0.0.0.0 DS4_BIN="$DS4B" DS4_MODEL="$DS4M" DS4_MODEL_SHA256="$DS4S" DS4_PORT=18000 \
     sh "$ROOT/scripts/install-backends.sh" --render-only "$PB/a3r" >/dev/null 2>&1
 cmp -s "$CONFB" "$PB/a3r/backends.conf" && ok "A3 installed conf equals the render" || fail "A3 conf differs: $(diff "$CONFB" "$PB/a3r/backends.conf")"
+
+# #21 on an installed Mac: ds4 is installed through install.sh, with its conf,
+# stamp and plists, and a stub /usr/local/bin/ollama.
+stamps() { for _sf in /var/db/mac-studio-server/*.model.verified; do printf '%s\n' "$_sf"; done | live_snap; }
+stamps > "$PB/stamps.before"
+OUT=$(sudo env MSS_TEST_SYSROOT="$TMP/x" MSS_BACKENDS=ds4 OLLAMA_USER="$(id -un)" DS4_BIN="$DS4B" DS4_MODEL="$DS4M" \
+    DS4_MODEL_SHA256="$DS4S" DS4_PORT=18000 sh "$ROOT/scripts/install-backends.sh" --check-only 2>&1) \
+    && fail "root accepted MSS_TEST_SYSROOT" \
+    || { printf '%s' "$OUT" | grep -q MSS_TEST_SYSROOT && ok "root refuses MSS_TEST_SYSROOT (#21)" || fail "root with MSS_TEST_SYSROOT: $OUT"; }
+stamps > "$PB/stamps.after"
+cmp -s "$PB/stamps.before" "$PB/stamps.after" && ok "the refused root pass left the stamps alone (#21)" \
+    || fail "stamps changed: $(diff "$PB/stamps.before" "$PB/stamps.after")"
+OUT=$(sudo env MSS_CONF=/nonexistent MSS_BACKENDS=llamacpp OLLAMA_USER="$(id -un)" LLAMACPP_BIN="$LLB" LLAMACPP_MODEL="$LLM" \
+    LLAMACPP_MODEL_SHA256="$LLS" LLAMACPP_PORT=18083 sh "$ROOT/scripts/install-backends.sh" --check-only 2>&1) \
+    && fail "root honoured MSS_CONF and passed D7" \
+    || { printf '%s' "$OUT" | grep -q "installed optional backend is 'ds4'" && ok "root ignores MSS_CONF: D7 still refuses (#21)" || fail "root with MSS_CONF: $OUT"; }
+OUT=$(sudo env MSS_TEST_PHASE=A sh "$ROOT/tests/run.sh" 2>&1); RC=$?
+check "phase A as root exits 2 (#21)" 2 "$RC"
+printf '%s\n' "$OUT" | grep -q '^ok - ' && fail "phase A as root printed an ok line" || ok "phase A as root prints no ok line (#21)"
+env LANG=C.UTF-8 LC_ALL=C.UTF-8 MSS_TEST_PHASE=A MSS_TEST_BIG_FILES= sh "$ROOT/tests/run.sh" >"$PB/phase-a-installed.log" 2>&1
+RC=$?
+SUM=$(grep '^phase A: [0-9]* passed, [0-9]* failed$' "$PB/phase-a-installed.log")
+if [ "$RC" = 0 ] && printf '%s' "$SUM" | grep -q ', 0 failed$' && ! grep -Eq 'panic|Setting locale failed' "$PB/phase-a-installed.log"; then
+    ok "phase A on an installed host under C.UTF-8: $SUM (#21)"
+else
+    fail "phase A on an installed host under C.UTF-8 (exit $RC): $(tail -n 20 "$PB/phase-a-installed.log")"
+fi
 sudo sh "$ROOT/scripts/uninstall.sh" --backend ds4 >/dev/null 2>&1
 
 # A PATH without llama-server, so "nothing found" is deterministic on any runner.
@@ -1007,7 +1241,7 @@ check "M9 Ollama PID unchanged by model.sh" "$P0" "$(OLLPID)"
 
 # M3: switch to another model by path: one hash, the new -m, the old file untouched.
 OLDM="$HOME/models/stories260K.gguf"; OLDT=$(stat -f %m "$OLDM" 2>/dev/null)
-printf 'phase-b-other-model' > "$PB/other.gguf"; OTHS=$(shasum -a 256 "$PB/other.gguf" | awk '{print $1}')
+printf 'phase-b-other-model' > "$PB/other.gguf"; OTHS=$(mss_shasum256 "$PB/other.gguf" | awk '{print $1}')
 env MSS_ENV_FILE="$EFM" OLLAMA_USER="$(id -un)" MSS_EXPECT_TIMEOUT=180 \
     expect "$ROOT/tests/expect/drive.exp" /dev/null "$PB/m3.transcript" /bin/bash "$ROOT/scripts/model.sh" \
     --path "$PB/other.gguf" --sha256 "$OTHS" >/dev/null 2>"$PB/m3.err"
@@ -1031,7 +1265,7 @@ check "M8 uninstall of a waiting backend exits 0" 0 $?
 [ ! -e "$CONFB" ] && ok "M8 conf removed" || fail "M8 conf left: $(cat "$CONFB")"
 
 # A18: a root --check-only writes only the stamp (and its directory).
-printf 'phase-b-a18-model' > "$PB/a18.gguf"; A18S=$(shasum -a 256 "$PB/a18.gguf" | awk '{print $1}')
+printf 'phase-b-a18-model' > "$PB/a18.gguf"; A18S=$(mss_shasum256 "$PB/a18.gguf" | awk '{print $1}')
 sudo rm -f /var/db/mac-studio-server/ds4.model.verified
 touch "$PB/a18.marker"; sleep 1
 sudo env MSS_BACKENDS=ds4 OLLAMA_USER="$(id -un)" DS4_BIN="$DS4B" DS4_MODEL="$PB/a18.gguf" DS4_MODEL_SHA256="$A18S" DS4_PORT=18000 \

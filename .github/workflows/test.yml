@@ -32,7 +32,8 @@ jobs:
       # GitHub sets CI=true on every runner, so each step picks its phase
       # explicitly instead of relying on CI to gate phase B.
       - name: Static, pure-function and render tests
-        run: MSS_TEST_PHASE=A sh tests/run.sh
+        # The 4 GiB hash-progress test (U3) runs here only, never on a Mac serving a model.
+        run: MSS_TEST_PHASE=A MSS_TEST_BIG_FILES=1 sh tests/run.sh
 
       - name: System tests (launchd, stub servers)
         run: MSS_TEST_PHASE=B sh tests/run.sh

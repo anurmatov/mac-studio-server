@@ -213,7 +213,7 @@ _mss_pick_need_brew() {
 # Ollama: /usr/local/bin/ollama as in 1.4.0, else the one on PATH, else an offer.
 _mss_pick_ollama() {
     local found
-    [ ! -x /usr/local/bin/ollama ] || return 0
+    [ ! -x "${MSS_TEST_SYSROOT:-}/usr/local/bin/ollama" ] || return 0
     found=$(printenv OLLAMA_BIN)
     if [ -n "$found" ] && [ -x "$found" ]; then return 0; fi
     found=$(command -v ollama 2>/dev/null)
@@ -289,7 +289,7 @@ _mss_pick_sha() {
         mss_ask_yn "Compute the sha256 now? This reads the whole file" Y
         if [ "$MSS_ANSWER" = y ]; then
             echo "Hashing $resolved ..." >&2
-            if sha=$(shasum -a 256 "$resolved" 2>/dev/null | awk '{print $1}') && [ -n "$sha" ]; then
+            if sha=$(mss_shasum256 "$resolved" 2>/dev/null | awk '{print $1}') && [ -n "$sha" ]; then
                 echo "sha256: $sha" >&2
                 mss_ask_yn "Use it? Compare with the checksum your model's source publishes" Y
                 [ "$MSS_ANSWER" = y ] || sha=""

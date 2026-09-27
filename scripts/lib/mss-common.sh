@@ -9,6 +9,11 @@
 mss_error() { echo "ERROR: $*" >&2; }
 mss_die()   { mss_error "$@"; exit 1; }
 
+# ── sha256 ─────────────────────────────────────────────────────────────────────
+# shasum is Perl, and Perl fails on an inherited locale it cannot load (an SSH
+# session with C.UTF-8). LC_ALL=C for this one call; the digest is the same.
+mss_shasum256() { LC_ALL=C shasum -a 256 "$@"; }
+
 # mss_match <value> <ERE>: the whole value must be one line matching ERE.
 # grep matches line by line, so a value carrying a newline could otherwise pass
 # on its first line and inject a second line into backends.conf.
