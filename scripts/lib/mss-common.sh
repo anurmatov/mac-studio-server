@@ -358,6 +358,27 @@ mss_keepalive_stop() {
     MSS_KEEPALIVE_PID=""
 }
 
+# ── launchd ────────────────────────────────────────────────────────────────────
+# mss_launchd_wait_gone <label> <timeout-s>: returns 0 once `launchctl print
+# system/<label>` fails, polling every 0.5 s, and 1 if the label is still there
+# at the timeout. `launchctl bootout` returns before a running job has exited,
+# and bootstrapping the label until then fails with "5: Input/output error"
+# (#18). The only signal is launchctl print: pgrep can match unrelated processes.
+mss_launchd_wait_gone() {
+    _wl=$1; _wt=$2; _wn=0
+    while launchctl print "system/$_wl" >/dev/null 2>&1; do
+        if [ "$_wn" -ge $((_wt * 2)) ]; then
+            mss_error "$_wl did not stop within ${_wt}s"
+            return 1
+        fi
+        [ "$_wn" -gt 0 ] || echo "waiting for $_wl to stop" >&2
+        sleep 0.5
+        _wn=$((_wn + 1))
+    done
+    [ "$_wn" -eq 0 ] || echo "$_wl stopped after $(awk -v n="$_wn" 'BEGIN { printf "%g", n / 2 }')s" >&2
+    return 0
+}
+
 # ── conf file ──────────────────────────────────────────────────────────────────
 # Read-only loader for runtime scripts: backends.conf is root:wheel 0644.
 mss_conf_path() { printf '%s\n' "${MSS_CONF:-/usr/local/etc/mac-studio-server/backends.conf}"; }
