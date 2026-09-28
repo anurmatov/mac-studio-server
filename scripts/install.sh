@@ -9,6 +9,8 @@ REPO_DIR=$(cd "$(dirname "$0")/.." && pwd)
 . "$REPO_DIR/scripts/lib/mss-common.sh" || exit 1
 . "$REPO_DIR/scripts/lib/mss-acquire.sh" || exit 1
 . "$REPO_DIR/scripts/lib/mss-run.sh" || exit 1
+. "$REPO_DIR/scripts/lib/mss-host.sh" || exit 1
+mss_host_root_guard
 
 # ── Modes (1.4.0). With no flag and no terminal, or with MSS_BACKENDS set, the
 # 1.3.0 flow runs unchanged: environment variables only, backends.env is never
@@ -66,11 +68,16 @@ elif [ "$MSS_MODE" = picker ]; then
         "$([ "$MSS_FLAG" = --configure-only ] && echo 1 || echo 0)"
 fi
 
+# D7 step 2: resolve the legacy choice keys, then validate every choice before
+# anything below changes the system. Nothing has been written yet.
+mss_choices_resolve || exit 1
+mss_choices_validate || exit 1
+
 # Configuration
 USER=${OLLAMA_USER:-$(whoami)}
 BASE_DIR=${OLLAMA_BASE_DIR:-"/Users/$USER/mac-studio-server"}
-# GPU memory percentage (if set, enables GPU optimization)
-GPU_PERCENT=${OLLAMA_GPU_PERCENT:-""}
+# Metal wired-memory limit in percent of RAM (shared by Ollama, llama.cpp, ds4)
+GPU_PERCENT=${MSS_GPU_PERCENT:-""}
 BIND=${OLLAMA_BIND:-0.0.0.0}
 BACKENDS=${MSS_BACKENDS:-ollama}
 LOG_FILE="$BASE_DIR/logs/install.log"
@@ -183,74 +190,18 @@ else
     fi
 fi
 
-# Install GPU memory optimization (if GPU_PERCENT is set)
-if [ -n "$GPU_PERCENT" ]; then
-    log_action "Installing GPU memory optimization (${GPU_PERCENT}%)..."
-    chmod +x "$BASE_DIR/scripts/set-gpu-memory.sh"
+# D7 step 6: install the missing Docker tools (only MSS_DOCKER_INSTALL=yes
+# installs; nothing here runs colima or docker).
+mss_docker_install_apply | tee -a "$LOG_FILE" || exit 1
 
-    # Replace user in GPU memory plist file
-    sed -e "s|<OLLAMA_USER>|$USER|g" -e "s/<GPU_PERCENT>/$GPU_PERCENT/" "$BASE_DIR/config/com.ollama.gpumemory.plist" > "/tmp/com.ollama.gpumemory.plist"
-    sudo cp "/tmp/com.ollama.gpumemory.plist" /Library/LaunchDaemons/
-    rm "/tmp/com.ollama.gpumemory.plist"
+# D7 step 9: the GPU boot job (D4 apply table).
+mss_gpu_apply "$GPU_PERCENT" | tee -a "$LOG_FILE" || exit 1
 
-    sudo chown root:wheel /Library/LaunchDaemons/com.ollama.gpumemory.plist
-    sudo chmod 644 /Library/LaunchDaemons/com.ollama.gpumemory.plist
+# D7 step 10: restart after a power failure (D6).
+mss_power_apply | tee -a "$LOG_FILE" || exit 1
 
-    # Load the GPU memory daemon
-    log_action "Loading GPU memory optimization service..."
-    sudo launchctl unload /Library/LaunchDaemons/com.ollama.gpumemory.plist 2>/dev/null || true
-    sudo launchctl load -w /Library/LaunchDaemons/com.ollama.gpumemory.plist
-    
-    log_action "GPU memory optimization enabled (${GPU_PERCENT}%)"
-else
-    log_action "Skipping GPU memory optimization (set OLLAMA_GPU_PERCENT to enable, e.g. OLLAMA_GPU_PERCENT=80)"
-fi
-
-# Install Docker daemon (if DOCKER_AUTOSTART is set)
-if [ "${DOCKER_AUTOSTART:-false}" = "true" ]; then
-    log_action "Setting up Docker with Colima..."
-    
-    # Check if Homebrew is installed
-    if ! command -v brew &>/dev/null; then
-        log_action "Homebrew is required but not installed. Please install Homebrew first:"
-        log_action "  /bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
-        log_action "Skipping Docker autostart setup"
-    else
-        # Check if Colima is installed, install if not
-        if ! command -v colima &>/dev/null; then
-            log_action "Installing Colima via Homebrew..."
-            brew install colima
-        fi
-        
-        # Check if Docker CLI is installed, install if not
-        if ! command -v docker &>/dev/null; then
-            log_action "Installing Docker CLI via Homebrew..."
-            brew install docker
-        fi
-        
-        # Make Colima script executable
-        chmod +x "$BASE_DIR/scripts/start-colima.sh"
-        
-        log_action "Installing Colima autostart..."
-        
-        # Replace user in Colima plist file
-        sed "s|<OLLAMA_USER>|$USER|g" "$BASE_DIR/config/com.colima.daemon.plist" > "/tmp/com.colima.daemon.plist"
-        sudo cp "/tmp/com.colima.daemon.plist" /Library/LaunchDaemons/
-        rm "/tmp/com.colima.daemon.plist"
-
-        sudo chown root:wheel /Library/LaunchDaemons/com.colima.daemon.plist
-        sudo chmod 644 /Library/LaunchDaemons/com.colima.daemon.plist
-
-        # Load the Colima daemon
-        log_action "Loading Colima autostart service..."
-        sudo launchctl unload /Library/LaunchDaemons/com.colima.daemon.plist 2>/dev/null || true
-        sudo launchctl load -w /Library/LaunchDaemons/com.colima.daemon.plist
-        
-        log_action "Docker autostart with Colima enabled"
-    fi
-else
-    log_action "Skipping Docker autostart (set DOCKER_AUTOSTART=true to enable)"
-fi
+# D7 step 11: the Colima boot job (D5 apply table; never stops a running Colima).
+mss_docker_autostart_apply | tee -a "$LOG_FILE" || exit 1
 
 # Optional backend (llamacpp or ds4), validated above.
 if mss_backend_selected llamacpp || mss_backend_selected ds4; then

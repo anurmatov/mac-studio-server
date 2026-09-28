@@ -16,6 +16,8 @@ REPO_DIR=$(cd "$(dirname "$0")/.." && pwd)
 . "$REPO_DIR/scripts/lib/mss-acquire.sh" || exit 1
 . "$REPO_DIR/scripts/lib/mss-run.sh" || exit 1
 . "$REPO_DIR/scripts/lib/mss-picker.sh" || exit 1
+. "$REPO_DIR/scripts/lib/mss-host.sh" || exit 1
+mss_host_root_guard
 
 mss_model_usage() {
     cat >&2 <<'USAGE'
@@ -51,6 +53,7 @@ if [ -n "$M_PATH" ] || [ -n "$M_URL" ]; then
 fi
 [ -z "$M_DEST" ] || [ -n "$M_CATALOG" ] || [ -n "$M_URL" ] || { echo "model.sh: --dest goes with --catalog or --url" >&2; exit 2; }
 [ "$(id -u)" -ne 0 ] || { echo "model.sh: run it as your user; it calls sudo itself" >&2; exit 1; }
+mss_host_root_guard
 
 MSS_ENV_FILE=${MSS_ENV_FILE:-$REPO_DIR/backends.env}
 if [ ! -e "$MSS_ENV_FILE" ] && [ ! -L "$MSS_ENV_FILE" ]; then
@@ -58,6 +61,13 @@ if [ ! -e "$MSS_ENV_FILE" ] && [ ! -L "$MSS_ENV_FILE" ]; then
     exit 1
 fi
 mss_envfile_load "$MSS_ENV_FILE" || exit 1
+# D4b: resolve the legacy choice keys, check the four formats, and require the
+# GPU boot job the file asks for — all before any download and before the save.
+# model.sh never applies Docker, Homebrew or power settings, so it never probes
+# them.
+mss_choices_resolve || exit 1
+mss_choices_check_format || exit 1
+mss_gpu_job_precheck || exit 1
 mss_validate_selection "$MSS_BACKENDS" || exit 1
 case ",$MSS_BACKENDS," in
     *,llamacpp,*) B=llamacpp ;;
@@ -100,6 +110,9 @@ else
     trap - INT
 fi
 _mss_pick_set MSS_DEFER_MODEL ""
+# D4b: the pre-check ran before the download; run it again so a file is never
+# saved that the boot job contradicts.
+mss_gpu_job_precheck || exit 1
 mss_envfile_write "$MSS_ENV_FILE" || exit 1
 echo "Saved $MSS_ENV_FILE" >&2
 
@@ -109,7 +122,7 @@ mss_sudo_keepalive || exit 1
 {
 USER=${OLLAMA_USER:-$(whoami)}
 BIND=${OLLAMA_BIND:-0.0.0.0}
-GPU_PERCENT=${OLLAMA_GPU_PERCENT:-""}
+GPU_PERCENT=${MSS_GPU_PERCENT:-""}
 BACKENDS=$MSS_BACKENDS
 MSS_PICKER_REPLACE=""
 }

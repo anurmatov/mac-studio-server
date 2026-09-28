@@ -31,9 +31,22 @@ if docker info &>/dev/null; then
     exit 0
 fi
 
-# Start Colima
-log_action "Starting Colima..."
-colima start --cpu 4 --memory 8 --disk 50 --vm-type=vz --mount-type=virtiofs 2>&1 | tee -a "$LOG_FILE"
+# Start Colima. Sizing flags are for a first creation only: Colima applies
+# --cpu/--memory/--disk to an existing stopped VM every time they are passed,
+# so autostart would shrink a larger VM and fail a VM that is not vz (#27 D5).
+# Stock macOS has no jq; `colima list --json` prints one object per instance.
+if colima_out=$(colima list --json 2>/dev/null); then
+    if printf '%s\n' "$colima_out" | grep -Eq '"name"[[:space:]]*:[[:space:]]*"default"'; then
+        log_action "Starting the existing Colima instance (no sizing flags)..."
+        colima start 2>&1 | tee -a "$LOG_FILE"
+    else
+        log_action "Creating the default Colima instance..."
+        colima start --cpu 4 --memory 8 --disk 50 --vm-type=vz --mount-type=virtiofs 2>&1 | tee -a "$LOG_FILE"
+    fi
+else
+    log_action "colima list failed; starting with no flags (resizing is never the fallback)..."
+    colima start 2>&1 | tee -a "$LOG_FILE"
+fi
 
 # Wait for Docker to become available
 log_action "Waiting for Docker daemon to become available..."
