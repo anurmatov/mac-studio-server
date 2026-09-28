@@ -52,7 +52,7 @@ case $_pct in
     *)
         case $_pct in 0|0[0-9]*) echo "set-gpu-memory.sh: '$_pct' must be 1-100 with no leading zero" >&2; exit 2 ;; esac
         [ "$_pct" -le 100 ] || { echo "set-gpu-memory.sh: '$_pct' is above 100" >&2; exit 2; }
-        # ${MSS_SYSCTL:-/usr/sbin/sysctl} so tests/run.sh can stand in for the
+        # ${MSS_SYSCTL:-...} so tests/run.sh can stand in for /usr/sbin/sysctl.
         _total=$(${MSS_SYSCTL:-/usr/sbin/sysctl} -n hw.memsize 2>/dev/null) \
             || { echo "set-gpu-memory.sh: cannot read hw.memsize" >&2; exit 1; }
         # same integer order as mss_wired_limit_mb / install-backends.sh

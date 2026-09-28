@@ -188,6 +188,8 @@ mss_resolve_path() {
 
 # ── wired limit (same integer formula and evaluation order as
 #    scripts/set-gpu-memory.sh) ─────────────────────────────────────────────────
+# mss_wired_limit_mb <percent> [memsize-bytes]: the second argument is the test
+# hook; unset reads sysctl, which only a Mac answers.
 mss_wired_limit_mb() {
     _percent=${1:?percent}
     _total=${2:-$(sysctl -n hw.memsize)}
@@ -493,11 +495,11 @@ mss_envfile_load() {
         _ekey=${_eline%%=*}
         _evalue=${_eline#*=}
         [ -n "$_evalue" ] || continue
-        # The legacy GPU key resolves to MSS_GPU_PERCENT (#27), which is
-        # already exported when the new name is set in the environment.
-        _ealt=$_ekey
-        [ "$_ekey" != OLLAMA_GPU_PERCENT ] || _ealt=MSS_GPU_PERCENT
-        if [ -n "$(printenv "$_ekey")" ] || { [ "$_ealt" != "$_ekey" ] && [ -n "$(printenv "$_ealt")" ]; }; then
+        # A key the environment already carries stays the environment's, except
+        # the legacy GPU key: the resolver must still see it, or a file holding
+        # OLLAMA_GPU_PERCENT is dropped before the D1 conflict row can compare
+        # the two (#27 r2, blocker 4). The resolver, not the loader, decides.
+        if [ -n "$(printenv "$_ekey")" ] && [ "$_ekey" != OLLAMA_GPU_PERCENT ]; then
             MSS_ENVFILE_OVERRIDDEN="$MSS_ENVFILE_OVERRIDDEN $_ekey"
             continue
         fi

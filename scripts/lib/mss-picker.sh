@@ -559,16 +559,21 @@ _mss_pick_gpu_valid() {
 
 _mss_pick_gpu() {
     local r kind rec def
+    # D3 default order: the resolved value first, then the installed job's value,
+    # then system. Ignoring the resolved value would re-ask a value the user has
+    # already set (A8a).
+    def=${MSS_GPU_PERCENT:-}
     r=$(mss_gpu_job_read); kind=${r%%|*}; rec=${r#*|}
-    case $kind in
+    [ -n "$def" ] || case $kind in
         new|legacy|both) [ "$rec" = unreadable ] && def=system || def=$rec ;;
         *) def=system ;;
     esac
     mss_ask "GPU memory for models (Ollama, llama.cpp, ds4): percent of RAM 1-100, or system" \
         "$def" _mss_pick_gpu_valid
-    # system means "no boot job": unset the key, so nothing is written and the
-    # apply step prints the system-default line.
-    if [ "$MSS_ANSWER" = system ]; then unset MSS_GPU_PERCENT; else _mss_pick_set MSS_GPU_PERCENT "$MSS_ANSWER"; fi
+    # `system` is saved as the answer it is. Unsetting the key would save
+    # nothing, the apply step would print "left as is", and an installed job
+    # would survive the run the user just answered "system" in (#27 r2, blocker 5).
+    _mss_pick_set MSS_GPU_PERCENT "$MSS_ANSWER"
 }
 
 # P — restart after a power failure. Skipped (and saved nothing) when this Mac
@@ -589,6 +594,14 @@ _mss_pick_power() {
 # DI — install Colima / the Docker CLI with Homebrew. The picker installs
 # nothing; install.sh does after confirmation (D7 step 6).
 _mss_pick_docker_install() {
+    # A tool the caller can run but the boot job cannot: asking about Docker
+    # would save a yes that step 2 refuses on every later run, so both Docker
+    # keys are dropped and neither question is asked (#27 r2 finding 1).
+    _mss_docker_outside_job_path >/dev/null || {
+        echo "Docker is installed outside the boot job's PATH; Docker questions skipped" >&2
+        unset MSS_DOCKER_INSTALL MSS_DOCKER_AUTOSTART
+        return 1
+    }
     if ! _mss_docker_missing; then
         echo "Colima and the Docker CLI are installed" >&2
         return 0
@@ -611,6 +624,8 @@ _mss_pick_docker_install() {
 # DA — start Colima at every boot. Only shown once both tools are present or
 # DI was answered yes; when skipped, MSS_DOCKER_AUTOSTART stays unset.
 _mss_pick_docker_autostart() {
+    # DI returned 1 because a Docker tool sits outside the boot job's PATH.
+    [ "${1:-}" = skipped ] && return 0
     if _mss_docker_missing && [ "${MSS_DOCKER_INSTALL:-}" != yes ]; then
         return 0
     fi
@@ -627,8 +642,11 @@ _mss_pick_docker_autostart() {
 _mss_pick_host_choices() {
     _mss_pick_gpu
     _mss_pick_power
-    _mss_pick_docker_install
-    _mss_pick_docker_autostart
+    if _mss_pick_docker_install; then
+        _mss_pick_docker_autostart
+    else
+        _mss_pick_docker_autostart skipped
+    fi
 }
 
 # ── summary ────────────────────────────────────────────────────────────────────
@@ -674,15 +692,18 @@ mss_picker_run() {
     local env_sel def num sel b
     mss_pick_trap
 
-    # D1: resolve the legacy choice keys before the first question. A conflict
-    # exits here and saves nothing.
-    mss_choices_resolve || exit 1
-
     # Environment values are the defaults, ahead of the saved file.
     env_sel=$(printenv MSS_BACKENDS)
     if [ -e "$file" ] || [ -L "$file" ]; then
         mss_envfile_load "$file" || exit 1
     fi
+
+    # D1: resolve the legacy choice keys before the first question, but only
+    # after the saved file is loaded. Resolving first would mark the run
+    # resolved, drop the legacy key, and the later resolve in install.sh would
+    # hit its early return — the file's OLLAMA_GPU_PERCENT would then vanish
+    # with no notice, no conflict, and nothing saved (#27 r2).
+    mss_choices_resolve || exit 1
 
     # 1. menu
     def=$(_mss_pick_sel_to_num "$env_sel")

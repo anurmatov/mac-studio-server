@@ -137,8 +137,10 @@ BAD=$(grep -nE 'stat -c|sha256sum|readlink -f|date -d' "$ROOT"/libexec/*.sh "$RO
 BADSHA=$(grep -rnE '(^|[^_])shasum' "$ROOT/scripts" "$ROOT/libexec" "$ROOT/bootstrap.sh" \
     | grep -v '^[^:]*:[0-9]*:[[:space:]]*#' | grep -vF 'mss_shasum256() { LC_ALL=C shasum -a 256 "$@"; }' || true)
 [ -z "$BADSHA" ] && ok "shasum runs only through mss_shasum256 (#21)" || fail "shasum outside mss_shasum256: $BADSHA"
-check "MSS_TEST_SYSROOT is read by exactly four files (#21, #27)" \
-    "scripts/install-backends.sh scripts/lib/mss-host.sh scripts/lib/mss-picker.sh tests/run.sh" \
+# #27 r2 adds install.sh: MSS_INSTALL_SANDBOX prefixes its absolute writes with
+# the sysroot so phase A can run install.sh end to end without touching /Library.
+check "MSS_TEST_SYSROOT is read by exactly five files (#21, #27)" \
+    "scripts/install-backends.sh scripts/install.sh scripts/lib/mss-host.sh scripts/lib/mss-picker.sh tests/run.sh" \
     "$(cd "$ROOT" && grep -rl --exclude-dir=.git MSS_TEST_SYSROOT . | sed 's|^\./||' | sort | tr '\n' ' ' | sed 's/ $//')"
 # Every PATH= keeps $PATH, so the hash-audit shims stay first (#21). tests/run.sh
 # counts from the phase A header to its summary line. One form is exempt: a
@@ -958,18 +960,43 @@ EFH2="$TMP/h27/out.env"
 ( export MSS_BACKENDS=ds4 MSS_GPU_PERCENT=80; unset OLLAMA_GPU_PERCENT; mss_envfile_write "$EFH2" ) >/dev/null 2>&1
 grep -q '^MSS_GPU_PERCENT=80$' "$EFH2" && ! grep -q OLLAMA_GPU_PERCENT "$EFH2" \
     && ok "mss_envfile_write writes the new key and never the legacy" || fail "write: $(cat "$EFH2" 2>/dev/null)"
-OUT=$( (unset MSS_BACKENDS; export MSS_GPU_PERCENT=85; mss_envfile_load "$EFH" >/dev/null 2>&1
+# The loader no longer swallows the legacy key when the new name is in the
+# environment: the resolver must still see both, or the D1 conflict row can never
+# fire from a file (#27 r2, blocker 4). The environment value stays in force and
+# the resolver is what exits 1.
+OUT=$( (unset MSS_GPU_PERCENT OLLAMA_GPU_PERCENT MSS_ENVFILE_LOADED MSS_CHOICES_RESOLVED; \
+        export MSS_GPU_PERCENT=85; mss_envfile_load "$EFH" >/dev/null 2>&1
         printf '%s|%s|%s' "${MSS_GPU_PERCENT}" "${OLLAMA_GPU_PERCENT:-unset}" "$MSS_ENVFILE_LOADED") 2>/dev/null )
-check "a new key in the environment blocks the legacy file value" "85|unset| MSS_BACKENDS OLLAMA_GPU_PERCENT" "$OUT"
+check "the loader keeps the legacy key but not its value" "85|unset| MSS_BACKENDS OLLAMA_GPU_PERCENT" "$OUT"
+OUT=$( (unset MSS_GPU_PERCENT OLLAMA_GPU_PERCENT MSS_DOCKER_AUTOSTART MSS_DOCKER_INSTALL \
+          MSS_POWER_AUTORESTART DOCKER_AUTOSTART MSS_ENVFILE_LOADED MSS_ENVFILE_OVERRIDDEN MSS_CHOICES_RESOLVED
+        export MSS_BACKENDS=ds4 MSS_GPU_PERCENT=85
+        mss_envfile_load "$EFH" >/dev/null 2>&1 && mss_choices_resolve) 2>&1 )
+printf '%s' "$OUT" | grep -q 'differ; keep one' \
+    && ok "a legacy file key against a new env key is a conflict" || fail "conflict row: $OUT"
 HS1=$(mss_shasum256 "$EFH" | awk '{print $1}')
 ( export MSS_BACKENDS=ds4; mss_envfile_load "$EFH" >/dev/null 2>&1 ) ; HS2=$(mss_shasum256 "$EFH" | awk '{print $1}')
 check "loaded mode never writes the file" "$HS1" "$HS2"
 printf 'MSS_BACKENDS=ollama\nMSS_PMSET=/bin/true\n' > "$TMP/h27/hook.env"; chmod 600 "$TMP/h27/hook.env"
 check_fail "the parser refuses a test-only hook key" mss_envfile_load "$TMP/h27/hook.env"
+# A test hook outside a test sysroot must not redirect a real call: with the
+# sysroot unset, mss-host.sh uses /usr/sbin/sysctl however MSS_SYSCTL is set.
+( unset MSS_TEST_SYSROOT; export MSS_SYSCTL="$ROOT/tests/stubs/sysctl-state"
+  . "$ROOT/scripts/lib/mss-common.sh"; . "$ROOT/scripts/lib/mss-host.sh"
+  _mss_sysctl -n hw.memsize 2>/dev/null ) > "$TMP/h27/hook-off.out" 2>&1
+grep -q 137438953472 "$TMP/h27/hook-off.out" \
+    && fail "a stray MSS_SYSCTL redirected a call with no sysroot" \
+    || ok "a stray MSS_SYSCTL is ignored outside a sysroot"
+( export MSS_TEST_SYSROOT=$TMP/h27 MSS_SYSCTL="$ROOT/tests/stubs/sysctl-state" MSS_STUB_STATE=$TMP/h27
+  . "$ROOT/scripts/lib/mss-common.sh"; . "$ROOT/scripts/lib/mss-host.sh"
+  [ "$(_mss_sysctl -n hw.memsize)" = 137438953472 ] ) \
+    && ok "MSS_SYSCTL still works inside a sysroot" || fail "MSS_SYSCTL ignored inside a sysroot"
 # mss_host_root_guard is a no-op for a non-root run; CI phase A is never root
 # (checked at the top of this file), so a set sysroot must not stop the run.
 MSS_TEST_SYSROOT=$TMP/h27 mss_host_root_guard && ok "mss_host_root_guard passes a non-root run" || fail "mss_host_root_guard blocked a non-root run"
-unset MSS_TEST_SYSROOT
+# Restored, not merely unset: the apply rows below rely on the exported phase A
+# sysroot, and the test hooks in mss-host.sh are honoured only inside it.
+MSS_TEST_SYSROOT=$TMP/sysroot; export MSS_TEST_SYSROOT
 fi
 
 
@@ -1249,8 +1276,217 @@ printf '%s' "$OUT" | grep -q 'cannot read com.mac-studio-server.gpumemory; run s
     && check "precheck: an unreadable plist exits 1" 1 "${OUT##*rc=}" || fail "precheck unreadable: $OUT"
 rm_gpu
 
+echo "== phase A: #27 r2 entry points (install.sh, install-backends.sh, status.sh) =="
+# Every row above exercises a library function through a stub. Findings 1 to 5
+# of round 2 all passed that suite, because nothing ran the scripts that call
+# these functions. These rows run the real entry points: install.sh end to end
+# against a sysroot, and install-backends.sh's render pass.
+mkdir -p "$TMP/h27r" "$TMP/h27r-bin"
+cp "$ROOT/tests/stubs/launchctl-state" "$TMP/h27r-bin/launchctl"
+cp "$ROOT/tests/stubs/sysctl-state" "$TMP/h27r-bin/sysctl"
+cp "$ROOT/tests/stubs/plutil" "$TMP/h27r-bin/plutil"
+cp "$ROOT/tests/stubs/stat-bsd" "$TMP/h27r-bin/stat"
+cp "$ROOT/tests/stubs/sudo-fail" "$TMP/h27r-bin/sudo-fail"
+chmod +x "$TMP/h27r-bin/"*
+HR_STATE=$TMP/h27r/state
+mkdir -p "$HR_STATE" "$TMP/h27r/sysroot/Library/LaunchDaemons"
+HSD_R="$TMP/h27r/sysroot/Library/LaunchDaemons"
 
-echo "== phase A: docs (R1, R2, S2, S3) =="
+# install_case <log> [env=...]: run install.sh in env mode against a sysroot,
+# with the phase A stubs first on PATH. Ollama is not selected, so the install
+# reaches the D7 apply steps without touching the real service.
+install_case() {
+    _log=$1; shift
+    : > "$_log"; : > "$HR_STATE/calls.log"
+    ( export MSS_TEST_SYSROOT=$TMP/h27r/sysroot MSS_STUB_STATE=$HR_STATE \
+          MSS_LAUNCHD_TIMEOUT=1 MSS_SUDO=$TMP/nosudo/sudo \
+          MSS_SYSCTL="$TMP/h27r-bin/sysctl" PATH="$TMP/h27r-bin:$PATH" \
+          OLLAMA_BASE_DIR="$TMP/h27r/base" HOME="$TMP/h27r/home" \
+          MSS_INSTALL_SANDBOX=1
+      mkdir -p "$TMP/h27r/home"
+      while [ "$#" -gt 0 ]; do export "${1?}"; shift; done
+      sh "$ROOT/scripts/install.sh" ) >"$_log" 2>&1
+    echo "rc=$?" >> "$_log"
+}
+
+# E1: a failing privileged apply step must stop install.sh. Before the fix the
+# step was piped into `tee`, so `|| exit 1` tested tee and the install reported
+# success with the job not installed.
+rm -f "$HSD_R/"*.plist
+install_case "$TMP/h27r/e1.log" MSS_BACKENDS=ollama MSS_GPU_PERCENT=80 \
+    MSS_TUNE_MACOS=no MSS_SUDO=$TMP/h27r-bin/sudo-fail
+RCline=${RCline:=}
+_rc=$(tail -n 1 "$TMP/h27r/e1.log"); _rc=${_rc#rc=}
+check "E1 a failing apply step exits non-zero" 1 "$_rc"
+grep -q 'Installation completed' "$TMP/h27r/e1.log" \
+    && fail "E1 a failed GPU step still reported success" || ok "E1 no 'Installation completed' after a failure"
+grep -q 'mss_gpu_apply failed' "$TMP/h27r/e1.log" \
+    && ok "E1 the failure names the step" || fail "E1 log: $(tail -5 "$TMP/h27r/e1.log")"
+
+# E2: a successful ollama install reaches the report line and installs the job.
+# MSS_INSTALL_SANDBOX redirects the handful of absolute writes in the Ollama
+# service block into the phase A sysroot, so install.sh runs end to end here.
+rm -f "$HSD_R/"*.plist; echo 0 > "$HR_STATE/live"
+install_case "$TMP/h27r/e2.log" MSS_BACKENDS=ollama MSS_GPU_PERCENT=80 \
+    MSS_TUNE_MACOS=no
+check "E2 an ollama install exits 0" "rc=0" "$(tail -n 1 "$TMP/h27r/e2.log")"
+[ -f "$HSD_R/com.mac-studio-server.gpumemory.plist" ] \
+    && ok "E2 the GPU job is installed" || fail "E2 no GPU plist: $(cat "$TMP/h27r/e2.log")"
+grep -q 'GPU memory: 80% (104857 MB), applied' "$TMP/h27r/e2.log" \
+    && ok "E2 the D8 line is reported" || fail "E2 log: $(grep -i 'gpu memory' "$TMP/h27r/e2.log")"
+grep -q 'Installation completed' "$TMP/h27r/e2.log" && ok "E2 the install completes" || fail "E2 no completion"
+
+# E3: the plist is rendered outside the daemon dir, then moved in. Creating the
+# temp file inside /Library/LaunchDaemons fails for the unprivileged user that
+# runs install.sh on a real Mac.
+grep -q 'cannot create a temporary plist' "$TMP/h27r/e2.log" \
+    && fail "E3 rendered inside the daemon dir" || ok "E3 no in-dir temp file needed"
+check "E3 the daemon dir holds no leftover temp file" 0 "$(ls "$HSD_R" | grep -c '\.tmp\|^\.' || true)"
+
+# E4: `system` with an optional backend selected must not reach mss_validate_uint.
+# install-backends.sh validates a percent; system means no wired limit.
+# MSS_HW_MEMSIZE plus the BSD-stat stub make the render pass runnable here.
+e4_render() { # e4_render <dir> <percent>: render with the BSD-stat stub first on
+# PATH and a fixed RAM size, so the wired-limit branch runs on a Linux runner.
+# The assignment is scoped to the command, so nothing has to be restored.
+    mkdir -p "$TMP/h27r/bin-bsd"; cp "$ROOT/tests/stubs/stat-bsd" "$TMP/h27r/bin-bsd/stat"
+    chmod +x "$TMP/h27r/bin-bsd/stat"
+    PATH="$TMP/h27r/bin-bsd:$PATH" MSS_HW_MEMSIZE=137438953472 \
+        render ollama,llamacpp "$1" MSS_GPU_PERCENT="$2"
+}
+if e4_render "$TMP/h27r/e4" system >/dev/null 2>&1; then
+    ok "E4 system with an optional backend renders"
+else
+    fail "E4 system with an optional backend: $(e4_render "$TMP/h27r/e4b" system 2>&1 | tail -2)"
+fi
+grep -q 'MSS_WIRED_LIMIT_MB' "$TMP/h27r/e4/backends.conf" \
+    && fail "E4 system wrote a wired limit" || ok "E4 system writes no MSS_WIRED_LIMIT_MB"
+# A number still produces the limit, so the case above did not just skip the branch.
+if e4_render "$TMP/h27r/e4n" 80 >/dev/null 2>&1; then
+    grep -q '^MSS_WIRED_LIMIT_MB=104857$' "$TMP/h27r/e4n/backends.conf" \
+        && ok "E4 a number still writes the wired limit" \
+        || fail "E4 80 wrote: $(grep MSS_WIRED_LIMIT_MB "$TMP/h27r/e4n/backends.conf")"
+else
+    fail "E4 render with 80: $(e4_render "$TMP/h27r/e4nb" 80 2>&1 | tail -2)"
+fi
+
+# E5: the guard and the exemption are both still in the file, and `system` never
+# reaches them. A full --check-only pass needs a rendered conf, which is what
+# the rows at #12/#15 already cover; here the point is that system is excluded
+# before the guard, not that the guard is gone.
+grep -q 'MSS_GPU_PERCENT:-}" != system' "$ROOT/scripts/install-backends.sh" \
+    && ok "E5 system is excluded before the wired-limit branch" \
+    || fail "E5 the exclusion is missing"
+grep -q 'com.mac-studio-server.gpumemory is not installed; run scripts/install.sh' "$ROOT/scripts/install-backends.sh" \
+    && ok "E5 the missing-plist guard is still there" || fail "E5 the guard was dropped"
+
+# E6: the picker path resolves after loading backends.env, so a legacy file key
+# migrates with its notice and a conflicting environment value is a conflict.
+if [ "$(id -u)" -ne 0 ]; then
+    # mss_envfile_check_file reads the owner and mode with BSD `stat -f`.
+    mkdir -p "$TMP/h27r/bin-bsd"
+    cp "$ROOT/tests/stubs/stat-bsd" "$TMP/h27r/bin-bsd/stat"; chmod +x "$TMP/h27r/bin-bsd/stat"
+    PKG="$TMP/h27r/pkgen"; mkdir -p "$PKG"
+    printf 'MSS_BACKENDS=ollama\nOLLAMA_GPU_PERCENT=80\n' > "$PKG/legacy.env"; chmod 600 "$PKG/legacy.env"
+    ( unset MSS_GPU_PERCENT OLLAMA_GPU_PERCENT MSS_CHOICES_RESOLVED MSS_ENVFILE_LOADED
+      export HOME="$TMP/h27r/home" MSS_ENV_FILE="$PKG/legacy.env" PATH="$TMP/h27r/bin-bsd:$PATH"
+      . "$ROOT/scripts/lib/mss-common.sh"; . "$ROOT/scripts/lib/mss-acquire.sh"
+      . "$ROOT/scripts/lib/mss-run.sh"; . "$ROOT/scripts/lib/mss-host.sh"
+      . "$ROOT/scripts/lib/mss-picker.sh"
+      mss_envfile_load "$PKG/legacy.env" && mss_choices_resolve ) > "$PKG/legacy.out" 2>&1
+    grep -q 'OLLAMA_GPU_PERCENT is deprecated; using it as MSS_GPU_PERCENT=80. Rename it in backends.env' "$PKG/legacy.out" \
+        && ok "E6 a legacy key in the file migrates with its notice" || fail "E6: $(cat "$PKG/legacy.out")"
+    ( unset MSS_GPU_PERCENT OLLAMA_GPU_PERCENT MSS_DOCKER_AUTOSTART MSS_DOCKER_INSTALL \
+          MSS_POWER_AUTORESTART DOCKER_AUTOSTART MSS_ENVFILE_LOADED MSS_ENVFILE_OVERRIDDEN
+      export MSS_GPU_PERCENT=85 PATH="$TMP/h27r/bin-bsd:$PATH"
+      MSS_CHOICES_RESOLVED=''
+      export MSS_CHOICES_RESOLVED
+      . "$ROOT/scripts/lib/mss-common.sh"; . "$ROOT/scripts/lib/mss-acquire.sh"
+      . "$ROOT/scripts/lib/mss-run.sh"; . "$ROOT/scripts/lib/mss-host.sh"
+      . "$ROOT/scripts/lib/mss-picker.sh"
+      mss_envfile_load "$PKG/legacy.env" && mss_choices_resolve ) > "$PKG/conf.out" 2>&1
+    grep -q 'differ; keep one' "$PKG/conf.out" \
+        && ok "E6 a file legacy key against a new env key is a conflict" || fail "E6 conflict: $(cat "$PKG/conf.out")"
+    # A file holding both keys is a conflict too: the loader reads both, the
+    # resolver compares them.
+    printf 'MSS_BACKENDS=ollama\nOLLAMA_GPU_PERCENT=80\nMSS_GPU_PERCENT=85\n' > "$PKG/both.env"; chmod 600 "$PKG/both.env"
+    ( unset MSS_GPU_PERCENT OLLAMA_GPU_PERCENT MSS_CHOICES_RESOLVED MSS_ENVFILE_LOADED
+      export PATH="$TMP/h27r/bin-bsd:$PATH"
+      . "$ROOT/scripts/lib/mss-common.sh"; . "$ROOT/scripts/lib/mss-acquire.sh"
+      . "$ROOT/scripts/lib/mss-run.sh"; . "$ROOT/scripts/lib/mss-host.sh"
+      mss_envfile_load "$PKG/both.env" && mss_choices_resolve ) > "$PKG/both.out" 2>&1
+    grep -q 'differ; keep one' "$PKG/both.out" \
+        && ok "E6 both keys in one file is a conflict" || fail "E6 both: $(cat "$PKG/both.out")"
+else
+    echo "skip - E6 needs a non-root user (the loader refuses a file it does not own)"
+fi
+
+# E6b: answering `system` in question G saves the word `system`, so the writer
+# persists it and the apply step removes the installed job. Unsetting the key
+# would leave the job in place after the user asked for the system default.
+grep -q 'system. is saved as the answer it is' "$ROOT/scripts/lib/mss-picker.sh" \
+    && ok "E6b the picker saves system rather than unsetting it" \
+    || fail "E6b: $(grep -n 'MSS_ANSWER" = system' "$ROOT/scripts/lib/mss-picker.sh")"
+grep -q 'GPU memory: system default from the next boot' "$ROOT/scripts/lib/mss-host.sh" \
+    && ok "E6b the apply step has a system row" || fail "E6b: no system row"
+
+# E7: status.sh reads the sysroot, and a legacy job alone is still healthy.
+# MSS_CONF points at a conf selecting ollama only, so the backend health probes
+# (which need a running service) are the only rows the stubs cannot answer.
+rm -f "$HSD_R/"*.plist; echo 0 > "$HR_STATE/live"
+mkdir -p "$TMP/h27r/conf"
+printf 'MSS_BACKENDS=ollama\n' > "$TMP/h27r/conf/ollama.conf"
+status_case() {
+    ( export MSS_TEST_SYSROOT=$TMP/h27r/sysroot MSS_STUB_STATE=$HR_STATE \
+          MSS_SYSCTL="$TMP/h27r-bin/sysctl" PATH="$TMP/h27r-bin:$PATH" \
+          MSS_CONF="$TMP/h27r/conf/ollama.conf"
+      sh "$ROOT/scripts/status.sh" ) 2>&1
+    echo "rc=$?"
+}
+rm_gpu_r() { rm -f "$HSD_R/com.mac-studio-server.gpumemory.plist" "$HSD_R/com.ollama.gpumemory.plist" "$HR_STATE"/loaded-com.*gpumemory; }
+rm_gpu_r
+OUT=$(status_case)
+printf '%s' "$OUT" | grep -q 'system default' && ok "E7 no job prints system default" || fail "E7: $OUT"
+rm_gpu_r
+cat > "$HSD_R/com.ollama.gpumemory.plist" <<'LP'
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+    <key>Label</key><string>com.ollama.gpumemory</string>
+    <key>EnvironmentVariables</key><dict>
+        <key>OLLAMA_GPU_PERCENT</key><string>80</string>
+    </dict>
+</dict></plist>
+LP
+printf 'loaded-com.ollama.gpumemory\n' > "$HR_STATE/loaded-com.ollama.gpumemory"
+OUT=$(status_case)
+printf '%s' "$OUT" | grep -q 'user-editable script as root' \
+    && ok "E7 a legacy job alone prints the migrate note" || fail "E7 note: $OUT"
+# "healthy" here means the gpu memory row itself, not the process exit code: the
+# ollama service probe in the same run cannot pass on a test runner.
+printf '%s' "$OUT" | grep -A1 'gpu memory' | grep -q 'via com.ollama.gpumemory' \
+    && ok "E7 the legacy job is reported healthy, not unhealthy" || fail "E7 gpu row: $OUT"
+# Both labels at once is the one GPU state that must fail the run.
+seed_legacy_r() {
+    cat > "$HSD_R/com.ollama.gpumemory.plist" <<'LPL'
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>Label</key><string>com.ollama.gpumemory</string>
+<key>EnvironmentVariables</key><dict><key>OLLAMA_GPU_PERCENT</key><string>80</string></dict>
+</dict></plist>
+LPL
+    printf 'loaded-com.ollama.gpumemory\n' > "$HR_STATE/loaded-com.ollama.gpumemory"
+}
+rm_gpu_r; seed_legacy_r
+mss_gpu_render 80 104857 > "$HSD_R/com.mac-studio-server.gpumemory.plist"
+printf 'loaded-com.mac-studio-server.gpumemory\n' > "$HR_STATE/loaded-com.mac-studio-server.gpumemory"
+OUT=$(status_case)
+printf '%s' "$OUT" | grep -q 'both GPU boot jobs installed' \
+    && ok "E7 two GPU labels are reported" || fail "E7 both: $OUT"
+rm_gpu_r
+
+rm_gpu_r
+
+
+echo "== phase A: docs (R1, R2, S2, S3) "==
 R1=$(awk '/^# /{s="title"} /^## /{s=$0} NF{c[s]++} END{for (k in c) print k"|"c[k]}' "$ROOT/README.md")
 cap() { printf '%s\n' "$R1" | awk -F'|' -v k="$1" '$1==k{print $2}'; }
 check "README sections in order (R1)" \

@@ -1,0 +1,40 @@
+#!/bin/sh
+# stat stub (#27): translate the BSD `stat -f` formats this suite uses into their
+# GNU stat(1) equivalents, so the picker rows that read a saved backends.env can
+# run on a Linux runner at all. mss_envfile_check_file calls `stat -f '%u'` and
+# `stat -f '%Lp'`; GNU stat reads -f as --file-system, so on Linux it prints a
+# filesystem report and exits 1, and every row that hands install.sh a saved
+# backends.env dies before its first prompt.
+#
+# Only a format built entirely from the fields listed below is translated;
+# anything else goes to the real stat unchanged, so an unsupported request fails
+# loudly instead of returning a plausible wrong value.
+#   %u uid  %g gid  %i inode  %z size  %Y mtime  %N name   (same in GNU)
+#   %Lp octal mode -> %a      %p st_mode -> %f     %c birth -> %W
+# %d (device) and %m (mtime) have no BSD-equivalent GNU field — GNU %Y prints a
+# date, not an epoch — so a format using them is refused rather than answered
+# with a value that means something else. B1 needs `%i %m` and runs on macOS
+# only, where the real stat answers it.
+_fmt=''
+_args=''
+_bsd=0
+while [ $# -gt 0 ]; do
+    case $1 in
+        -f) _bsd=1; _fmt=$2; shift 2 ;;
+        -*) _args="$_args $1"; shift ;;
+        *) _args="$_args $1"; shift ;;
+    esac
+done
+[ "$_bsd" = 1 ] || exec /usr/bin/stat $_args
+
+# _bad_field FMT: 0 when FMT holds a % field this stub cannot express. The
+# three-argument form of %Lp is stripped before %L, or %L would leave a bare p
+# behind and a plain %p format would be refused as unsupported.
+_bad_field() {
+    _f=$1
+    _f=$(printf '%s' "$_f" | sed -e 's/%Lp//g' -e 's/%[cizYNdmpgu]//g')
+    case $_f in *'%'*) return 0 ;; *) return 1 ;; esac
+}
+_bad_field "$_fmt" && exec /usr/bin/stat -f "$_fmt" $_args
+_t=$(printf '%s' "$_fmt" | sed -e 's/%Lp/%a/g' -e 's/%p/%f/g' -e 's/%c/%W/g')
+exec /usr/bin/stat -c "$_t" $_args

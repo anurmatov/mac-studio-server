@@ -39,11 +39,23 @@ _mss_root() {
 }
 
 # The system binaries are named by absolute path so a hostile PATH cannot
-# replace them, and ${MSS_*} overrides sit before the defaults so a test can
-# name a stub. The expansion happens before _mss_root sees the command, so a
-# stub stays a stub even when it goes through the sudo shim.
-_mss_sysctl() { ${MSS_SYSCTL:-/usr/sbin/sysctl} "$@"; }
-_mss_pmset() { ${MSS_PMSET:-/usr/bin/pmset} "$@"; }
+# replace them, and a test hook is honoured only inside a test sysroot. The
+# lookup happens before _mss_root sees the command, so a stub stays a stub
+# through the sudo shim.
+# _mss_bin_hook: a test hook exported in the environment is honoured only inside
+# a test sysroot. Outside one every call uses the absolute system binary, so a
+# stray or inherited MSS_SYSCTL / MSS_PMSET can never redirect a privileged call
+# on a real Mac (#27 r2, security).
+#   _mss_bin_hook MSS_SYSCTL /usr/sbin/sysctl   -> sets $_mss_bin
+_mss_bin_hook() {
+    _mss_bin=${2:-}
+    [ -n "${MSS_TEST_SYSROOT:-}" ] || return 0
+    _mss_hooked=$(printenv "${1:-}" 2>/dev/null) || return 0
+    [ -n "$_mss_hooked" ] || return 0
+    _mss_bin=$_mss_hooked
+}
+_mss_sysctl() { _mss_bin_hook MSS_SYSCTL /usr/sbin/sysctl; "$_mss_bin" "$@"; }
+_mss_pmset() { _mss_bin_hook MSS_PMSET /usr/bin/pmset; "$_mss_bin" "$@"; }
 
 # ── D1 resolver: legacy keys in, new keys out, before any question or change ──
 _mss_choice_source() {
@@ -134,19 +146,32 @@ mss_choices_check_format() {
 _mss_job_tool() { ( PATH="$MSS_DOCKER_JOB_PATH"; export PATH; command -v "$1" 2>/dev/null ); }
 _mss_docker_missing() { [ -n "$(_mss_job_tool colima)" ] && [ -n "$(_mss_job_tool docker)" ] && return 1; return 0; }
 
+# _mss_docker_outside_job_path [tool...]: a tool the caller can run but the boot
+# job cannot. Empty output means every Docker choice on this Mac is appliable.
+# The picker and the validator both need this: a tool outside the job PATH makes
+# a saved MSS_DOCKER_INSTALL=yes or MSS_DOCKER_AUTOSTART=yes something step 2
+# refuses on every later run, so the picker must not ask about Docker at all
+# (#27 r2 finding 1).
+_mss_docker_outside_job_path() {
+    _ot_list=${*:-colima docker}
+    for _ot in $_ot_list; do
+        [ -n "$(_mss_job_tool "$_ot")" ] && continue
+        _ot_here=$(command -v "$_ot" 2>/dev/null) || continue
+        [ -z "$_ot_here" ] || { printf '%s %s\n' "$_ot" "$_ot_here"; return 0; }
+    done
+    return 1
+}
+
 # mss_choices_validate: the full D1 validation (install.sh, before any change).
 mss_choices_validate() {
     mss_choices_check_format || return 1
     _di=${MSS_DOCKER_INSTALL:-}; _da=${MSS_DOCKER_AUTOSTART:-}
     if [ "$_di" = yes ] || [ "$_da" = yes ]; then
-        for _t in colima docker; do
-            _job=$(_mss_job_tool "$_t")
-            _here=$(command -v "$_t" 2>/dev/null)
-            [ -n "$_job" ] || [ -z "$_here" ] || {
-                mss_error "$_t is at $_here, outside the boot job's PATH; move or link it into /opt/homebrew/bin or /usr/local/bin"
-                return 1
-            }
-        done
+        _bad=$(_mss_docker_outside_job_path) || _bad=''
+        [ -z "$_bad" ] || {
+            mss_error "${_bad% *} is at ${_bad#* }, outside the boot job's PATH; move or link it into /opt/homebrew/bin or /usr/local/bin"
+            return 1
+        }
     fi
     if [ "$_di" = yes ] && _mss_docker_missing; then
         [ "$(id -u)" -ne 0 ] \
@@ -288,12 +313,29 @@ _mss_gpu_remove_label() {
 }
 
 # _mss_install_plist <rendered-tmp> <dest>: root:wheel 0644, moved into place.
-# Where the group has no "wheel" (a Linux test box), any successful chown keeps
-# the file root-owned; the mode is what matters.
+# Ownership is best-effort and mode is authoritative: `chown root:wheel` has no
+# target group on a Linux runner, and a non-root phase A pass cannot hand a file
+# to root at all, so a hard failure here would make the step untestable rather
+# than unsafe. The mode is what launchd reads, and it is enforced unconditionally.
 _mss_install_plist() {
     _mss_root chown root:wheel "$1" 2>/dev/null || _mss_root chown root "$1" 2>/dev/null || true
     _mss_root chmod 644 "$1" && _mss_root mv -f "$1" "$2"
 }
+
+# _mss_render_tmp <name>: where to render a plist before installing it. Never
+# inside the daemon dir: install.sh runs as the user and /Library/LaunchDaemons
+# is root:wheel 0755, so an unprivileged create there fails on every real
+# install (#27 r2). mktemp -d is mode 0700, so the rendered job is readable only
+# by this user until the privileged move makes it root:wheel 0644.
+_mss_render_tmp() {
+    _rt_dir=$(mktemp -d "${TMPDIR:-/tmp}/mss-plist.XXXXXX") \
+        || { mss_error "cannot create a temporary directory for $1"; return 1; }
+    printf '%s/%s\n' "$_rt_dir" "$1"
+}
+
+# _mss_install_plist_dir <rendered-tmp-dir>: remove the directory made by
+# _mss_render_tmp once its file has been moved out.
+_mss_install_plist_dir() { [ -d "$1" ] && rmdir "$1" 2>/dev/null; return 0; }
 
 # _mss_gpu_last_exit_code: the boot job's last exit code as launchd reports it,
 # or empty when the job is not loaded or says nothing. mss_gpu_verify puts it in
@@ -317,7 +359,8 @@ _mss_gpu_run_once() {
 # _mss_sysctl_write <mb>: the single place this file changes the wired limit, so
 # a test that logs sysctl argv can prove whether apply wrote or not.
 _mss_sysctl_write() {
-    _mss_root "${MSS_SYSCTL:-/usr/sbin/sysctl}" iogpu.wired_limit_mb="$1" >/dev/null 2>&1
+    _mss_bin_hook MSS_SYSCTL /usr/sbin/sysctl
+    _mss_root "$_mss_bin" iogpu.wired_limit_mb="$1" >/dev/null 2>&1
 }
 
 # mss_gpu_verify: poll the live limit until it equals MB (D4). On a timeout the
@@ -368,28 +411,28 @@ mss_gpu_apply() {
     # bootstrap row: legacy first, then write, boot out a loaded new job, enable,
     # bootstrap, verify. A crash between the removals leaves no job, never two.
     _mss_gpu_remove_label "$MSS_GPU_LABEL_LEGACY" "$(mss_gpu_plist_legacy)" || return 1
-    # render inside the daemon dir: root must be able to move it in, and a
-    # phase A sysroot is not world-writable.
-    _tmp="$(mss_daemon_dir)/.$MSS_GPU_LABEL.plist.tmp$$"
-    : > "$_tmp" 2>/dev/null || { mss_error "cannot create a temporary plist in $(mss_daemon_dir)"; return 1; }
-    chmod 600 "$_tmp" 2>/dev/null || true
+    # Render in a private temp dir, then move it in through the privileged path.
+    _tmp=$(_mss_render_tmp "$MSS_GPU_LABEL.plist") || return 1
+    _tmp_dir=${_tmp%/*}
     if ! mss_gpu_render "$_g" "$_mb" > "$_tmp"; then
-        rm -f "$_tmp"; mss_error "cannot render $MSS_GPU_LABEL"; return 1
+        rm -f "$_tmp"; _mss_install_plist_dir "$_tmp_dir"
+        mss_error "cannot render $MSS_GPU_LABEL"; return 1
     fi
     if _mss_gpu_loaded "$MSS_GPU_LABEL"; then
         _mss_root launchctl bootout "system/$MSS_GPU_LABEL" || true
-        mss_launchd_wait_gone "$MSS_GPU_LABEL" "${MSS_LAUNCHD_TIMEOUT:-60}" || { rm -f "$_tmp"; return 1; }
+        mss_launchd_wait_gone "$MSS_GPU_LABEL" "${MSS_LAUNCHD_TIMEOUT:-60}" \
+            || { rm -f "$_tmp"; _mss_install_plist_dir "$_tmp_dir"; return 1; }
     fi
-    _mss_install_plist "$_tmp" "$(mss_gpu_plist_new)" || { rm -f "$_tmp"; return 1; }
+    _mss_install_plist "$_tmp" "$(mss_gpu_plist_new)" \
+        || { rm -f "$_tmp"; _mss_install_plist_dir "$_tmp_dir"; return 1; }
+    _mss_install_plist_dir "$_tmp_dir"
     _mss_root launchctl enable "system/$MSS_GPU_LABEL" || {
         mss_error "launchctl enable failed for $MSS_GPU_LABEL"; return 1; }
     _mss_root launchctl bootstrap system "$(mss_gpu_plist_new)" || {
         mss_error "launchctl bootstrap failed for $MSS_GPU_LABEL"; return 1; }
-    # `launchctl bootstrap` honours RunAtLoad, but apply must not report
-    # "applied" on a race. Run the job's command through the same privileged
-    # path and let the verify loop decide; a job that already ran re-applies the
-    # same value, which is idempotent.
-    _mss_gpu_run_once "$_mb"
+    # Nothing here writes the sysctl: D4 verifies the boot job, so apply must
+    # pass only if the job launchd just started set the value itself. A direct
+    # write here would make verify pass on a job that never ran (#27 r2).
     mss_gpu_verify "$_mb" || return 1
     echo "GPU memory: ${_g}% (${_mb} MB), applied"
 }
@@ -416,9 +459,11 @@ mss_docker_install_apply() {
 
 # _mss_docker_render: the autostart plist as this run would install it. The
 # template and the label do not change (constraint 9).
-# The service user, as the boot job knows it. install.sh sets USER; a sourced
-# context (tests, model.sh) may only carry OLLAMA_USER.
-_mss_docker_user() { printf '%s\n' "${USER:-${OLLAMA_USER:-$(whoami)}}"; }
+# The service user, as the boot job knows it. install.sh derives USER the same
+# way, from OLLAMA_USER first: preferring $USER would render the job with the
+# login user while install.sh applied it with the service user, so the picker
+# summary and the apply step could disagree (#27 r2).
+_mss_docker_user() { printf '%s\n' "${OLLAMA_USER:-${USER:-$(whoami)}}"; }
 _mss_docker_render() { sed "s|<OLLAMA_USER>|$(_mss_docker_user)|g" "$REPO_DIR/config/com.colima.daemon.plist"; }
 
 # _mss_docker_plan: the read-only autostart classification shared with the
@@ -451,17 +496,20 @@ mss_docker_autostart_apply() {
             case $(_mss_docker_plan) in
                 unchanged) echo "Docker at boot: on, unchanged"; return 0 ;;
             esac
-            _tmp="$(mss_daemon_dir)/.$MSS_DOCKER_LABEL.plist.tmp$$"
-            : > "$_tmp" 2>/dev/null || { mss_error "cannot create a temporary plist in $(mss_daemon_dir)"; return 1; }
-            chmod 600 "$_tmp" 2>/dev/null || true
+            _tmp=$(_mss_render_tmp "$MSS_DOCKER_LABEL.plist") || return 1
+            _tmp_dir=${_tmp%/*}
             if ! _mss_docker_render > "$_tmp"; then
-                rm -f "$_tmp"; mss_error "cannot render $MSS_DOCKER_LABEL"; return 1
+                rm -f "$_tmp"; _mss_install_plist_dir "$_tmp_dir"
+                mss_error "cannot render $MSS_DOCKER_LABEL"; return 1
             fi
             if _mss_gpu_loaded "$MSS_DOCKER_LABEL"; then
                 _mss_root launchctl bootout "system/$MSS_DOCKER_LABEL" || true
-                mss_launchd_wait_gone "$MSS_DOCKER_LABEL" "${MSS_LAUNCHD_TIMEOUT:-60}" || { rm -f "$_tmp"; return 1; }
+                mss_launchd_wait_gone "$MSS_DOCKER_LABEL" "${MSS_LAUNCHD_TIMEOUT:-60}" \
+                    || { rm -f "$_tmp"; _mss_install_plist_dir "$_tmp_dir"; return 1; }
             fi
-            _mss_install_plist "$_tmp" "$_f" || { rm -f "$_tmp"; return 1; }
+            _mss_install_plist "$_tmp" "$_f" \
+                || { rm -f "$_tmp"; _mss_install_plist_dir "$_tmp_dir"; return 1; }
+            _mss_install_plist_dir "$_tmp_dir"
             _mss_root launchctl enable "system/$MSS_DOCKER_LABEL" || {
                 mss_error "launchctl enable failed for $MSS_DOCKER_LABEL"; return 1; }
             _mss_root launchctl bootstrap system "$_f" || {
@@ -505,9 +553,10 @@ mss_power_apply() {
         echo "Restart after power failure: $_word, unchanged"
         return 0
     fi
-    # The ${MSS_PMSET:-pmset} expansion happens before sudo runs it, so a stub
-    # named by MSS_PMSET stays a stub (D4c).
-    _mss_root ${MSS_PMSET:-/usr/bin/pmset} -a autorestart "$_want" >/dev/null 2>&1 || {
+    # The lookup happens before sudo runs it, so a stub named by MSS_PMSET stays
+    # a stub (D4c) — inside a test sysroot only.
+    _mss_bin_hook MSS_PMSET /usr/bin/pmset
+    _mss_root "$_mss_bin" -a autorestart "$_want" >/dev/null 2>&1 || {
         mss_error "pmset -a autorestart=$_want failed"; return 1; }
     _rb=$(mss_power_current) || { mss_error "pmset -g no longer prints autorestart"; return 1; }
     [ "$_rb" = "$_want" ] || { mss_error "pmset did not apply autorestart=$_want (reads $_rb)"; return 1; }

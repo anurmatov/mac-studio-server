@@ -389,9 +389,16 @@ MSS_WIRED_LIMIT_MB=""
 if [ -n "${OLLAMA_GPU_PERCENT:-}" ]; then
     mss_die "OLLAMA_GPU_PERCENT is replaced by MSS_GPU_PERCENT; run scripts/install.sh (it migrates backends.env)"
 fi
-if [ -n "${MSS_GPU_PERCENT:-}" ] && [ "$_has_optional" = 1 ]; then
+# `system` is a first-class picker answer (D3 G) meaning "no wired limit", so it
+# takes this branch exactly as an empty value does. Validating it as an integer
+# killed every install with an optional backend selected (#27 r2, blocker 3).
+if [ -n "${MSS_GPU_PERCENT:-}" ] && [ "${MSS_GPU_PERCENT:-}" != system ] && [ "$_has_optional" = 1 ]; then
     mss_validate_uint MSS_GPU_PERCENT "$MSS_GPU_PERCENT" 1 100 || exit 1
-    MSS_WIRED_LIMIT_MB=$(mss_wired_limit_mb "$MSS_GPU_PERCENT")
+    # MSS_HW_MEMSIZE is the same render-only test hook the ds4 session default
+    # uses; only --render-only may honour it, so an install still reads the Mac.
+    _memsize=""
+    if [ -n "$RENDER_ONLY" ]; then _memsize=${MSS_HW_MEMSIZE:-}; fi
+    MSS_WIRED_LIMIT_MB=$(mss_wired_limit_mb "$MSS_GPU_PERCENT" "$_memsize")
     mss_validate_uint "wired limit (from hw.memsize)" "$MSS_WIRED_LIMIT_MB" 1 || exit 1
     # The backend waits for this limit; something must apply it at every boot.
     # scripts/install.sh installs com.mac-studio-server.gpumemory before

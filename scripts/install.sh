@@ -76,6 +76,23 @@ mss_choices_validate || exit 1
 # Configuration
 USER=${OLLAMA_USER:-$(whoami)}
 BASE_DIR=${OLLAMA_BASE_DIR:-"/Users/$USER/mac-studio-server"}
+
+# MSS_INSTALL_SANDBOX: tests/run.sh only. The Ollama service block below writes
+# a handful of absolute paths (/Library/LaunchDaemons, /Users/$USER/.ollama) and
+# calls the real sudo, so phase A cannot run install.sh end to end without them.
+# With the flag every absolute path in this file is prefixed with the phase A
+# sysroot, and the raw `sudo` calls go through the same ${MSS_SUDO:-sudo} shim
+# the apply steps use. Never set outside tests/run.sh; the guard below refuses it
+# for root, exactly as mss_host_root_guard does.
+MSS_SYSROOT_PREFIX=""
+if [ "${MSS_INSTALL_SANDBOX:-}" = 1 ]; then
+    [ "$(id -u)" -ne 0 ] || { echo "install.sh: MSS_INSTALL_SANDBOX is for tests/run.sh only" >&2; exit 1; }
+    [ -n "${MSS_TEST_SYSROOT:-}" ] || { echo "install.sh: MSS_INSTALL_SANDBOX needs MSS_TEST_SYSROOT" >&2; exit 1; }
+    MSS_SYSROOT_PREFIX=$MSS_TEST_SYSROOT
+    sudo() { ${MSS_SUDO:-sudo} "$@"; }
+    mkdir -p "$MSS_SYSROOT_PREFIX/Library/LaunchDaemons" \
+        "$MSS_SYSROOT_PREFIX/Users/$USER/.ollama"
+fi
 # Metal wired-memory limit in percent of RAM (shared by Ollama, llama.cpp, ds4)
 GPU_PERCENT=${MSS_GPU_PERCENT:-""}
 BIND=${OLLAMA_BIND:-0.0.0.0}
@@ -93,6 +110,25 @@ mss_check() {
     mss_rc=$?
     [ "$mss_rc" != 3 ] || mss_sha_mismatch_rename
     return "$mss_rc"
+}
+
+# mss_apply_step <fn> [args...]: run one D7 apply step, echo its report lines
+# to stdout and the log, and exit on its failure. Piping straight into `tee`
+# would test tee's status, not the step's, and a failed step would report
+# success (#27 r2).
+mss_apply_step() {
+    mss_step_out=$(
+        "$@" 2>&1
+        mss_step_rc=$?
+        printf '@@RC@@%s\n' "$mss_step_rc"
+    )
+    mss_step_rc=${mss_step_out##*@@RC@@}
+    printf '%s\n' "${mss_step_out%@@RC@@*}" | tee -a "$LOG_FILE" || exit 1
+    [ "$mss_step_rc" != 0 ] || return 0
+    mss_step_fn=$1
+    shift
+    mss_error "$mss_step_fn failed: $*"
+    exit 1
 }
 
 # Validate before any system change.
@@ -153,21 +189,21 @@ fi
 log_action "Installing Ollama launch daemon..."
 # Replace user, bind address and binary in the plist file
 mss_render_ollama_plist "$BASE_DIR/config/com.ollama.service.plist" "$USER" "$BIND" "$OLLAMA_EXE" > "/tmp/com.ollama.service.plist"
-sudo cp "/tmp/com.ollama.service.plist" /Library/LaunchDaemons/
+sudo cp "/tmp/com.ollama.service.plist" "$MSS_SYSROOT_PREFIX/Library/LaunchDaemons/"
 rm "/tmp/com.ollama.service.plist"
 
-sudo chown root:wheel /Library/LaunchDaemons/com.ollama.service.plist
-sudo chmod 644 /Library/LaunchDaemons/com.ollama.service.plist
+sudo chown root:wheel "$MSS_SYSROOT_PREFIX/Library/LaunchDaemons/com.ollama.service.plist"
+sudo chmod 644 "$MSS_SYSROOT_PREFIX/Library/LaunchDaemons/com.ollama.service.plist"
 
 # Ensure Ollama directory exists with proper permissions
 log_action "Setting up Ollama directory..."
-mkdir -p "/Users/$USER/.ollama"
-chown "$USER:staff" "/Users/$USER/.ollama"
+mkdir -p "$MSS_SYSROOT_PREFIX/Users/$USER/.ollama"
+chown "$USER:staff" "$MSS_SYSROOT_PREFIX/Users/$USER/.ollama"
 
 # Load the launch daemon
 log_action "Loading Ollama service..."
-sudo launchctl unload /Library/LaunchDaemons/com.ollama.service.plist 2>/dev/null || true
-sudo launchctl load -w /Library/LaunchDaemons/com.ollama.service.plist
+sudo launchctl unload "$MSS_SYSROOT_PREFIX/Library/LaunchDaemons/com.ollama.service.plist" 2>/dev/null || true
+sudo launchctl load -w "$MSS_SYSROOT_PREFIX/Library/LaunchDaemons/com.ollama.service.plist"
 
 mss_is_loopback_host "$BIND" || \
     log_action "WARNING: Ollama is LAN-bound on $BIND (OLLAMA_BIND=127.0.0.1 makes it loopback-only)"
@@ -191,17 +227,18 @@ else
 fi
 
 # D7 step 6: install the missing Docker tools (only MSS_DOCKER_INSTALL=yes
-# installs; nothing here runs colima or docker).
-mss_docker_install_apply | tee -a "$LOG_FILE" || exit 1
+# installs; nothing here runs colima or docker). It runs before any launchd or
+# pmset change, so a Homebrew failure leaves the boot jobs untouched (#27 r2).
+mss_apply_step mss_docker_install_apply
 
 # D7 step 9: the GPU boot job (D4 apply table).
-mss_gpu_apply "$GPU_PERCENT" | tee -a "$LOG_FILE" || exit 1
+mss_apply_step mss_gpu_apply "$GPU_PERCENT"
 
 # D7 step 10: restart after a power failure (D6).
-mss_power_apply | tee -a "$LOG_FILE" || exit 1
+mss_apply_step mss_power_apply
 
 # D7 step 11: the Colima boot job (D5 apply table; never stops a running Colima).
-mss_docker_autostart_apply | tee -a "$LOG_FILE" || exit 1
+mss_apply_step mss_docker_autostart_apply
 
 # Optional backend (llamacpp or ds4), validated above.
 if mss_backend_selected llamacpp || mss_backend_selected ds4; then
