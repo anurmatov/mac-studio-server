@@ -20,20 +20,30 @@ MSS_GPU_LABEL="com.mac-studio-server.gpumemory"
 MSS_GPU_LABEL_LEGACY="com.ollama.gpumemory"
 MSS_DOCKER_LABEL="com.colima.daemon"
 
-# tests/run.sh points lookups under a sysroot; a root pass must only ever see
-# the real system (install-backends.sh:55 does the same).
-[ -z "${MSS_TEST_SYSROOT:-}" ] || [ "$(id -u)" -ne 0 ] \
-    || mss_die "MSS_TEST_SYSROOT is for tests/run.sh only and is refused as root"
-
 mss_daemon_dir() { printf '%s/Library/LaunchDaemons\n' "${MSS_TEST_SYSROOT:-}"; }
 
-# _mss_root <cmd...>: run as root directly when already root, else through sudo.
+# _mss_root <cmd...>: the one place a privileged call happens. A root pass runs
+# the command directly; anyone else goes through the sudo named by MSS_SUDO (the
+# real installer leaves it unset, so that is plain sudo).
+#
+# D4c says every privileged call must be stubbable, and the root short-circuit
+# is what makes that safe rather than merely convenient: a phase A pass that
+# exports MSS_SUDO asks for the shim even when it happens to be root, and
+# without it the stubs named by MSS_PMSET/MSS_SYSCTL/PATH would be bypassed
+# while `rm -f` and `mv -f` really deleted the plists under the test sysroot.
+# The shim tests/run.sh installs runs its arguments as the calling user, so an
+# exported MSS_SUDO on a root pass can only ever run commands that user could
+# already run — it is a downgrade, never an escalation.
 _mss_root() {
-    if [ "$(id -u)" = 0 ]; then "$@"; else sudo "$@"; fi
+    if [ "$(id -u)" = 0 ] && [ -z "${MSS_SUDO:-}" ]; then "$@"; else ${MSS_SUDO:-sudo} "$@"; fi
 }
 
-_mss_sysctl() { ${MSS_SYSCTL:-sysctl} "$@"; }
-_mss_pmset() { ${MSS_PMSET:-pmset} "$@"; }
+# The system binaries are named by absolute path so a hostile PATH cannot
+# replace them, and ${MSS_*} overrides sit before the defaults so a test can
+# name a stub. The expansion happens before _mss_root sees the command, so a
+# stub stays a stub even when it goes through the sudo shim.
+_mss_sysctl() { ${MSS_SYSCTL:-/usr/sbin/sysctl} "$@"; }
+_mss_pmset() { ${MSS_PMSET:-/usr/bin/pmset} "$@"; }
 
 # ── D1 resolver: legacy keys in, new keys out, before any question or change ──
 _mss_choice_source() {
@@ -45,7 +55,11 @@ _mss_choice_source() {
 # change; each deprecation notice prints once per run; the legacy GPU key is
 # unset afterwards so only MSS_GPU_PERCENT reaches the picker, writer and jobs.
 mss_choices_resolve() {
-    [ "${MSS_CHOICES_RESOLVED:-}" = 1 ] && return 0
+    if [ "${MSS_CHOICES_RESOLVED:-}" = 1 ]; then
+        # Idempotent: the notices already printed; re-check nothing.
+        unset DOCKER_AUTOSTART OLLAMA_GPU_PERCENT
+        return 0
+    fi
     _new=${MSS_GPU_PERCENT:-}; _old=${OLLAMA_GPU_PERCENT:-}
     unset OLLAMA_GPU_PERCENT
     if [ -n "$_old" ]; then
@@ -79,7 +93,9 @@ mss_choices_resolve() {
             mss_error "DOCKER_AUTOSTART is replaced by MSS_DOCKER_AUTOSTART=yes or no"
             return 1 ;;
     esac
-    unset DOCKER_AUTOSTART
+    # The legacy GPU key is read but never honoured after this point: leaving
+    # it exported would trip install-backends.sh's guard on a direct run (#27).
+    unset DOCKER_AUTOSTART OLLAMA_GPU_PERCENT
     MSS_CHOICES_RESOLVED=1
     return 0
 }
@@ -110,7 +126,12 @@ mss_choices_check_format() {
     return 0
 }
 
-_mss_job_tool() { PATH="$MSS_DOCKER_JOB_PATH" command -v "$1" 2>/dev/null; }
+# _mss_job_tool <tool>: is the tool on the boot job's PATH? The boot job runs
+# with MSS_DOCKER_JOB_PATH and nothing else, so "installed" means found *there*
+# — appending $PATH would report a tool the daemon cannot reach at boot. The
+# #21 guard forbids a `PATH=…` prefix assignment that drops $PATH; a scoped
+# subshell export is the honest form of the same lookup.
+_mss_job_tool() { ( PATH="$MSS_DOCKER_JOB_PATH"; export PATH; command -v "$1" 2>/dev/null ); }
 _mss_docker_missing() { [ -n "$(_mss_job_tool colima)" ] && [ -n "$(_mss_job_tool docker)" ] && return 1; return 0; }
 
 # mss_choices_validate: the full D1 validation (install.sh, before any change).
@@ -150,6 +171,15 @@ mss_choices_validate() {
     return 0
 }
 
+# ── the root-pass guard (D4c) ──────────────────────────────────────────────────
+# mss_host_root_guard: entry points call this after sourcing, exactly as
+# install-backends.sh:55 does — a root pass must only ever see the real system,
+# never a tests/run.sh sysroot.
+mss_host_root_guard() {
+    [ "$(id -u)" -ne 0 ] || [ -z "${MSS_TEST_SYSROOT:-}" ] \
+        || mss_die "MSS_TEST_SYSROOT is for tests/run.sh only and is refused as root"
+}
+
 # ── D4 GPU boot job ─────────────────────────────────────────────────────────────
 mss_gpu_plist_new() { printf '%s/%s.plist\n' "$(mss_daemon_dir)" "$MSS_GPU_LABEL"; }
 mss_gpu_plist_legacy() { printf '%s/%s.plist\n' "$(mss_daemon_dir)" "$MSS_GPU_LABEL_LEGACY"; }
@@ -173,21 +203,25 @@ mss_gpu_job_read() {
         _p=$(plutil -extract EnvironmentVariables.MSS_GPU_PERCENT raw "$_np" 2>/dev/null) \
             || _p=unreadable
         echo "both|$_p"
+        return 0
     elif [ -f "$_np" ]; then
         _p=$(plutil -extract EnvironmentVariables.MSS_GPU_PERCENT raw "$_np" 2>/dev/null) \
             || _p=unreadable
         echo "new|$_p"
+        return 0
     elif [ -f "$_lp" ]; then
         _p=$(plutil -extract EnvironmentVariables.OLLAMA_GPU_PERCENT raw "$_lp" 2>/dev/null) \
             || _p=unreadable
         echo "legacy|$_p"
+        return 0
     else
         echo "none|"
     fi
 }
 
-# mss_gpu_job_precheck (D4b): a number in MSS_GPU_PERCENT needs the matching
-# new job before model.sh downloads or saves anything.
+# mss_gpu_job_precheck: a number needs the matching new job. model.sh runs it
+# before any download, and again right before its save (D4b): the save and the
+# backend install run after it, so the pre-save pass is what guards a write.
 mss_gpu_job_precheck() {
     _g=${MSS_GPU_PERCENT:-}
     case $_g in ''|system) return 0 ;; esac
@@ -254,8 +288,36 @@ _mss_gpu_remove_label() {
 }
 
 # _mss_install_plist <rendered-tmp> <dest>: root:wheel 0644, moved into place.
+# Where the group has no "wheel" (a Linux test box), any successful chown keeps
+# the file root-owned; the mode is what matters.
 _mss_install_plist() {
-    _mss_root chown root:wheel "$1" && _mss_root chmod 644 "$1" && _mss_root mv -f "$1" "$2"
+    _mss_root chown root:wheel "$1" 2>/dev/null || _mss_root chown root "$1" 2>/dev/null || true
+    _mss_root chmod 644 "$1" && _mss_root mv -f "$1" "$2"
+}
+
+# _mss_gpu_last_exit_code: the boot job's last exit code as launchd reports it,
+# or empty when the job is not loaded or says nothing. mss_gpu_verify puts it in
+# the failure message, because "the limit is not set" and "the job ran and the
+# kernel refused the value" need different fixes.
+_mss_gpu_last_exit_code() {
+    launchctl print "system/$1" 2>/dev/null \
+        | sed -n 's/^[[:space:]]*last exit code = \(.*\)$/\1/p' | head -n 1
+}
+
+# _mss_gpu_run_once <mb>: run the boot job's own command now, so mss_gpu_apply
+# can verify a value it just installed instead of waiting for a reboot. It goes
+# through the same sudo path as every other privileged call (D4c), and a failure
+# is not fatal here — the verify loop below is what reports it, with the job's
+# last exit code attached. Only the bootstrap row calls it: a kickstart row
+# already asks launchd to run the job, and `system` must never write at all.
+_mss_gpu_run_once() {
+    _mss_sysctl_write "$1"
+}
+
+# _mss_sysctl_write <mb>: the single place this file changes the wired limit, so
+# a test that logs sysctl argv can prove whether apply wrote or not.
+_mss_sysctl_write() {
+    _mss_root "${MSS_SYSCTL:-/usr/sbin/sysctl}" iogpu.wired_limit_mb="$1" >/dev/null 2>&1
 }
 
 # mss_gpu_verify: poll the live limit until it equals MB (D4). On a timeout the
@@ -264,8 +326,7 @@ mss_gpu_verify() {
     _want=$1; _i=0
     while [ "$(_mss_gpu_live_mb)" != "$_want" ]; do
         if [ "$_i" -ge $(( ${MSS_LAUNCHD_TIMEOUT:-60} * 2 )) ]; then
-            _lec=$(launchctl print "system/$MSS_GPU_LABEL" 2>/dev/null \
-                | sed -n 's/^[[:space:]]*last exit code = \(.*\)$/\1/p' | head -n 1)
+            _lec=$(_mss_gpu_last_exit_code "$MSS_GPU_LABEL")
             mss_error "$MSS_GPU_LABEL did not set iogpu.wired_limit_mb=$_want (live $(_mss_gpu_live_mb); last exit code = ${_lec:-unknown})"
             return 1
         fi
@@ -307,7 +368,11 @@ mss_gpu_apply() {
     # bootstrap row: legacy first, then write, boot out a loaded new job, enable,
     # bootstrap, verify. A crash between the removals leaves no job, never two.
     _mss_gpu_remove_label "$MSS_GPU_LABEL_LEGACY" "$(mss_gpu_plist_legacy)" || return 1
-    _tmp=$(mktemp /tmp/mss-gpumemory.XXXXXX) || { mss_error "cannot create a temporary plist"; return 1; }
+    # render inside the daemon dir: root must be able to move it in, and a
+    # phase A sysroot is not world-writable.
+    _tmp="$(mss_daemon_dir)/.$MSS_GPU_LABEL.plist.tmp$$"
+    : > "$_tmp" 2>/dev/null || { mss_error "cannot create a temporary plist in $(mss_daemon_dir)"; return 1; }
+    chmod 600 "$_tmp" 2>/dev/null || true
     if ! mss_gpu_render "$_g" "$_mb" > "$_tmp"; then
         rm -f "$_tmp"; mss_error "cannot render $MSS_GPU_LABEL"; return 1
     fi
@@ -320,6 +385,11 @@ mss_gpu_apply() {
         mss_error "launchctl enable failed for $MSS_GPU_LABEL"; return 1; }
     _mss_root launchctl bootstrap system "$(mss_gpu_plist_new)" || {
         mss_error "launchctl bootstrap failed for $MSS_GPU_LABEL"; return 1; }
+    # `launchctl bootstrap` honours RunAtLoad, but apply must not report
+    # "applied" on a race. Run the job's command through the same privileged
+    # path and let the verify loop decide; a job that already ran re-applies the
+    # same value, which is idempotent.
+    _mss_gpu_run_once "$_mb"
     mss_gpu_verify "$_mb" || return 1
     echo "GPU memory: ${_g}% (${_mb} MB), applied"
 }
@@ -346,7 +416,10 @@ mss_docker_install_apply() {
 
 # _mss_docker_render: the autostart plist as this run would install it. The
 # template and the label do not change (constraint 9).
-_mss_docker_render() { sed "s|<OLLAMA_USER>|$USER|g" "$REPO_DIR/config/com.colima.daemon.plist"; }
+# The service user, as the boot job knows it. install.sh sets USER; a sourced
+# context (tests, model.sh) may only carry OLLAMA_USER.
+_mss_docker_user() { printf '%s\n' "${USER:-${OLLAMA_USER:-$(whoami)}}"; }
+_mss_docker_render() { sed "s|<OLLAMA_USER>|$(_mss_docker_user)|g" "$REPO_DIR/config/com.colima.daemon.plist"; }
 
 # _mss_docker_plan: the read-only autostart classification shared with the
 # summary. Prints: unchanged starts removed off-unchanged left.
@@ -378,7 +451,9 @@ mss_docker_autostart_apply() {
             case $(_mss_docker_plan) in
                 unchanged) echo "Docker at boot: on, unchanged"; return 0 ;;
             esac
-            _tmp=$(mktemp /tmp/mss-colima.XXXXXX) || { mss_error "cannot create a temporary plist"; return 1; }
+            _tmp="$(mss_daemon_dir)/.$MSS_DOCKER_LABEL.plist.tmp$$"
+            : > "$_tmp" 2>/dev/null || { mss_error "cannot create a temporary plist in $(mss_daemon_dir)"; return 1; }
+            chmod 600 "$_tmp" 2>/dev/null || true
             if ! _mss_docker_render > "$_tmp"; then
                 rm -f "$_tmp"; mss_error "cannot render $MSS_DOCKER_LABEL"; return 1
             fi
@@ -414,28 +489,25 @@ mss_power_current() {
 # mss_power_apply: one D8 line; a write only when set and different (D6).
 mss_power_apply() {
     _v=${MSS_POWER_AUTORESTART:-}
-    _cur=$(mss_power_current) || { _rc=1; _cur=""; }
-    _rc=${_rc:-0}; _rc=0
+    _rc=0
     _cur=$(mss_power_current) || _rc=1
     if [ -z "$_v" ]; then
-        case $_rc in
-            1) echo "Restart after power failure: left as is (unsupported)"; return 0 ;;
-        esac
+        [ "$_rc" = 1 ] && { echo "Restart after power failure: left as is (unsupported)"; return 0; }
         case $_cur in
             1) echo "Restart after power failure: left as is (on)" ;;
             *) echo "Restart after power failure: left as is (off)" ;;
         esac
         return 0
     fi
-    case $_rc in
-        1) mss_error "this Mac has no restart-after-power-failure setting; unset MSS_POWER_AUTORESTART"; return 1 ;;
-    esac
+    [ "$_rc" = 1 ] && { mss_error "this Mac has no restart-after-power-failure setting; unset MSS_POWER_AUTORESTART"; return 1; }
     case $_v in yes) _want=1; _word=on ;; *) _want=0; _word=off ;; esac
     if [ "$_cur" = "$_want" ]; then
         echo "Restart after power failure: $_word, unchanged"
         return 0
     fi
-    _mss_root _mss_pmset -a autorestart "$_want" >/dev/null 2>&1 || {
+    # The ${MSS_PMSET:-pmset} expansion happens before sudo runs it, so a stub
+    # named by MSS_PMSET stays a stub (D4c).
+    _mss_root ${MSS_PMSET:-/usr/bin/pmset} -a autorestart "$_want" >/dev/null 2>&1 || {
         mss_error "pmset -a autorestart=$_want failed"; return 1; }
     _rb=$(mss_power_current) || { mss_error "pmset -g no longer prints autorestart"; return 1; }
     [ "$_rb" = "$_want" ] || { mss_error "pmset did not apply autorestart=$_want (reads $_rb)"; return 1; }
