@@ -22,7 +22,9 @@ Every question has a default; press Enter to take it. Installs and downloads hap
 5. A model: the starter (the default, downloaded right away), another one, your own file or URL, or later.
 6. LAN access for llama.cpp or ds4 (default no; yes asks for an address and allowed clients).
 7. Headless macOS tweaks: no sleep, Spotlight, Time Machine or auto-updates (default no).
-8. A summary to confirm, then an Ollama starter model once the service is up.
+8. GPU memory percent for every backend (1-100 or system), restart after a power failure
+   (default off), installing Colima and the Docker CLI, and starting Colima at boot.
+9. A summary to confirm, then an Ollama starter model once the service is up.
 
 ## After install
 
@@ -41,9 +43,10 @@ Ollama listens on all interfaces (0.0.0.0) by default and has no password; set O
 
 - **LAN access for llama.cpp or ds4:** answer yes in the installer. A macOS firewall (pf) allowlist
   guards the port; llama.cpp can use an API key file instead. See [docs/backends.md](docs/backends.md).
-- **GPU memory:** set `OLLAMA_GPU_PERCENT=80` in `backends.env` to let Metal use 80% of RAM.
-  See [docs/options.md](docs/options.md).
-- **Docker via Colima:** `DOCKER_AUTOSTART=true ./scripts/install.sh` starts Colima at boot.
+- **GPU memory:** set `MSS_GPU_PERCENT=80` in `backends.env` to let Metal use 80% of RAM
+  for every backend. See [docs/options.md](docs/options.md).
+- **Docker via Colima:** `MSS_DOCKER_AUTOSTART=yes ./scripts/install.sh` starts Colima at
+  boot; `MSS_DOCKER_INSTALL=yes` installs what is missing. Power loss? `MSS_POWER_AUTORESTART=yes`.
   See [docs/options.md](docs/options.md).
 - **Saved answers:** `backends.env` in the repository holds them, one `KEY=value` per line;
   [config/backends.env.example](config/backends.env.example) lists every key.

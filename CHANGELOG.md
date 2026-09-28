@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- GPU memory percent, Docker install, Docker at boot and restart after a power failure are now asked, saved and reported by the installer
+- A GPU boot job that no longer runs a user-editable script as root at every boot
+- The status report covers the GPU limit, the power setting and the Docker boot job
+
+### Changed
+- The GPU limit is set by the system tool directly, so it survives removing an optional backend
+- Autostarted Colima starts an existing VM without resizing it, and reloads only when its job changed
+- Changing the GPU limit by hand takes the value as an argument and never defaults silently
+
+### Deprecated
+- The GPU percent key is now backend-neutral (it was named after one backend); the old name is still read and migrated on the next save
+- Docker autostart splits into "install what is missing" and "start at boot"; the old switch still works
+
 ### Fixed
 - Model hashing works in SSH sessions that set an unsupported locale such as C.UTF-8
 - Re-installing while a backend is running no longer fails with 'Bootstrap failed: 5'

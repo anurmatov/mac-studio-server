@@ -28,20 +28,51 @@ The log is `logs/optimization.log`.
 
 ## GPU memory
 
-Metal uses about 75% of RAM by default. `OLLAMA_GPU_PERCENT` installs a boot job that raises
-the limit, and llama.cpp or ds4 wait for it at start:
+Metal uses about 75% of RAM by default. `MSS_GPU_PERCENT` (1-100, or `system`) installs a
+boot job that raises the limit for every backend together; llama.cpp or ds4 wait for it:
 
 ```bash
-echo 'OLLAMA_GPU_PERCENT=80' >> backends.env && ./scripts/install.sh
-OLLAMA_GPU_PERCENT=85 sudo ./scripts/set-gpu-memory.sh    # change it now, until reboot
+echo 'MSS_GPU_PERCENT=80' >> backends.env && ./scripts/install.sh
+sudo ./scripts/set-gpu-memory.sh 85          # change it now, until reboot
 ```
+
+`sudo` resets the environment, so pass the value as an argument. `system` removes the boot
+job; the macOS default applies at the next boot (`sudo sysctl iogpu.wired_limit_mb=0` for
+now). Unset leaves an installed job as it is.
 
 ## Docker via Colima
 
 ```bash
-DOCKER_AUTOSTART=true ./scripts/install.sh    # installs Colima and the Docker CLI with Homebrew
-colima status                                 # log: logs/docker.log
+MSS_DOCKER_INSTALL=yes ./scripts/install.sh      # brew install colima docker (only missing ones)
+MSS_DOCKER_AUTOSTART=yes ./scripts/install.sh    # start Colima at every boot
+colima status                                    # log: logs/docker.log
 ```
+
+The installer never starts, stops or resizes a Colima VM; autostart re-runs
+`scripts/start-colima.sh`, which leaves an existing VM's size alone. `no` removes the boot
+job and never stops a running Colima.
+
+## Restart after a power failure
+
+```bash
+echo 'MSS_POWER_AUTORESTART=yes' >> backends.env && ./scripts/install.sh
+```
+
+Sets `pmset autorestart`. Unset leaves the power setting as it is.
+
+## Upgrading from `OLLAMA_GPU_PERCENT` / `DOCKER_AUTOSTART`
+
+Both old names still work: the installer prints a deprecation notice and migrates the value
+to `MSS_GPU_PERCENT` in `backends.env` on the next save. A legacy `OLLAMA_GPU_PERCENT=80`
+and a differing `MSS_GPU_PERCENT` together stop the run before anything changes. Until you
+re-run the installer, the old `com.ollama.gpumemory` job keeps working after a `git pull`.
+
+## Downgrading
+
+A machine that migrated to `com.mac-studio-server.gpumemory` must run
+`sudo launchctl bootout system/com.mac-studio-server.gpumemory` and
+`sudo rm /Library/LaunchDaemons/com.mac-studio-server.gpumemory.plist` before going back to
+v1.5.0, or both GPU jobs run at boot. `scripts/status.sh` flags two labels.
 
 ## Changing Ollama settings
 
