@@ -68,7 +68,7 @@ if ! mss_is_loopback_host "$HOST" && { [ "$PF_RULE_COUNT" != 0 ] || [ -z "$API_K
     done
 fi
 
-# 6. Wired limit applied (boot race with com.ollama.gpumemory).
+# 6. Wired limit applied (boot race with com.mac-studio-server.gpumemory).
 if [ -n "$WIRED_LIMIT" ]; then
     _waited=0
     while :; do
