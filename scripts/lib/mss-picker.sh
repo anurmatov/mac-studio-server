@@ -597,11 +597,14 @@ _mss_pick_docker_install() {
     # A tool the caller can run but the boot job cannot: asking about Docker
     # would save a yes that step 2 refuses on every later run, so both Docker
     # keys are dropped and neither question is asked (#27 r2 finding 1).
-    _mss_docker_outside_job_path >/dev/null || {
+    # The helper returns 0 when such a tool exists and 1 when every Docker choice
+    # is appliable, so the skip is the 0 branch. Negating it dropped both
+    # questions on every ordinary Mac (#27 r3, blocker).
+    if _mss_docker_outside_job_path >/dev/null; then
         echo "Docker is installed outside the boot job's PATH; Docker questions skipped" >&2
         unset MSS_DOCKER_INSTALL MSS_DOCKER_AUTOSTART
         return 1
-    }
+    fi
     if ! _mss_docker_missing; then
         echo "Colima and the Docker CLI are installed" >&2
         return 0
