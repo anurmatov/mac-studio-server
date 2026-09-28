@@ -1,0 +1,35 @@
+#!/bin/sh
+# sysctl stub with state (D4c).
+#   -n hw.memsize            128 GiB (the golden render's basis)
+#   -n iogpu.wired_limit_mb  reads $MSS_STUB_STATE/live (0 when unset)
+#   iogpu.wired_limit_mb=N   stores N and logs the call
+# `sysctl hw.memsize` (the BSD "key: value" form) also works, so the same stub
+# serves scripts/set-gpu-memory.sh.
+#
+# MSS_SYSCTL_MODE:
+#   stuck    every iogpu write is refused — the value is logged but never stored,
+#            and every iogpu read reports the limit as 0. A kernel that rejects
+#            the value behaves this way no matter how many times the job runs,
+#            which is what the apply-then-verify row needs: a stub that merely
+#            stopped storing would still show a value a previous write had left.
+#   missing  every iogpu read fails.
+_s=${MSS_STUB_STATE:-.}
+if [ "${1:-}" = -n ]; then
+    case ${2:-} in
+        hw.memsize) echo 137438953472 ;;
+        iogpu.wired_limit_mb)
+            [ "${MSS_SYSCTL_MODE:-}" = missing ] && exit 1
+            [ "${MSS_SYSCTL_MODE:-}" = stuck ] && { echo 0; exit 0; }
+            cat "$_s/live" 2>/dev/null || echo 0 ;;
+        *) exit 1 ;;
+    esac
+    exit 0
+fi
+case ${1:-} in
+    hw.memsize) echo 'hw.memsize: 137438953472'; exit 0 ;;
+    iogpu.wired_limit_mb=*)
+        echo "$*" >> "$_s/calls.log" 2>/dev/null || true
+        [ "${MSS_SYSCTL_MODE:-}" = stuck ] || echo "${1#*=}" > "$_s/live" 2>/dev/null || true
+        exit 0 ;;
+esac
+exit 1

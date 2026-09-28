@@ -1,0 +1,4 @@
+#!/bin/sh
+# pmset stub: this Mac prints no autorestart line at all.
+[ "${1:-}" = -g ] && echo ' Battery Power:'
+exit 0

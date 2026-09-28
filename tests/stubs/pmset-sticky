@@ -1,0 +1,7 @@
+#!/bin/sh
+# pmset stub: a write succeeds but the readback never changes (reads 0).
+case ${1:-} in
+    -g) echo ' Battery Power:'; echo '	autorestart         0'; exit 0 ;;
+    -a) exit 0 ;;
+esac
+exit 0

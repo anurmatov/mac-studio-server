@@ -1,0 +1,60 @@
+#!/bin/sh
+# launchctl stub with state, for #27 phase A (D4c).
+# State lives in $MSS_STUB_STATE (a directory):
+#   calls.log        every argv, one line per call
+#   loaded-<service> present while that service is loaded
+#   runs-<service>   RunAtLoad counter
+# bootstrap/kickstart/bootout of a service whose *label* ends in .gpumemory
+# simulate RunAtLoad by copying the plist's iogpu.wired_limit_mb=<n> into the
+# sysctl state — except when MSS_SYSCTL_MODE=stuck, which models a kernel that
+# refuses the write.
+#
+# bootstrap carries the plist path but its service argument is bare "system";
+# kickstart carries "system/<label>" but no path, like the real command. So
+# bootstrap records the plist it bootstrapped in $MSS_STUB_STATE/plist-<label>
+# and kickstart reads the limit from there. The stub never derives a path
+# from a sysroot variable, so #21's four-file count stays four.
+_s=${MSS_STUB_STATE:?MSS_STUB_STATE}
+echo "launchctl $*" >> "$_s/calls.log"
+_svc_label() { printf '%s\n' "${1#system/}"; }
+case ${1:-} in
+    bootstrap)
+        _l=$(basename "${3:-}" .plist)
+        [ -f "${3:-}" ] && cp "$3" "$_s/plist-$_l"
+        touch "$_s/loaded-$_l"
+        _n=$(( $(cat "$_s/runs-$_l" 2>/dev/null || echo 0) + 1 ))
+        echo "$_n" > "$_s/runs-$_l"
+        case $_l in
+            *.gpumemory)
+                _mb=$(sed -n 's|.*iogpu\.wired_limit_mb=\([0-9][0-9]*\).*|\1|p' "$3" | head -n 1)
+                # MSS_SYSCTL_MODE=stuck: RunAtLoad runs but the write never
+                # lands, which is how a kernel that refuses the value is modelled.
+                [ -n "$_mb" ] && [ "${MSS_SYSCTL_MODE:-}" != stuck ] && echo "$_mb" > "$_s/live" ;;
+        esac ;;
+    bootout)
+        # Unloading a job leaves the kernel value alone until the next boot, so
+        # bootout never touches `live`. That is what makes the "system never
+        # touches the live value" row and the remove-and-report rows meaningful
+        # rather than tautological.
+        rm -f "$_s/loaded-$(_svc_label "$2")" ;;
+    print)
+        [ -f "$_s/loaded-$(_svc_label "$2")" ] || exit 1
+        _l=$(_svc_label "$2")
+        echo "    runs = $(cat "$_s/runs-$_l" 2>/dev/null || echo 0)"
+        # MSS_SYSCTL_MODE=stuck models a job that ran and was refused by the
+        # kernel, so the reported exit code has to say so — the A10e row asserts
+        # the message carries a real code, and a stub that always says 0 would
+        # let the helper report "last exit code = 0" for a failed job.
+        case ${MSS_SYSCTL_MODE:-} in stuck) echo '    last exit code = 1' ;; *) echo '    last exit code = 0' ;; esac ;;
+    kickstart)
+        _l=$(_svc_label "$2")
+        _n=$(( $(cat "$_s/runs-$_l" 2>/dev/null || echo 0) + 1 ))
+        echo "$_n" > "$_s/runs-$_l"
+        case $_l in
+            *.gpumemory)
+                _mb=$(sed -n 's|.*iogpu\.wired_limit_mb=\([0-9][0-9]*\).*|\1|p' "$_s/plist-$_l" 2>/dev/null | head -n 1)
+                [ -n "$_mb" ] && [ "${MSS_SYSCTL_MODE:-}" != stuck ] && echo "$_mb" > "$_s/live" ;;
+        esac ;;
+    enable) ;;
+esac
+exit 0
