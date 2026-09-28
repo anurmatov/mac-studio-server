@@ -411,8 +411,8 @@ mss_pf_rule_count() {
 # ── backends.env: the saved install.sh answers (parsed, never sourced) ────────
 # Keys in config/backends.env.example order; tests/run.sh asserts they match.
 mss_envfile_keys() {
-    echo MSS_BACKENDS MSS_DEFER_MODEL OLLAMA_BIND OLLAMA_USER OLLAMA_GPU_PERCENT OLLAMA_BIN \
-        MSS_TUNE_MACOS \
+    echo MSS_BACKENDS MSS_DEFER_MODEL OLLAMA_BIND OLLAMA_USER MSS_GPU_PERCENT OLLAMA_BIN \
+        MSS_TUNE_MACOS MSS_POWER_AUTORESTART MSS_DOCKER_INSTALL MSS_DOCKER_AUTOSTART \
         LLAMACPP_BIN LLAMACPP_MODEL LLAMACPP_MODEL_SHA256 LLAMACPP_HOST LLAMACPP_PORT \
         LLAMACPP_ALLOW_FROM LLAMACPP_API_KEY_FILE LLAMACPP_CTX LLAMACPP_PARALLEL \
         LLAMACPP_EXTRA_ARGS \
@@ -420,6 +420,10 @@ mss_envfile_keys() {
         DS4_BATCHED_SESSIONS DS4_WORKDIR DS4_EXTRA_ARGS \
         MSS_GUARD_FREE_PCT MSS_GUARD_SWAP_HEADROOM_MB MSS_GUARD_STREAK MSS_LOG_MAX_MB
 }
+
+# mss_envfile_legacy_keys: keys the parser still accepts and mss_envfile_write
+# never writes (#27). The resolver migrates them on the next save.
+mss_envfile_legacy_keys() { echo OLLAMA_GPU_PERCENT; }
 
 # A value is taken literally. Characters a shell would interpret are refused
 # instead of escaped, so the file can never mean more than it says.
@@ -452,7 +456,7 @@ mss_envfile_check_file() {
 mss_envfile_load() {
     _ef=$1
     mss_envfile_check_file "$_ef" || return 1
-    _ekeys=" $(mss_envfile_keys) "
+    _ekeys=" $(mss_envfile_keys) $(mss_envfile_legacy_keys) "
     _eseen=" "
     _eok=""
     _eno=0
@@ -483,15 +487,21 @@ mss_envfile_load() {
     case $_eseen in *" MSS_BACKENDS "*) ;; *) mss_error "$_ef has no MSS_BACKENDS line"; return 1 ;; esac
 
     MSS_ENVFILE_OVERRIDDEN=""
+    MSS_ENVFILE_LOADED=""
     while IFS= read -r _eline; do
         [ -n "$_eline" ] || continue
         _ekey=${_eline%%=*}
         _evalue=${_eline#*=}
         [ -n "$_evalue" ] || continue
-        if [ -n "$(printenv "$_ekey")" ]; then
+        # The legacy GPU key resolves to MSS_GPU_PERCENT (#27), which is
+        # already exported when the new name is set in the environment.
+        _ealt=$_ekey
+        [ "$_ekey" != OLLAMA_GPU_PERCENT ] || _ealt=MSS_GPU_PERCENT
+        if [ -n "$(printenv "$_ekey")" ] || { [ "$_ealt" != "$_ekey" ] && [ -n "$(printenv "$_ealt")" ]; }; then
             MSS_ENVFILE_OVERRIDDEN="$MSS_ENVFILE_OVERRIDDEN $_ekey"
             continue
         fi
+        MSS_ENVFILE_LOADED="$MSS_ENVFILE_LOADED $_ekey"
         export "$_ekey=$_evalue"
     done <<MSS_ENVFILE_EOF
 $_eok
