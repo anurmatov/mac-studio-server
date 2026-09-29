@@ -1714,6 +1714,41 @@ tr -d '\r' < "$TMP/h27r/e10.transcript" | grep -q 'GPU memory: 80% (104857 MB), 
 check "E10 loaded mode leaves the file's shasum unchanged" "$SHA_L1" "$(mss_shasum256 "$TMP/h27r/loaded.env" | awk '{print $1}')"
 rm -f "$HSD_R/"*.plist
 
+# E11 (manual step 2 at a44b988): with OLLAMA_BIN unset, the plist gets the
+# Ollama already installed, in the picker's order: /usr/local/bin, then PATH,
+# then Homebrew's Apple silicon prefix. The PATH drops every directory holding
+# a real ollama, so the runner's own install cannot answer for a row.
+OB=$TMP/h27ob
+mkdir -p "$OB/both/usr/local/bin" "$OB/both/opt/homebrew/bin" "$OB/path" "$OB/brew/opt/homebrew/bin" "$OB/none"
+for _d in "$OB/both/usr/local/bin" "$OB/both/opt/homebrew/bin" "$OB/path" "$OB/brew/opt/homebrew/bin"; do
+    cp "$ROOT/tests/stubs/fake-ollama.sh" "$_d/ollama"; chmod +x "$_d/ollama"
+done
+OB_PATH=$(printf '%s\n' "$PATH" | tr ':' '\n' | while IFS= read -r _d; do
+    [ -n "$_d" ] || continue; [ -x "$_d/ollama" ] || printf '%s:' "$_d"; done)
+OB_PATH=${OB_PATH%:}
+obin() { ( PATH="${1:+$1:}${OB_PATH:-$PATH}"; export PATH; mss_default_ollama_bin "$2"; echo "rc=$?" ) | tr '\n' ' '; }
+check "E11 /usr/local/bin/ollama comes first" "$OB/both/usr/local/bin/ollama rc=0 " "$(obin "$OB/path" "$OB/both")"
+check "E11 then the ollama on PATH" "$OB/path/ollama rc=0 " "$(obin "$OB/path" "$OB/brew")"
+check "E11 then /opt/homebrew/bin/ollama, even off PATH" "$OB/brew/opt/homebrew/bin/ollama rc=0 " "$(obin "" "$OB/brew")"
+check "E11 none found keeps /usr/local/bin/ollama and says so" "/usr/local/bin/ollama rc=1 " "$(obin "" "$OB/none")"
+# End to end in env mode: a Homebrew-only Ollama, found on PATH (the reported
+# Mac) and off PATH (a sudo PATH without /opt/homebrew/bin), is what the plist runs.
+mkdir -p "$TMP/h27r/sysroot/opt/homebrew/bin"
+cp "$ROOT/tests/stubs/fake-ollama.sh" "$TMP/h27r/sysroot/opt/homebrew/bin/ollama"; chmod +x "$TMP/h27r/sysroot/opt/homebrew/bin/ollama"
+# The Ollama block renders from $BASE_DIR/config, so this base links the templates.
+mkdir -p "$TMP/h27r/base11"; ln -sf "$ROOT/config" "$TMP/h27r/base11/config"
+for _case in on-path off-path; do
+    rm -f "$HSD_R/"*.plist
+    _pre="$TMP/h27r-bin:"; [ "$_case" = off-path ] || _pre="$TMP/h27r/sysroot/opt/homebrew/bin:$_pre"
+    install_case "$TMP/h27r/e11-$_case.log" MSS_BACKENDS=ollama MSS_TUNE_MACOS=no \
+        OLLAMA_BASE_DIR="$TMP/h27r/base11" PATH="$_pre${OB_PATH:-$PATH}"
+    check "E11 env mode, Homebrew Ollama $_case, exits 0" "rc=0" "$(tail -n 1 "$TMP/h27r/e11-$_case.log")"
+    grep -q "<string>$TMP/h27r/sysroot/opt/homebrew/bin/ollama</string>" "$HSD_R/com.ollama.service.plist" 2>/dev/null \
+        && ok "E11 com.ollama.service runs the Homebrew Ollama ($_case)" \
+        || fail "E11 $_case plist: $(grep -A1 ProgramArguments "$HSD_R/com.ollama.service.plist" 2>&1 | tail -n 1)"
+done
+rm -rf "$TMP/h27r/sysroot/opt"; rm -f "$HSD_R/"*.plist
+
 # E8 (D7 step 6): the Docker install runs before the switch removal, the Ollama
 # steps and every launchd or pmset change. A brew that fails must stop install.sh
 # with nothing loaded; the static pin below checks the same order in the source.
@@ -2460,6 +2495,33 @@ grep -q 'Which backends' "$PB/a2.log" && fail "A2 prompted without a terminal" |
 grep -Eq 'NOT_A_KEY|unknown key' "$PB/a2.log" && fail "A2 read the poisoned backends.env" || ok "A2 did not read backends.env"
 loaded com.ollama.service && ok "A2 com.ollama.service loaded" || fail "A2 com.ollama.service not loaded"
 wait_listen 11434 && curl -s http://127.0.0.1:11434/api/version | grep -q stub && ok "A2 stub ollama answers /api/version" || fail "A2 stub ollama unreachable"
+
+# O1 (#27 manual step 2): Ollama only at /opt/homebrew/bin, as Homebrew installs
+# it on Apple silicon, OLLAMA_BIN unset, env mode. The plist must run that
+# binary, launchd must start it, and status.sh must exit 0.
+if [ -e /opt/homebrew/bin/ollama ]; then
+    echo "skip - O1 needs a runner without /opt/homebrew/bin/ollama"
+else
+    sudo mv /usr/local/bin/ollama "$PB/ollama.usrlocal"
+    sudo mkdir -p /opt/homebrew/bin
+    sudo install -m 0755 "$ROOT/tests/stubs/fake-ollama.sh" /opt/homebrew/bin/ollama
+    MSS_BACKENDS=ollama MSS_TUNE_MACOS=no "$IS" </dev/null >"$PB/o1.log" 2>&1
+    check "O1 env mode with a Homebrew-only Ollama exits 0" 0 $?
+    grep -q '<string>/opt/homebrew/bin/ollama</string>' /Library/LaunchDaemons/com.ollama.service.plist \
+        && ok "O1 com.ollama.service runs /opt/homebrew/bin/ollama" \
+        || fail "O1 plist: $(grep -A1 ProgramArguments /Library/LaunchDaemons/com.ollama.service.plist | tail -n 1)"
+    loaded com.ollama.service && ok "O1 com.ollama.service is loaded" || fail "O1 not loaded"
+    wait_listen 11434 && curl -s http://127.0.0.1:11434/api/version | grep -q stub \
+        && ok "O1 the Homebrew Ollama answers /api/version" || fail "O1 no /api/version"
+    sh "$ROOT/scripts/status.sh" >"$PB/o1.status" 2>&1
+    check "O1 status.sh exits 0" 0 $?
+    # Back to the /usr/local/bin stub the rest of phase B expects, re-rendered.
+    sudo rm -f /opt/homebrew/bin/ollama
+    sudo mv "$PB/ollama.usrlocal" /usr/local/bin/ollama
+    MSS_BACKENDS=ollama MSS_TUNE_MACOS=no "$IS" </dev/null >"$PB/o1b.log" 2>&1
+    grep -q '<string>/usr/local/bin/ollama</string>' /Library/LaunchDaemons/com.ollama.service.plist \
+        && ok "O1 /usr/local/bin/ollama wins again once it is back" || fail "O1 restore: $(tail -3 "$PB/o1b.log")"
+fi
 
 # A3: MSS_BACKENDS set, no flag, on a pty: no menu, conf as rendered.
 bdrive a3 "" -- MSS_BACKENDS=ds4 DS4_BIN="$DS4B" DS4_MODEL="$DS4M" DS4_MODEL_SHA256="$DS4S" DS4_PORT=18000
