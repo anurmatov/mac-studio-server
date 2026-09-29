@@ -1510,6 +1510,12 @@ rm_gpu; printf 'garbage\n' > "$HSD/com.mac-studio-server.gpumemory.plist"
 check "A13 an unreadable plist exits 1" 1 "$(status_rc)"
 printf '%s' "$(status_gpu_line)" | grep -q 'is unreadable' \
     && ok "A13 an unreadable plist is unhealthy" || fail "A13 unreadable: $(status_gpu_line)"
+# A recorded percent that is not 1-100 never reaches the arithmetic.
+for bad in 8O 080 101; do
+    rm_gpu; mss_gpu_render "$bad" 104857 > "$HSD/com.mac-studio-server.gpumemory.plist"
+    check "A13 a recorded percent of $bad is unreadable and exits 1" "1 unreadable" \
+        "$(status_rc) $(status_gpu_line | grep -q 'is unreadable' && echo unreadable || status_gpu_line)"
+done
 rm_gpu; seed_legacy; echo 0 > "$HS_STATE/live"
 check "A13 legacy alone exits 0" 0 "$(status_rc)"
 status_run | grep -q 'com.ollama.gpumemory runs a user-editable script as root at boot; re-run install.sh with MSS_GPU_PERCENT to migrate' \
@@ -1675,6 +1681,38 @@ grep -q 'Installation completed' "$TMP/h27r/e2.log" && ok "E2 the install comple
 grep -q 'cannot create a temporary plist' "$TMP/h27r/e2.log" \
     && fail "E3 rendered inside the daemon dir" || ok "E3 no in-dir temp file needed"
 check "E3 the daemon dir holds no leftover temp file" 0 "$(ls "$HSD_R" | grep -c '\.tmp\|^\.' || true)"
+
+# E9: outside a test sysroot a failed chown stops the step and installs nothing;
+# inside one it is best-effort. The sudo stub fails chown only.
+mkdir -p "$TMP/h27o"
+printf '#!/bin/sh\n[ "$1" = chown ] && exit 1\nexec "$@"\n' > "$TMP/h27o/sudo"; chmod +x "$TMP/h27o/sudo"
+printf x > "$TMP/h27o/src"
+( unset MSS_TEST_SYSROOT; MSS_SUDO=$TMP/h27o/sudo; export MSS_SUDO
+  _mss_install_plist "$TMP/h27o/src" "$TMP/h27o/dest" ) 2>/dev/null; RC=$?
+check "E9 a failed chown on a real Mac stops the install" "1 absent" "$RC $([ -e "$TMP/h27o/dest" ] && echo present || echo absent)"
+printf x > "$TMP/h27o/src2"
+( MSS_TEST_SYSROOT=$TMP/sysroot; MSS_SUDO=$TMP/h27o/sudo; export MSS_TEST_SYSROOT MSS_SUDO
+  _mss_install_plist "$TMP/h27o/src2" "$TMP/h27o/dest2" ) 2>/dev/null; RC=$?
+check "E9 inside a test sysroot the chown is best-effort" "0 present" "$RC $([ -e "$TMP/h27o/dest2" ] && echo present || echo absent)"
+
+# E10 (A2): loaded mode reads backends.env, applies it and never writes it. The
+# run is install.sh on a pty with a saved file and no flag, end to end in the
+# sandbox, and it must apply the saved GPU value.
+printf 'MSS_BACKENDS=ollama\nMSS_TUNE_MACOS=no\nMSS_GPU_PERCENT=80\n' > "$TMP/h27r/loaded.env"; chmod 600 "$TMP/h27r/loaded.env"
+SHA_L1=$(mss_shasum256 "$TMP/h27r/loaded.env" | awk '{print $1}')
+rm -f "$HSD_R/"*.plist; echo 0 > "$HR_STATE/live"; : > "$HR_STATE/calls.log"
+( export MSS_TEST_SYSROOT=$TMP/h27r/sysroot MSS_STUB_STATE=$HR_STATE MSS_LAUNCHD_TIMEOUT=1 MSS_SUDO=$TMP/nosudo/sudo \
+      MSS_SYSCTL="$TMP/h27r-bin/sysctl" PATH="$TMP/nosudo:$TMP/h27r-bin:$PATH" MSS_INSTALL_SANDBOX=1 \
+      OLLAMA_BASE_DIR="$TMP/h27r/base" HOME="$TMP/h27r/home" MSS_ENV_FILE="$TMP/h27r/loaded.env" \
+      OLLAMA_USER="$(id -un)" MSS_CONF="$TMP/h27r/none.conf"
+  unset MSS_BACKENDS
+  expect "$ROOT/tests/expect/drive.exp" /dev/null "$TMP/h27r/e10.transcript" /bin/bash "$ROOT/scripts/install.sh" ) \
+    >/dev/null 2>"$TMP/h27r/e10.err"
+check "E10 loaded mode on a pty exits 0" 0 $?
+tr -d '\r' < "$TMP/h27r/e10.transcript" | grep -q 'GPU memory: 80% (104857 MB), applied' \
+    && ok "E10 loaded mode applied the saved GPU value" || fail "E10: $(tr -d '\r' < "$TMP/h27r/e10.transcript" | tail -5)"
+check "E10 loaded mode leaves the file's shasum unchanged" "$SHA_L1" "$(mss_shasum256 "$TMP/h27r/loaded.env" | awk '{print $1}')"
+rm -f "$HSD_R/"*.plist
 
 # E8 (D7 step 6): the Docker install runs before the switch removal, the Ollama
 # steps and every launchd or pmset change. A brew that fails must stop install.sh
@@ -2104,6 +2142,25 @@ else
   docker install: no
   docker at boot: left as is" "$(summary_of a8d)"
 
+    # Stale keys: a saved file holding MSS_DOCKER_AUTOSTART=yes and
+    # MSS_POWER_AUTORESTART=yes, on a Mac where DA and P are both skipped. The
+    # picker must drop both: saved again, step 2 would refuse the file on every
+    # later run and --configure could never clear it. The run's own step 2 is
+    # what exits 0 here.
+    envfile a8st.env 'MSS_BACKENDS=ollama\nMSS_POWER_AUTORESTART=yes\nMSS_DOCKER_AUTOSTART=yes\n'
+    DRIVE_BASE_PATH=$NODOCKER_PATH drive a8st "Choose [1]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" "$G_ENTER" \
+        "Install Colima and the Docker CLI with Homebrew? [y/N]: ${T}@ENTER" "Save? [Y/n]: ${T}@ENTER" -- \
+        MSS_ENV_FILE="$PK/a8st.env" MSS_DOCKER_JOB_PATH="$PK/job-none" MSS_PMSET="$ROOT/tests/stubs/pmset-none"
+    check "A8 stale DA and P keys: the run passes its own validation" 0 $?
+    check "A8 stale keys are dropped when DA and P are skipped" "no||" \
+        "$(saved a8st.env MSS_DOCKER_INSTALL)|$(saved a8st.env MSS_DOCKER_AUTOSTART)|$(saved a8st.env MSS_POWER_AUTORESTART)"
+    tr_of a8st | grep -Eq 'every boot\?|power failure\?' && fail "A8 stale keys: DA or P was asked" || ok "A8 stale keys: neither DA nor P was asked"
+    # The saved file now loads and validates: a second --configure-only run reaches the save again.
+    DRIVE_BASE_PATH=$NODOCKER_PATH drive a8st2 "Choose [1]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" "$G_ENTER" \
+        "Install Colima and the Docker CLI with Homebrew? [y/N]: ${T}@ENTER" "Save? [Y/n]: ${T}@ENTER" -- \
+        MSS_ENV_FILE="$PK/a8st.env" MSS_DOCKER_JOB_PATH="$PK/job-none" MSS_PMSET="$ROOT/tests/stubs/pmset-none"
+    check "A8 stale keys: the saved file is accepted on the next run" 0 $?
+
     # (e, h) DI = y shows DA; --configure-only never runs brew for Docker.
     DRIVE_BASE_PATH=$NODOCKER_PATH DRIVE_PATH="$PK/brewbin" drive a8e "Choose [1]: ${T}1" "auto-updates)? ${T}@ENTER" \
         "$G_ENTER" "power failure? [y/N]: ${T}y" "Install Colima and the Docker CLI with Homebrew? [y/N]: ${T}y" \
@@ -2358,6 +2415,10 @@ IS="$HOME/mac-studio-server/scripts/install.sh"
 sudo install -m 0755 "$ROOT/tests/stubs/fake-ollama.sh" /usr/local/bin/ollama
 PB="$TMP/pb"; mkdir -p "$PB"
 T=$(printf '\t')
+# The #27 host prompts this runner will show (G, then P, DI or DA as pmset and
+# the Docker tools decide), each answered with its default. Every bdrive row
+# that reaches the picker lists "$HS" right after the tweaks answer.
+HS=$(sh "$ROOT/tests/expect/host-steps.sh")
 for b in llamacpp ds4; do
     cp "$ROOT/tests/stubs/fake-server.sh" "$PB/$b-server"; chmod +x "$PB/$b-server"
     printf 'phase-b-model-%s' "$b" > "$PB/$b.gguf"
@@ -2446,7 +2507,7 @@ LOGS="$HOME/mac-studio-server/logs"
 rm -f "$EFB"
 bdrive a5ll "" "Choose [1]: ${T}4" "brew install llama.cpp)? [y/N]: ${T}n" "binary path: ${T}$LLB" "later [1]: ${T}3" \
     "path or https URL: ${T}$LLM" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" "LAN access to llamacpp? [y/N]: ${T}@ENTER" \
-    "auto-updates)? ${T}n" "Install with these settings? [Y/n]: ${T}@ENTER" -- LLAMACPP_PORT=18080 PATH="$PATH_NOLL"
+    "auto-updates)? ${T}n" "$HS" "Install with these settings? [Y/n]: ${T}@ENTER" -- LLAMACPP_PORT=18080 PATH="$PATH_NOLL"
 check "A5 first-run picker install (llama.cpp only)" 0 $?
 check "A5 backends.env mode and owner" "600 $(id -un)" "$(stat -f '%Lp %Su' "$EFB" 2>/dev/null)"
 loaded com.mac-studio-server.llamacpp && loaded com.mac-studio-server.guard && ! loaded com.mac-studio-server.ds4 \
@@ -2458,9 +2519,10 @@ grep -q '^MSS_TUNE_MACOS=no$' "$EFB" && ok "A1 saved MSS_TUNE_MACOS=no" || fail 
 
 # A6 / A5: re-run with the saved file: no prompts (the password is not asked with NOPASSWD
 # sudo), same conf, no hash.
-cp "$CONFB" "$PB/conf.a5"
+cp "$CONFB" "$PB/conf.a5"; SHA_A6=$(mss_shasum256 "$EFB" | awk '{print $1}')
 bdrive a6 "" --
 check "A6 re-run with saved backends.env" 0 $?
+check "A2 loaded mode leaves backends.env's shasum unchanged" "$SHA_A6" "$(mss_shasum256 "$EFB" | awk '{print $1}')"
 has a6 'Choose' && fail "A6 prompted" || ok "A6 zero prompts"
 cmp -s "$CONFB" "$PB/conf.a5" && ok "A6 backends.conf byte-identical" || fail "A6 conf changed"
 has a6 'hashing ' && fail "A6 re-hashed the model" || ok "A6 model not re-hashed"
@@ -2478,7 +2540,7 @@ wait_listen 18081 && ok "A7 llama.cpp moved to 18081" || fail "A7 not listening 
 BEFORE=$(daemons)
 bdrive a10c "--configure-only" "Choose [4]: ${T}5" "in ~/ds4? [y/N]: ${T}n" "binary path: ${T}$DS4B" "later [4]: ${T}3" \
     "path or https URL: ${T}$DS4M" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" "LAN access to ds4? [y/N]: ${T}@ENTER" \
-    "auto-updates)? ${T}@ENTER" "Save? [Y/n]: ${T}@ENTER" -- DS4_PORT=18000
+    "auto-updates)? ${T}@ENTER" "$HS" "Save? [Y/n]: ${T}@ENTER" -- DS4_PORT=18000
 check "A10c --configure-only with another backend installed" 0 $?
 has a10c 'Remove it first' && fail "A10c asked the switch question" || ok "A10c no switch question"
 has a10c 'install.sh --configure will offer to replace it' && ok "A10c message names install.sh --configure" || fail "A10c message missing"
@@ -2490,7 +2552,7 @@ check "A10c /Library/LaunchDaemons unchanged" "$BEFORE" "$(daemons)"
 # A9: --configure switch to ds4, answer n.
 BEFORE=$(daemons); cp "$CONFB" "$PB/conf.a9"
 bdrive a9 "--configure" "Choose [4]: ${T}5" "(.gguf) path [$DS4M]: ${T}@ENTER" "c computes it now) [$DS4S]: ${T}@ENTER" \
-    "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" \
+    "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" "$HS" \
     "Install with these settings? [Y/n]: ${T}@ENTER" "--backend llamacpp? [y/N]: ${T}n" --
 check "A9 declining the switch exits 1" 1 $?
 has a9 'binary path' && fail "A9 asked for a saved binary (I7)" || ok "A9 a saved binary is not asked (I7)"
@@ -2500,7 +2562,7 @@ cmp -s "$CONFB" "$PB/conf.a9" && ok "A9 backends.conf unchanged" || fail "A9 con
 
 # A10 / A9 (sha): switch with a wrong ds4 sha256, answer y: stops at the check with exit 1.
 bdrive a10 "--configure" "Choose [4]: ${T}5" "(.gguf) path [$DS4M]: ${T}@ENTER" "c computes it now) [$DS4S]: ${T}$ZERO" \
-    "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" \
+    "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" "$HS" \
     "Install with these settings? [Y/n]: ${T}@ENTER" "--backend llamacpp? [y/N]: ${T}y" --
 check "A10 wrong sha stops the switch with exit 1" 1 $?
 has a10 'sha256 mismatch' && ok "A10 failed at the check" || fail "A10 did not fail at the check"
@@ -2513,7 +2575,7 @@ nc -l 127.0.0.1 18000 >/dev/null 2>&1 &
 NCPID=$!
 sleep 1
 bdrive a10b "--configure" "Choose [4]: ${T}5" "(.gguf) path [$DS4M]: ${T}@ENTER" "c computes it now) [$ZERO]: ${T}$DS4S" \
-    "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" \
+    "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" "$HS" \
     "Install with these settings? [Y/n]: ${T}@ENTER" "--backend llamacpp? [y/N]: ${T}y" --
 check "A10b foreign listener stops the switch with exit 1" 1 $?
 has a10b "port 18000 is in use (pid $NCPID); set DS4_PORT in backends.env and re-run" && ok "A10b names the pid and the variable (I6)" \
@@ -2524,7 +2586,7 @@ kill "$NCPID" 2>/dev/null; wait "$NCPID" 2>/dev/null
 
 # A8: switch llama.cpp -> ds4, answer y.
 bdrive a8 "--configure" "Choose [4]: ${T}5" "(.gguf) path [$DS4M]: ${T}@ENTER" "c computes it now) [$DS4S]: ${T}@ENTER" \
-    "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" \
+    "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" "$HS" \
     "Install with these settings? [Y/n]: ${T}@ENTER" "--backend llamacpp? [y/N]: ${T}y" --
 check "A8 switch llama.cpp -> ds4" 0 $?
 loaded com.mac-studio-server.ds4 && loaded com.mac-studio-server.guard && ! loaded com.mac-studio-server.llamacpp \
@@ -2536,7 +2598,7 @@ wait_listen 18000 && ok "A8 ds4 listening" || fail "A8 ds4 not listening"
 # A5 / F3: ollama + ds4 (same optional backend: no switch), headless tweaks answered y.
 touch "$PB/f3.marker"; sleep 1
 bdrive a5o3 "--configure" "Choose [5]: ${T}3" "(.gguf) path [$DS4M]: ${T}@ENTER" "c computes it now) [$DS4S]: ${T}@ENTER" \
-    "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}y" \
+    "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}y" "$HS" \
     "Install with these settings? [Y/n]: ${T}@ENTER" "(starter) 2) later [1]: ${T}2" --
 check "A5 ollama + ds4" 0 $?
 loaded com.ollama.service && loaded com.mac-studio-server.ds4 && ok "A5 ollama + ds4 labels" || fail "A5 option 3 labels: $(daemons)"
@@ -2549,7 +2611,7 @@ snap() { pmset -g custom 2>/dev/null; mdutil -s / 2>/dev/null; tmutil destinatio
     defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticCheckEnabled 2>/dev/null; }
 snap > "$PB/f2.before"; touch "$PB/f2.marker"; sleep 1
 bdrive a5o2 "--configure" "Choose [3]: ${T}2" "(.gguf) path [$LLM]: ${T}@ENTER" "c computes it now) [$LLS]: ${T}@ENTER" \
-    "LAN access to llamacpp? [y/N]: ${T}@ENTER" "auto-updates)? ${T}n" \
+    "LAN access to llamacpp? [y/N]: ${T}@ENTER" "auto-updates)? ${T}n" "$HS" \
     "Install with these settings? [Y/n]: ${T}@ENTER" "--backend ds4? [y/N]: ${T}y" "(starter) 2) later [1]: ${T}2" --
 check "A5 ollama + llama.cpp" 0 $?
 loaded com.ollama.service && loaded com.mac-studio-server.llamacpp && ! loaded com.mac-studio-server.ds4 \
@@ -2559,7 +2621,7 @@ cmp -s "$PB/f2.before" "$PB/f2.after" && ok "F2 pmset, mdutil, tmutil and update
 [ "$LOGS/optimization.log" -nt "$PB/f2.marker" ] && fail "F2 the optimizer ran" || ok "F2 optimization.log not written"
 
 # A5: ollama only (removes llama.cpp; no check to run).
-bdrive a5o1 "--configure" "Choose [2]: ${T}1" "auto-updates)? ${T}n" "Install with these settings? [Y/n]: ${T}@ENTER" \
+bdrive a5o1 "--configure" "Choose [2]: ${T}1" "auto-updates)? ${T}n" "$HS" "Install with these settings? [Y/n]: ${T}@ENTER" \
     "--backend llamacpp? [y/N]: ${T}y" "(starter) 2) later [1]: ${T}2" --
 check "A5 ollama only" 0 $?
 loaded com.ollama.service && ! loaded com.mac-studio-server.llamacpp && ! loaded com.mac-studio-server.guard \
@@ -2567,7 +2629,7 @@ loaded com.ollama.service && ! loaded com.mac-studio-server.llamacpp && ! loaded
 
 # A5: MSS_BACKENDS set in the environment, --configure choosing ds4 only.
 bdrive a5env "--configure" "Choose [4]: ${T}5" "(.gguf) path [$DS4M]: ${T}@ENTER" "c computes it now) [$DS4S]: ${T}@ENTER" \
-    "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}n" \
+    "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}n" "$HS" \
     "Install with these settings? [Y/n]: ${T}@ENTER" -- MSS_BACKENDS=llamacpp
 check "A5 --configure overrides MSS_BACKENDS from the environment" 0 $?
 loaded com.mac-studio-server.ds4 && ! loaded com.mac-studio-server.llamacpp && ok "A5 env run installed ds4" || fail "A5 env run labels: $(daemons)"
@@ -2595,7 +2657,7 @@ echo "== phase B: 1.5.0 model later, model.sh, stamp and prompts (#15) =="
 # M1: llama.cpp with a model later: the conf says waiting and no backend or guard job exists.
 EFM="$PB/m.env"
 bdrive m1 "--configure" "Choose [5]: ${T}4" "brew install llama.cpp)? [y/N]: ${T}n" "binary path: ${T}$LLB" "later [1]: ${T}4" \
-    "LAN access to llamacpp? [y/N]: ${T}@ENTER" "auto-updates)? ${T}n" \
+    "LAN access to llamacpp? [y/N]: ${T}@ENTER" "auto-updates)? ${T}n" "$HS" \
     "Install with these settings? [Y/n]: ${T}@ENTER" "--backend ds4? [y/N]: ${T}y" -- \
     MSS_ENV_FILE="$EFM" LLAMACPP_PORT=18082 PATH="$PATH_NOLL"
 check "M1 install with a model later" 0 $?
@@ -2673,7 +2735,7 @@ nc -l 127.0.0.1 8080 >/dev/null 2>&1 &
 NCPID=$!
 sleep 1; BEFORE=$(daemons)
 bdrive f7 "--configure" "Choose [1]: ${T}4" "later [1]: ${T}3" "path or https URL: ${T}$LLM" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" \
-    "LAN access to llamacpp? [y/N]: ${T}@ENTER" "auto-updates)? ${T}n" "Install with these settings? [Y/n]: ${T}@ENTER" -- \
+    "LAN access to llamacpp? [y/N]: ${T}@ENTER" "auto-updates)? ${T}n" "$HS" "Install with these settings? [Y/n]: ${T}@ENTER" -- \
     MSS_ENV_FILE="$PB/f7.env" LLAMACPP_BIN="$LLB"
 check "F7 a busy default port exits 1" 1 $?
 has f7 "port 8080 is in use (pid $NCPID); set LLAMACPP_PORT in backends.env and re-run" && ok "F7 names the pid, LLAMACPP_PORT and backends.env" \
