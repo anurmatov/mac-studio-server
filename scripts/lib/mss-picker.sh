@@ -12,6 +12,8 @@
 #   MSS_BACKENDS, OLLAMA_BIN, MSS_TUNE_MACOS, MSS_DEFER_MODEL and the chosen
 #   backend's *_BIN/_MODEL/_MODEL_SHA256/_HOST/_PORT/_ALLOW_FROM (and
 #   LLAMACPP_API_KEY_FILE)
+#   MSS_GPU_PERCENT, MSS_POWER_AUTORESTART, MSS_DOCKER_INSTALL and (when the
+#   autostart question ran) MSS_DOCKER_AUTOSTART
 #   MSS_PICKER_REPLACE  installed backend the check may look through
 #   MSS_SWITCH_FROM     installed backend to uninstall after the check passes
 #   MSS_DOWNLOADED      a model file downloaded in this run
@@ -535,6 +537,130 @@ _mss_pick_tweaks() {
     if [ "$MSS_ANSWER" = y ]; then _mss_pick_set MSS_TUNE_MACOS yes; else _mss_pick_set MSS_TUNE_MACOS no; fi
 }
 
+
+# ── host choices (#27): G, P, DI, DA — after the tweaks question ──────────────
+# Every prompt offers the default it detects (#26's rule). Each question is
+# fully resolved before the next one's "shown when" is evaluated.
+
+# G — Metal wired-memory limit. The validator is the same check D1 runs, so the
+# picker can never save a value step 2 would refuse on every later run.
+_mss_pick_gpu_valid() {
+    case $1 in
+        system) return 0 ;;
+        [1-9]|[1-9][0-9]|100) ;;
+        *) mss_error "answer a percent 1-100 (no leading zero) or system"; return 1 ;;
+    esac
+    _mss_sysctl -n iogpu.wired_limit_mb >/dev/null 2>&1 || {
+        echo "this Mac has no iogpu.wired_limit_mb; answer system" >&2; return 1; }
+    _mss_sysctl -n hw.memsize >/dev/null 2>&1 || {
+        echo "cannot read hw.memsize; answer system" >&2; return 1; }
+    return 0
+}
+
+_mss_pick_gpu() {
+    local r kind rec def
+    # D3 default order: the resolved value first, then the installed job's value,
+    # then system. Ignoring the resolved value would re-ask a value the user has
+    # already set (A8a).
+    def=${MSS_GPU_PERCENT:-}
+    r=$(mss_gpu_job_read); kind=${r%%|*}; rec=${r#*|}
+    [ -n "$def" ] || case $kind in
+        new|legacy|both) case $rec in [1-9]|[1-9][0-9]|100) def=$rec ;; *) def=system ;; esac ;;
+        *) def=system ;;
+    esac
+    # A Mac without the limit can only answer system, so that is the default.
+    _mss_sysctl -n iogpu.wired_limit_mb >/dev/null 2>&1 || def=system
+    mss_ask "GPU memory for models (Ollama, llama.cpp, ds4): percent of RAM 1-100, or system" \
+        "$def" _mss_pick_gpu_valid
+    # `system` is saved as the answer it is. Unsetting the key would save
+    # nothing, the apply step would print "left as is", and an installed job
+    # would survive the run the user just answered "system" in (#27 r2, blocker 5).
+    _mss_pick_set MSS_GPU_PERCENT "$MSS_ANSWER"
+}
+
+# P — restart after a power failure. Skipped (and saved nothing) when this Mac
+# has no such setting.
+_mss_pick_power() {
+    local cur
+    if ! cur=$(mss_power_current); then
+        echo "This Mac has no restart-after-power-failure setting; skipped" >&2
+        # A value loaded from backends.env would be saved again and refused by
+        # step 2 on every later run, so a skipped P saves nothing.
+        unset MSS_POWER_AUTORESTART
+        return 0
+    fi
+    local def=N
+    case ${MSS_POWER_AUTORESTART:-} in yes) def=Y ;; no) def=N ;; *) [ "$cur" = 1 ] && def=Y ;; esac
+    mss_ask_yn "Start this Mac automatically after a power failure?" "$def"
+    if [ "$MSS_ANSWER" = y ]; then _mss_pick_set MSS_POWER_AUTORESTART yes
+    else _mss_pick_set MSS_POWER_AUTORESTART no; fi
+}
+
+# DI — install Colima / the Docker CLI with Homebrew. The picker installs
+# nothing; install.sh does after confirmation (D7 step 6).
+_mss_pick_docker_install() {
+    # A tool the caller can run but the boot job cannot: asking about Docker
+    # would save a yes that step 2 refuses on every later run, so both Docker
+    # keys are dropped and neither question is asked (#27 r2 finding 1).
+    # The helper returns 0 when such a tool exists and 1 when every Docker choice
+    # is appliable, so the skip is the 0 branch. Negating it dropped both
+    # questions on every ordinary Mac (#27 r3, blocker).
+    local out
+    if out=$(_mss_docker_outside_job_path); then
+        echo "${out%% *} is at ${out#* }, outside the boot job's PATH; move or link it into /opt/homebrew/bin or /usr/local/bin" >&2
+        unset MSS_DOCKER_INSTALL MSS_DOCKER_AUTOSTART
+        return 1
+    fi
+    if ! _mss_docker_missing; then
+        echo "Colima and the Docker CLI are installed" >&2
+        return 0
+    fi
+    local def=N names
+    [ "${MSS_DOCKER_INSTALL:-}" != yes ] || def=Y
+    if [ -n "$(_mss_job_tool colima)" ]; then names="the Docker CLI"
+    elif [ -n "$(_mss_job_tool docker)" ]; then names="Colima"
+    else names="Colima and the Docker CLI"; fi
+    mss_ask_yn "Install $names with Homebrew?" "$def"
+    if [ "$MSS_ANSWER" = y ] && ! _mss_pick_need_brew; then
+        echo "Without Homebrew the install can't run; Docker won't be installed." >&2
+        _mss_pick_set MSS_DOCKER_INSTALL no
+        return 0
+    fi
+    if [ "$MSS_ANSWER" = y ]; then _mss_pick_set MSS_DOCKER_INSTALL yes
+    else _mss_pick_set MSS_DOCKER_INSTALL no; fi
+}
+
+# DA — start Colima at every boot. Only shown once both tools are present or
+# DI was answered yes; when skipped, MSS_DOCKER_AUTOSTART stays unset.
+_mss_pick_docker_autostart() {
+    # DI returned 1 because a Docker tool sits outside the boot job's PATH.
+    [ "${1:-}" = skipped ] && return 0
+    if _mss_docker_missing && [ "${MSS_DOCKER_INSTALL:-}" != yes ]; then
+        # D3: a skipped DA leaves autostart as it is. A loaded yes would be saved
+        # again and refused by step 2 on every later run.
+        unset MSS_DOCKER_AUTOSTART
+        return 0
+    fi
+    local def=N
+    if [ -f "$(mss_daemon_dir)/$MSS_DOCKER_LABEL.plist" ]; then def=Y; fi
+    case ${MSS_DOCKER_AUTOSTART:-} in yes) def=Y ;; no) def=N ;; esac
+    local now=off
+    _mss_gpu_loaded "$MSS_DOCKER_LABEL" && now=on
+    mss_ask_yn "Start Colima (Docker) at every boot? Currently $now." "$def"
+    if [ "$MSS_ANSWER" = y ]; then _mss_pick_set MSS_DOCKER_AUTOSTART yes
+    else _mss_pick_set MSS_DOCKER_AUTOSTART no; fi
+}
+
+_mss_pick_host_choices() {
+    _mss_pick_gpu
+    _mss_pick_power
+    if _mss_pick_docker_install; then
+        _mss_pick_docker_autostart
+    else
+        _mss_pick_docker_autostart skipped
+    fi
+}
+
 # ── summary ────────────────────────────────────────────────────────────────────
 _mss_pick_summary() {
     local sel=$1 b=$2 P
@@ -547,6 +673,10 @@ _mss_pick_summary() {
             ;;
     esac
     echo "  headless tweaks: $(printenv MSS_TUNE_MACOS)" >&2
+    mss_gpu_summary_line "$(printenv MSS_GPU_PERCENT)" >&2
+    mss_power_summary_line >&2
+    mss_docker_install_summary_line >&2
+    mss_docker_autostart_summary_line >&2
     if [ -n "$b" ]; then
         P=$(mss_prefix "$b")
         echo "  $b binary:  $(printenv "${P}_BIN")" >&2
@@ -580,6 +710,13 @@ mss_picker_run() {
         mss_envfile_load "$file" || exit 1
     fi
 
+    # D1: resolve the legacy choice keys before the first question, but only
+    # after the saved file is loaded. Resolving first would mark the run
+    # resolved, and the later resolve in install.sh would hit its early return:
+    # the file's legacy GPU key would then vanish with no notice, no conflict,
+    # and nothing saved (#27 r2).
+    mss_choices_resolve || exit 1
+
     # 1. menu
     def=$(_mss_pick_sel_to_num "$env_sel")
     [ -n "$def" ] || def=$(_mss_pick_sel_to_num "$installed_sel")
@@ -601,6 +738,9 @@ mss_picker_run() {
     case ",$sel," in *,ollama,*) _mss_pick_ollama ;; esac
     [ -z "$b" ] || _mss_pick_backend "$b"
     _mss_pick_tweaks
+
+    # 6b. host choices (#27)
+    _mss_pick_host_choices
 
     # 7. summary and confirmation
     _mss_pick_summary "$sel" "$b"

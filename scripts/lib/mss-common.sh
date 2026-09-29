@@ -188,6 +188,8 @@ mss_resolve_path() {
 
 # ── wired limit (same integer formula and evaluation order as
 #    scripts/set-gpu-memory.sh) ─────────────────────────────────────────────────
+# mss_wired_limit_mb <percent> [memsize-bytes]: the second argument is the test
+# hook; unset reads sysctl, which only a Mac answers.
 mss_wired_limit_mb() {
     _percent=${1:?percent}
     _total=${2:-$(sysctl -n hw.memsize)}
@@ -336,6 +338,21 @@ mss_validate_extra_args() {
 # ── Ollama plist render (P3) ───────────────────────────────────────────────────
 # mss_render_ollama_plist <template> <user> <bind> <bin>. With the default bin
 # /usr/local/bin/ollama the output is byte-identical to the v1.2.0 golden file.
+# mss_default_ollama_bin [root-prefix]: the Ollama binary to render when
+# OLLAMA_BIN is unset, in the picker's order: /usr/local/bin/ollama (1.3.0's
+# path), then the ollama on PATH, then Homebrew's Apple silicon prefix, which a
+# sudo PATH can lack. With none found it prints /usr/local/bin/ollama and
+# returns 1. The prefix is install.sh's test sandbox; it is empty on a Mac.
+mss_default_ollama_bin() {
+    _obp=${1:-}
+    if [ -x "$_obp/usr/local/bin/ollama" ]; then echo "$_obp/usr/local/bin/ollama"; return 0; fi
+    _obf=$(command -v ollama 2>/dev/null) || _obf=""
+    case $_obf in /*) if [ -x "$_obf" ]; then echo "$_obf"; return 0; fi ;; esac
+    if [ -x "$_obp/opt/homebrew/bin/ollama" ]; then echo "$_obp/opt/homebrew/bin/ollama"; return 0; fi
+    echo /usr/local/bin/ollama
+    return 1
+}
+
 mss_render_ollama_plist() {
     sed -e "s|<OLLAMA_USER>|$2|g" -e "s|<OLLAMA_BIND>|$3|g" -e "s|<OLLAMA_BIN>|$4|g" "$1"
 }
@@ -411,8 +428,8 @@ mss_pf_rule_count() {
 # ── backends.env: the saved install.sh answers (parsed, never sourced) ────────
 # Keys in config/backends.env.example order; tests/run.sh asserts they match.
 mss_envfile_keys() {
-    echo MSS_BACKENDS MSS_DEFER_MODEL OLLAMA_BIND OLLAMA_USER OLLAMA_GPU_PERCENT OLLAMA_BIN \
-        MSS_TUNE_MACOS \
+    echo MSS_BACKENDS MSS_DEFER_MODEL OLLAMA_BIND OLLAMA_USER MSS_GPU_PERCENT OLLAMA_BIN \
+        MSS_TUNE_MACOS MSS_POWER_AUTORESTART MSS_DOCKER_INSTALL MSS_DOCKER_AUTOSTART \
         LLAMACPP_BIN LLAMACPP_MODEL LLAMACPP_MODEL_SHA256 LLAMACPP_HOST LLAMACPP_PORT \
         LLAMACPP_ALLOW_FROM LLAMACPP_API_KEY_FILE LLAMACPP_CTX LLAMACPP_PARALLEL \
         LLAMACPP_EXTRA_ARGS \
@@ -420,6 +437,10 @@ mss_envfile_keys() {
         DS4_BATCHED_SESSIONS DS4_WORKDIR DS4_EXTRA_ARGS \
         MSS_GUARD_FREE_PCT MSS_GUARD_SWAP_HEADROOM_MB MSS_GUARD_STREAK MSS_LOG_MAX_MB
 }
+
+# mss_envfile_legacy_keys: keys the parser still accepts and mss_envfile_write
+# never writes (#27). The resolver migrates them on the next save.
+mss_envfile_legacy_keys() { echo OLLAMA_GPU_PERCENT; }
 
 # A value is taken literally. Characters a shell would interpret are refused
 # instead of escaped, so the file can never mean more than it says.
@@ -452,7 +473,7 @@ mss_envfile_check_file() {
 mss_envfile_load() {
     _ef=$1
     mss_envfile_check_file "$_ef" || return 1
-    _ekeys=" $(mss_envfile_keys) "
+    _ekeys=" $(mss_envfile_keys) $(mss_envfile_legacy_keys) "
     _eseen=" "
     _eok=""
     _eno=0
@@ -483,15 +504,21 @@ mss_envfile_load() {
     case $_eseen in *" MSS_BACKENDS "*) ;; *) mss_error "$_ef has no MSS_BACKENDS line"; return 1 ;; esac
 
     MSS_ENVFILE_OVERRIDDEN=""
+    MSS_ENVFILE_LOADED=""
     while IFS= read -r _eline; do
         [ -n "$_eline" ] || continue
         _ekey=${_eline%%=*}
         _evalue=${_eline#*=}
         [ -n "$_evalue" ] || continue
+        # A key the environment already carries stays the environment's. That
+        # includes the legacy GPU key; a file OLLAMA_GPU_PERCENT beside an
+        # environment MSS_GPU_PERCENT is still exported, because the environment
+        # does not carry that name, and mss_choices_resolve compares the two.
         if [ -n "$(printenv "$_ekey")" ]; then
             MSS_ENVFILE_OVERRIDDEN="$MSS_ENVFILE_OVERRIDDEN $_ekey"
             continue
         fi
+        MSS_ENVFILE_LOADED="$MSS_ENVFILE_LOADED $_ekey"
         export "$_ekey=$_evalue"
     done <<MSS_ENVFILE_EOF
 $_eok
@@ -501,7 +528,9 @@ MSS_ENVFILE_EOF
 
 # mss_envfile_write FILE: write every exported non-empty key, in the example's
 # order, atomically with mode 0600. Refuses to run as root or to replace a
-# symlink. Comments are not preserved.
+# symlink. Comments are not preserved. OLLAMA_BIN is written only when Ollama is
+# selected: a DS4-only or llama.cpp-only file must not carry a binary that was
+# removed on purpose.
 mss_envfile_write() {
     _ef=$1
     [ "$(id -u)" -ne 0 ] || { mss_error "refusing to write $_ef as root"; return 1; }
@@ -517,6 +546,7 @@ mss_envfile_write() {
         echo "# KEY=value lines, parsed and never sourced: no quotes, no \$, no export."
         for _ek in $(mss_envfile_keys); do
             _ev=$(printenv "$_ek")
+            [ "$_ek" != OLLAMA_BIN ] || mss_backend_selected ollama || continue
             [ -z "$_ev" ] || printf '%s=%s\n' "$_ek" "$_ev"
         done
     } > "$_etmp"; then

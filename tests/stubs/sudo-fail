@@ -1,0 +1,11 @@
+#!/bin/sh
+# sudo stub that fails, for the rows that prove install.sh stops when an apply
+# step fails (#27 r2). The privileged calls in mss-host.sh all go through
+# _mss_root, which uses ${MSS_SUDO:-sudo}, so naming this stub makes every
+# launchctl/pmset/chmod/mv privileged call fail on demand.
+case ${1:-} in
+    -v) exit 0 ;;
+    -n) shift ;;
+esac
+echo "sudo-fail: refusing ${*}" >&2
+exit 1

@@ -1,0 +1,14 @@
+#!/bin/sh
+# plutil stub (#27): -extract EnvironmentVariables.<KEY> raw <plist> prints the
+# string that follows that key, and fails when the key is absent or its value
+# is empty — like the real plutil.
+[ "${1:-}" = -extract ] || exit 1
+_key=$2; _f=$4
+[ -f "$_f" ] || exit 1
+case $_key in
+    EnvironmentVariables.*) _name=${_key##*.} ;;
+    *) exit 1 ;;
+esac
+_v=$(grep -F -A1 "<key>$_name</key>" "$_f" | sed -n 's|.*<string>\(.*\)</string>.*|\1|p' | head -n 1)
+[ -n "$_v" ] || exit 1
+printf '%s\n' "$_v"

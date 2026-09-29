@@ -161,10 +161,14 @@ jobs:
           set -u
           if command -v llama-server >/dev/null; then echo "llama-server is already on PATH"; exit 1; fi
           T=$(printf '\t')
-          printf '%s\n' "Choose [1]: ${T}4" "brew install llama.cpp)? [y/N]: ${T}y" "later [1]: ${T}2" \
-            "Save the model to [${HOME}/models/stories260K.gguf]: ${T}@ENTER" "free)? [y/N]: ${T}y" \
-            "LAN access to llamacpp? [y/N]: ${T}@ENTER" "auto-updates)? ${T}n" \
-            "Install with these settings? [Y/n]: ${T}@ENTER" > "$RUNNER_TEMP/a4.steps"
+          # The #27 host prompts depend on the runner (pmset, colima, docker), so
+          # host-steps.sh lists the ones this Mac will show, each answered with Enter.
+          { printf '%s\n' "Choose [1]: ${T}4" "brew install llama.cpp)? [y/N]: ${T}y" "later [1]: ${T}2" \
+              "Save the model to [${HOME}/models/stories260K.gguf]: ${T}@ENTER" "free)? [y/N]: ${T}y" \
+              "LAN access to llamacpp? [y/N]: ${T}@ENTER" "auto-updates)? ${T}n"
+            sh tests/expect/host-steps.sh
+            printf '%s\n' "Install with these settings? [Y/n]: ${T}@ENTER"; } > "$RUNNER_TEMP/a4.steps"
+          cat "$RUNNER_TEMP/a4.steps"
           rc=0
           MSS_CATALOG="$PWD/$CAT" MSS_ENV_FILE="$RUNNER_TEMP/a4.env" LLAMACPP_PORT=18080 MSS_EXPECT_TIMEOUT=600 \
             expect tests/expect/drive.exp "$RUNNER_TEMP/a4.steps" "$RUNNER_TEMP/a4.transcript" /bin/bash scripts/install.sh || rc=$?
@@ -267,10 +271,13 @@ jobs:
           # Ollama must be missing: drop any PATH directory that has it.
           P=$(printf '%s\n' "$PATH" | tr ':' '\n' | while IFS= read -r d; do [ -x "$d/ollama" ] || printf '%s:' "$d"; done)
           T=$(printf '\t')
-          printf '%s\n' "Choose [1]: ${T}2" "(brew install ollama)? [y/N]: ${T}y" "brew install llama.cpp)? [y/N]: ${T}y" \
-            "later [1]: ${T}2" "Save the model to [${HOME}/models/stories260K.gguf]: ${T}@ENTER" "free)? [y/N]: ${T}y" \
-            "LAN access to llamacpp? [y/N]: ${T}@ENTER" "auto-updates)? ${T}n" \
-            "Install with these settings? [Y/n]: ${T}@ENTER" "(starter) 2) later [1]: ${T}1" > "$RUNNER_TEMP/b2.steps"
+          # host-steps.sh: the #27 host prompts this runner will show, with the PATH install.sh gets.
+          { printf '%s\n' "Choose [1]: ${T}2" "(brew install ollama)? [y/N]: ${T}y" "brew install llama.cpp)? [y/N]: ${T}y" \
+              "later [1]: ${T}2" "Save the model to [${HOME}/models/stories260K.gguf]: ${T}@ENTER" "free)? [y/N]: ${T}y" \
+              "LAN access to llamacpp? [y/N]: ${T}@ENTER" "auto-updates)? ${T}n"
+            PATH="${P%:}" sh tests/expect/host-steps.sh
+            printf '%s\n' "Install with these settings? [Y/n]: ${T}@ENTER" "(starter) 2) later [1]: ${T}1"; } > "$RUNNER_TEMP/b2.steps"
+          cat "$RUNNER_TEMP/b2.steps"
           rc=0
           PATH="${P%:}" MSS_CATALOG="$HOME/mac-studio-server/tests/fixtures/catalog/more.tsv" LLAMACPP_PORT=18080 \
             MSS_EXPECT_TIMEOUT=900 expect tests/expect/drive.exp "$RUNNER_TEMP/b2.steps" "$RUNNER_TEMP/b2.transcript" \
@@ -286,7 +293,8 @@ jobs:
           for i in $(seq 1 60); do nc -z 127.0.0.1 18080 && break; sleep 2; done
           sh "$HOME/mac-studio-server/scripts/status.sh"
           # F1: every prompt is on the allowlist, none repeats, at most 11 (entry 7 includes its
-          # "more" sub-prompts); S4: prompts stay within 100 characters.
+          # "more" sub-prompts; the #27 host prompts G, P and DI or DA fit inside it);
+          # S4: prompts stay within 100 characters.
           sed -n 's/^\(.*\]: \).*/\1/p' "$RUNNER_TEMP/b2.txt" > "$RUNNER_TEMP/prompts"
           cat "$RUNNER_TEMP/prompts"
           test -z "$(awk 'length($0) > 100' "$RUNNER_TEMP/prompts")"

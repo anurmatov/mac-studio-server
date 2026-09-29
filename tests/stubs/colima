@@ -1,0 +1,8 @@
+#!/bin/sh
+# colima stub: logs argv; `list --json` output comes from MSS_STUB_COLIMA_LIST
+# (a file), and the exit code from MSS_STUB_COLIMA_LIST_RC (default 0).
+echo "colima $*" >> "$MSS_STUB_LOG"
+[ "${1:-}" = list ] || exit 0
+[ "${MSS_STUB_COLIMA_LIST_RC:-0}" = 0 ] || exit 1
+[ -n "${MSS_STUB_COLIMA_LIST:-}" ] && cat "$MSS_STUB_COLIMA_LIST"
+exit 0

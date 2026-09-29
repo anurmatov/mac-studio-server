@@ -1,0 +1,6 @@
+#!/bin/sh
+# pmset stub: this Mac prints no autorestart line at all. Calls are logged when
+# a state directory is given.
+[ -z "${MSS_STUB_STATE:-}" ] || echo "pmset $*" >> "$MSS_STUB_STATE/pmset.log"
+[ "${1:-}" = -g ] && echo ' Battery Power:'
+exit 0

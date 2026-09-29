@@ -9,6 +9,8 @@ REPO_DIR=$(cd "$(dirname "$0")/.." && pwd)
 . "$REPO_DIR/scripts/lib/mss-common.sh" || exit 1
 . "$REPO_DIR/scripts/lib/mss-acquire.sh" || exit 1
 . "$REPO_DIR/scripts/lib/mss-run.sh" || exit 1
+. "$REPO_DIR/scripts/lib/mss-host.sh" || exit 1
+mss_host_root_guard
 
 # ── Modes (1.4.0). With no flag and no terminal, or with MSS_BACKENDS set, the
 # 1.3.0 flow runs unchanged: environment variables only, backends.env is never
@@ -66,11 +68,33 @@ elif [ "$MSS_MODE" = picker ]; then
         "$([ "$MSS_FLAG" = --configure-only ] && echo 1 || echo 0)"
 fi
 
+# D7 step 2: resolve the legacy choice keys, then validate every choice before
+# anything below changes the system. Nothing has been written yet.
+mss_choices_resolve || exit 1
+mss_choices_validate || exit 1
+
 # Configuration
 USER=${OLLAMA_USER:-$(whoami)}
 BASE_DIR=${OLLAMA_BASE_DIR:-"/Users/$USER/mac-studio-server"}
-# GPU memory percentage (if set, enables GPU optimization)
-GPU_PERCENT=${OLLAMA_GPU_PERCENT:-""}
+
+# MSS_INSTALL_SANDBOX: tests/run.sh only. The Ollama service block below writes
+# a handful of absolute paths (/Library/LaunchDaemons, /Users/$USER/.ollama) and
+# calls the real sudo, so phase A cannot run install.sh end to end without them.
+# With the flag every absolute path in this file is prefixed with the phase A
+# sysroot, and the raw `sudo` calls go through the same ${MSS_SUDO:-sudo} shim
+# the apply steps use. Never set outside tests/run.sh; the guard below refuses it
+# for root, exactly as mss_host_root_guard does.
+MSS_SYSROOT_PREFIX=""
+if [ "${MSS_INSTALL_SANDBOX:-}" = 1 ]; then
+    [ "$(id -u)" -ne 0 ] || { echo "install.sh: MSS_INSTALL_SANDBOX is for tests/run.sh only" >&2; exit 1; }
+    [ -n "${MSS_TEST_SYSROOT:-}" ] || { echo "install.sh: MSS_INSTALL_SANDBOX needs MSS_TEST_SYSROOT" >&2; exit 1; }
+    MSS_SYSROOT_PREFIX=$MSS_TEST_SYSROOT
+    sudo() { ${MSS_SUDO:-sudo} "$@"; }
+    mkdir -p "$MSS_SYSROOT_PREFIX/Library/LaunchDaemons" \
+        "$MSS_SYSROOT_PREFIX/Users/$USER/.ollama"
+fi
+# Metal wired-memory limit in percent of RAM (shared by Ollama, llama.cpp, ds4)
+GPU_PERCENT=${MSS_GPU_PERCENT:-""}
 BIND=${OLLAMA_BIND:-0.0.0.0}
 BACKENDS=${MSS_BACKENDS:-ollama}
 LOG_FILE="$BASE_DIR/logs/install.log"
@@ -88,14 +112,48 @@ mss_check() {
     return "$mss_rc"
 }
 
+# mss_apply_step <fn> [args...]: run one D7 apply step, echo its report lines
+# to stdout and the log, and exit on its failure. Piping straight into `tee`
+# would test tee's status, not the step's, and a failed step would report
+# success (#27 r2).
+mss_apply_step() {
+    mss_step_out=$(
+        "$@" 2>&1
+        mss_step_rc=$?
+        printf '@@RC@@%s\n' "$mss_step_rc"
+    )
+    mss_step_rc=${mss_step_out##*@@RC@@}
+    printf '%s\n' "${mss_step_out%@@RC@@*}" | tee -a "$LOG_FILE" || exit 1
+    [ "$mss_step_rc" != 0 ] || return 0
+    mss_step_fn=$1
+    shift
+    mss_error "$mss_step_fn failed: $*"
+    exit 1
+}
+
 # Validate before any system change.
 mss_validate_selection "$BACKENDS" || exit 1
 mss_validate_ipv4 "$BIND" || { mss_error "OLLAMA_BIND: '$BIND' must be a single IPv4 address"; exit 1; }
 case ${MSS_TUNE_MACOS:-} in ''|yes|no) ;; *) mss_error "MSS_TUNE_MACOS must be yes or no"; exit 1 ;; esac
-OLLAMA_EXE=${OLLAMA_BIN:-/usr/local/bin/ollama}
-if [ -n "${OLLAMA_BIN:-}" ]; then
+# The Ollama binary matters only when Ollama is selected. A key left from an
+# earlier Ollama configuration must not stop a DS4-only or llama.cpp-only run.
+OLLAMA_EXE=/usr/local/bin/ollama
+if ! mss_backend_selected ollama; then
+    :   # neither looked up nor validated
+elif [ -n "${OLLAMA_BIN:-}" ]; then
+    OLLAMA_EXE=$OLLAMA_BIN
     mss_validate_path_chars OLLAMA_BIN "$OLLAMA_BIN" || exit 1
     [ -f "$OLLAMA_BIN" ] && [ -x "$OLLAMA_BIN" ] || { mss_error "OLLAMA_BIN: not an executable file: $OLLAMA_BIN"; exit 1; }
+elif OLLAMA_EXE=$(mss_default_ollama_bin "$MSS_SYSROOT_PREFIX"); then
+    # The Ollama already installed, not a fixed path: Homebrew on Apple silicon
+    # puts it in /opt/homebrew/bin, and a plist naming /usr/local/bin/ollama
+    # there cannot start (launchd EX_CONFIG). The path lives in the rendered
+    # plist; env and loaded modes never write backends.env.
+    mss_validate_path_chars "Ollama binary" "$OLLAMA_EXE" || exit 1
+elif [ "$MSS_MODE" != picker ]; then
+    # Nothing found: 1.3.0's default path is kept, and said out loud. (The
+    # picker has already told the user how to install Ollama later.)
+    echo "WARNING: no Ollama binary found; com.ollama.service will run $OLLAMA_EXE (brew install ollama, or set OLLAMA_BIN)" >&2
 fi
 [ -z "${MSS_PROGRESS_SECONDS:-}" ] || mss_validate_uint MSS_PROGRESS_SECONDS "$MSS_PROGRESS_SECONDS" 1 60 || exit 1
 # D7: acquisition asked for by environment variables (the picker asks instead).
@@ -114,14 +172,25 @@ fi
 if mss_backend_selected llamacpp || mss_backend_selected ds4; then
     mss_check --check-only || exit 1
 fi
-# A confirmed switch removes the old backend only now, after the check passed.
+
+# The Colima boot job runs a fixed start-colima.sh path; refuse autostart before
+# any change unless that file is this checkout's (an older one resizes the VM).
+mss_docker_job_script_check || exit 1
+
+# log_action and mss_apply_step append to $LOG_FILE, so its directory must exist first.
+mkdir -p "$BASE_DIR/logs"
+
+# D7 step 6: install the missing Docker tools (only MSS_DOCKER_INSTALL=yes
+# installs; nothing here runs colima or docker). It runs before the switch
+# removal, the Ollama steps and any launchd or pmset change, so a Homebrew
+# failure leaves the machine as it was.
+mss_apply_step mss_docker_install_apply
+
+# D7 step 7: a confirmed switch removes the old backend only now, after the check passed.
 if [ -n "$MSS_SWITCH_FROM" ]; then
     echo "Removing $MSS_SWITCH_FROM ..." >&2
     sudo /bin/sh "$REPO_DIR/scripts/uninstall.sh" --backend "$MSS_SWITCH_FROM" || exit 1
 fi
-
-# log_action appends to $LOG_FILE, so its directory must exist first.
-mkdir -p "$BASE_DIR/logs"
 
 if mss_backend_selected ollama; then
 # Create necessary directories
@@ -143,24 +212,24 @@ else
 fi
 
 # Install launch daemon
-log_action "Installing Ollama launch daemon..."
+log_action "Installing Ollama launch daemon ($OLLAMA_EXE)..."
 # Replace user, bind address and binary in the plist file
 mss_render_ollama_plist "$BASE_DIR/config/com.ollama.service.plist" "$USER" "$BIND" "$OLLAMA_EXE" > "/tmp/com.ollama.service.plist"
-sudo cp "/tmp/com.ollama.service.plist" /Library/LaunchDaemons/
+sudo cp "/tmp/com.ollama.service.plist" "$MSS_SYSROOT_PREFIX/Library/LaunchDaemons/"
 rm "/tmp/com.ollama.service.plist"
 
-sudo chown root:wheel /Library/LaunchDaemons/com.ollama.service.plist
-sudo chmod 644 /Library/LaunchDaemons/com.ollama.service.plist
+sudo chown root:wheel "$MSS_SYSROOT_PREFIX/Library/LaunchDaemons/com.ollama.service.plist"
+sudo chmod 644 "$MSS_SYSROOT_PREFIX/Library/LaunchDaemons/com.ollama.service.plist"
 
 # Ensure Ollama directory exists with proper permissions
 log_action "Setting up Ollama directory..."
-mkdir -p "/Users/$USER/.ollama"
-chown "$USER:staff" "/Users/$USER/.ollama"
+mkdir -p "$MSS_SYSROOT_PREFIX/Users/$USER/.ollama"
+chown "$USER:staff" "$MSS_SYSROOT_PREFIX/Users/$USER/.ollama"
 
 # Load the launch daemon
 log_action "Loading Ollama service..."
-sudo launchctl unload /Library/LaunchDaemons/com.ollama.service.plist 2>/dev/null || true
-sudo launchctl load -w /Library/LaunchDaemons/com.ollama.service.plist
+sudo launchctl unload "$MSS_SYSROOT_PREFIX/Library/LaunchDaemons/com.ollama.service.plist" 2>/dev/null || true
+sudo launchctl load -w "$MSS_SYSROOT_PREFIX/Library/LaunchDaemons/com.ollama.service.plist"
 
 mss_is_loopback_host "$BIND" || \
     log_action "WARNING: Ollama is LAN-bound on $BIND (OLLAMA_BIND=127.0.0.1 makes it loopback-only)"
@@ -183,74 +252,14 @@ else
     fi
 fi
 
-# Install GPU memory optimization (if GPU_PERCENT is set)
-if [ -n "$GPU_PERCENT" ]; then
-    log_action "Installing GPU memory optimization (${GPU_PERCENT}%)..."
-    chmod +x "$BASE_DIR/scripts/set-gpu-memory.sh"
+# D7 step 9: the GPU boot job (D4 apply table).
+mss_apply_step mss_gpu_apply "$GPU_PERCENT"
 
-    # Replace user in GPU memory plist file
-    sed -e "s|<OLLAMA_USER>|$USER|g" -e "s/<GPU_PERCENT>/$GPU_PERCENT/" "$BASE_DIR/config/com.ollama.gpumemory.plist" > "/tmp/com.ollama.gpumemory.plist"
-    sudo cp "/tmp/com.ollama.gpumemory.plist" /Library/LaunchDaemons/
-    rm "/tmp/com.ollama.gpumemory.plist"
+# D7 step 10: restart after a power failure (D6).
+mss_apply_step mss_power_apply
 
-    sudo chown root:wheel /Library/LaunchDaemons/com.ollama.gpumemory.plist
-    sudo chmod 644 /Library/LaunchDaemons/com.ollama.gpumemory.plist
-
-    # Load the GPU memory daemon
-    log_action "Loading GPU memory optimization service..."
-    sudo launchctl unload /Library/LaunchDaemons/com.ollama.gpumemory.plist 2>/dev/null || true
-    sudo launchctl load -w /Library/LaunchDaemons/com.ollama.gpumemory.plist
-    
-    log_action "GPU memory optimization enabled (${GPU_PERCENT}%)"
-else
-    log_action "Skipping GPU memory optimization (set OLLAMA_GPU_PERCENT to enable, e.g. OLLAMA_GPU_PERCENT=80)"
-fi
-
-# Install Docker daemon (if DOCKER_AUTOSTART is set)
-if [ "${DOCKER_AUTOSTART:-false}" = "true" ]; then
-    log_action "Setting up Docker with Colima..."
-    
-    # Check if Homebrew is installed
-    if ! command -v brew &>/dev/null; then
-        log_action "Homebrew is required but not installed. Please install Homebrew first:"
-        log_action "  /bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
-        log_action "Skipping Docker autostart setup"
-    else
-        # Check if Colima is installed, install if not
-        if ! command -v colima &>/dev/null; then
-            log_action "Installing Colima via Homebrew..."
-            brew install colima
-        fi
-        
-        # Check if Docker CLI is installed, install if not
-        if ! command -v docker &>/dev/null; then
-            log_action "Installing Docker CLI via Homebrew..."
-            brew install docker
-        fi
-        
-        # Make Colima script executable
-        chmod +x "$BASE_DIR/scripts/start-colima.sh"
-        
-        log_action "Installing Colima autostart..."
-        
-        # Replace user in Colima plist file
-        sed "s|<OLLAMA_USER>|$USER|g" "$BASE_DIR/config/com.colima.daemon.plist" > "/tmp/com.colima.daemon.plist"
-        sudo cp "/tmp/com.colima.daemon.plist" /Library/LaunchDaemons/
-        rm "/tmp/com.colima.daemon.plist"
-
-        sudo chown root:wheel /Library/LaunchDaemons/com.colima.daemon.plist
-        sudo chmod 644 /Library/LaunchDaemons/com.colima.daemon.plist
-
-        # Load the Colima daemon
-        log_action "Loading Colima autostart service..."
-        sudo launchctl unload /Library/LaunchDaemons/com.colima.daemon.plist 2>/dev/null || true
-        sudo launchctl load -w /Library/LaunchDaemons/com.colima.daemon.plist
-        
-        log_action "Docker autostart with Colima enabled"
-    fi
-else
-    log_action "Skipping Docker autostart (set DOCKER_AUTOSTART=true to enable)"
-fi
+# D7 step 11: the Colima boot job (D5 apply table; never stops a running Colima).
+mss_apply_step mss_docker_autostart_apply
 
 # Optional backend (llamacpp or ds4), validated above.
 if mss_backend_selected llamacpp || mss_backend_selected ds4; then

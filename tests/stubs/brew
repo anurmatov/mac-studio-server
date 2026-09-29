@@ -1,0 +1,8 @@
+#!/bin/sh
+# brew stub: logs argv; only `install` succeeds, anything else fails the test.
+echo "brew $*" >> "$MSS_STUB_LOG"
+case ${1:-} in
+    install) exit 0 ;;
+    --prefix) echo "$MSS_STUB_BREW_PREFIX"; exit 0 ;;
+esac
+exit 1

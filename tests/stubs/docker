@@ -1,0 +1,4 @@
+#!/bin/sh
+# docker stub: logs argv and succeeds.
+echo "docker $*" >> "$MSS_STUB_LOG"
+exit 0

@@ -65,7 +65,7 @@ if ! mss_is_loopback_host "$HOST"; then
     done
 fi
 
-# 6. Wired limit applied.
+# 6. Wired limit applied (boot race with com.mac-studio-server.gpumemory).
 if [ -n "$WIRED_LIMIT" ]; then
     _waited=0
     while :; do

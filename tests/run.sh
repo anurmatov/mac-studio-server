@@ -36,7 +36,8 @@ live_paths() {
         printf '%s\n' "$_lp"
     done
     printf '%s\n' /usr/local/bin/ollama /Library/LaunchDaemons/com.ollama.service.plist \
-        /Library/LaunchDaemons/com.ollama.gpumemory.plist "$ROOT/backends.env"
+        /Library/LaunchDaemons/com.mac-studio-server.gpumemory.plist \
+        /Library/LaunchDaemons/com.colima.daemon.plist "$ROOT/backends.env"
 }
 # live_snap: paths on stdin, "path<TAB>state" out. Only stat, without -L; the
 # contents of a file are never read.
@@ -115,7 +116,7 @@ fi
 
 echo "== phase A: static =="
 if command -v shellcheck >/dev/null 2>&1; then
-    if shellcheck -S warning -s sh "$ROOT"/libexec/*.sh "$ROOT"/scripts/lib/mss-common.sh "$ROOT"/scripts/install-backends.sh "$ROOT"/scripts/status.sh "$ROOT"/scripts/uninstall.sh; then
+    if shellcheck -S warning -s sh "$ROOT"/libexec/*.sh "$ROOT"/scripts/lib/mss-common.sh "$ROOT"/scripts/lib/mss-host.sh "$ROOT"/scripts/install-backends.sh "$ROOT"/scripts/status.sh "$ROOT"/scripts/uninstall.sh "$ROOT"/tests/expect/host-steps.sh; then
         ok "shellcheck -s sh"
     else
         fail "shellcheck -s sh"
@@ -136,16 +137,23 @@ BAD=$(grep -nE 'stat -c|sha256sum|readlink -f|date -d' "$ROOT"/libexec/*.sh "$RO
 BADSHA=$(grep -rnE '(^|[^_])shasum' "$ROOT/scripts" "$ROOT/libexec" "$ROOT/bootstrap.sh" \
     | grep -v '^[^:]*:[0-9]*:[[:space:]]*#' | grep -vF 'mss_shasum256() { LC_ALL=C shasum -a 256 "$@"; }' || true)
 [ -z "$BADSHA" ] && ok "shasum runs only through mss_shasum256 (#21)" || fail "shasum outside mss_shasum256: $BADSHA"
-check "MSS_TEST_SYSROOT is read by exactly three files (#21)" \
-    "scripts/install-backends.sh scripts/lib/mss-picker.sh tests/run.sh" \
+# #27 r2 adds install.sh: MSS_INSTALL_SANDBOX prefixes its absolute writes with
+# the sysroot so phase A can run install.sh end to end without touching /Library.
+# set-gpu-memory.sh reads it to gate its MSS_SYSCTL hook, never to find a path.
+check "MSS_TEST_SYSROOT is read by exactly six files (#21, #27)" \
+    "scripts/install-backends.sh scripts/install.sh scripts/lib/mss-host.sh scripts/lib/mss-picker.sh scripts/set-gpu-memory.sh tests/run.sh" \
     "$(cd "$ROOT" && grep -rl --exclude-dir=.git MSS_TEST_SYSROOT . | sed 's|^\./||' | sort | tr '\n' ' ' | sed 's/ $//')"
 # Every PATH= keeps $PATH, so the hash-audit shims stay first (#21). tests/run.sh
-# counts from the phase A header to its summary line.
+# counts from the phase A header to its summary line. One form is exempt: a
+# `PATH=<set>; export PATH` pair inside a subshell, which replaces the search
+# path on purpose and is invisible to its caller — that is how _mss_job_tool
+# asks whether a tool is on the boot job's PATH, where appending $PATH would
+# report a tool the daemon cannot reach at boot.
 PATHRE='(^|[^A-Za-z0-9_])PATH='
 BADPATH=$( { grep -rnE "$PATHRE" "$ROOT/scripts" "$ROOT/libexec" "$ROOT/bootstrap.sh"
     awk '/^if \[ "\$PHASE" != B \]; then$/ { a = 1 } a { print FILENAME ":" FNR ":" $0 } /^echo "phase A: \$PASS passed/ { a = 0 }' \
         "$ROOT/tests/run.sh" | grep -E "$PATHRE"
-    } | grep -Ev '\$(PATH|\{PATH\})([^A-Za-z0-9_]|$)' | grep -vF "PATHRE='" || true)
+    } | grep -Ev '\$(PATH|\{PATH\})([^A-Za-z0-9_]|$)' | grep -vF "PATHRE='" | grep -vF '; export PATH' || true)
 [ -z "$BADPATH" ] && ok "every PATH= assignment keeps \$PATH (#21)" || fail "PATH= without \$PATH: $BADPATH"
 
 echo "== phase A: mss_resolve_path =="
@@ -229,11 +237,188 @@ check "mss_launchd_wait_gone returns 1 at the timeout" 1 "$RC"
 printf '%s' "$OUT" | grep -q 'did not stop within 1s' && ok "mss_launchd_wait_gone names the timeout" \
     || fail "mss_launchd_wait_gone timeout output: $OUT"
 BOOTS=$(cd "$ROOT" && grep -rl 'launchctl bootstrap' scripts libexec bootstrap.sh | sort | tr '\n' ' ' | sed 's/ $//')
-check "launchctl bootstrap appears only in install-backends.sh and mss-enable.sh" \
-    "libexec/mss-enable.sh scripts/install-backends.sh" "$BOOTS"
-for f in libexec/mss-enable.sh scripts/install-backends.sh; do
+# #27 adds mss-host.sh: the GPU and Colima boot jobs converge through the same
+# bootstrap/wait/enable sequence as the backend jobs.
+check "launchctl bootstrap appears only in install-backends.sh, mss-enable.sh and mss-host.sh" \
+    "libexec/mss-enable.sh scripts/install-backends.sh scripts/lib/mss-host.sh" "$BOOTS"
+for f in libexec/mss-enable.sh scripts/install-backends.sh scripts/lib/mss-host.sh; do
     grep -q 'mss_launchd_wait_gone "' "$ROOT/$f" && ok "$f calls mss_launchd_wait_gone" || fail "$f never calls mss_launchd_wait_gone"
 done
+
+
+echo "== phase A: #27 D4 render, helper, and A17 install-backends guards =="
+# The #27 blocks below all call helpers from this one file, so it is sourced at
+# the first of them. REPO_DIR is normally set at the system-tests boundary; the
+# helpers resolve config templates through it, so it has to exist before they
+# run, not merely before phase B.
+REPO_DIR=$ROOT
+. "$ROOT/scripts/lib/mss-host.sh"
+# The A17 install-backends.sh rows need the model fixtures and run after the
+# --check-only block below. Everything here runs on every runner.
+mkdir -p "$TMP/h27b" "$TMP/h27b/stub"
+check "render 80% at 128 GiB equals the golden file" 0 \
+    "$(mss_gpu_render 80 104857 | cmp - "$ROOT/tests/golden/com.mac-studio-server.gpumemory.80.plist" >/dev/null 2>&1; echo $?)"
+grep -F -A1 '<string>/usr/sbin/sysctl</string>' "$ROOT/tests/golden/com.mac-studio-server.gpumemory.80.plist" \
+    | grep -q '<string>iogpu.wired_limit_mb=104857</string>' \
+    && ok "the golden render sets the limit with sysctl directly" || fail "the golden render does not run sysctl directly"
+check "mss_wired_limit_mb 80 at 128 GiB is 104857" 104857 "$(mss_wired_limit_mb 80 137438953472)"
+# set-gpu-memory.sh helper (A4)
+cat > "$TMP/h27b/stub/sysctl" <<'XS'
+#!/bin/sh
+# hw.memsize: the harness pins 128 GiB via MSS_H27_MEMSIZE so the expected MB
+# is a constant; anything else falls back to this host's real value.
+if [ "${1:-}" = -n ]; then
+    [ "${2:-}" = hw.memsize ] || exit 1
+    [ -n "${MSS_H27_MEMSIZE:-}" ] && { echo "$MSS_H27_MEMSIZE"; exit 0; }
+    /usr/sbin/sysctl -n hw.memsize 2>/dev/null || echo 137438953472
+    exit 0
+fi
+echo "sysctl $*" >> "$MSS_H27_LOG"; exit 0
+XS
+cat > "$TMP/h27b/stub/sudo" <<'XS'
+#!/bin/sh
+case ${1:-} in -v) exit 0 ;; -n) shift ;; esac
+exec "$@"
+XS
+chmod +x "$TMP/h27b/stub/sysctl"
+helper_case() { # helper_case <log> <env=...>... -- args...: rc
+    _log=$1; shift
+    : > "$_log"
+    ( export MSS_H27_LOG=$_log MSS_H27_MEMSIZE=137438953472 OLLAMA_BASE_DIR="$TMP/h27b" MSS_SYSCTL="$TMP/h27b/stub/sysctl" MSS_SUDO="$TMP/h27b/stub/sudo" PATH="$TMP/h27b/stub:$PATH"
+      while [ "$#" -gt 0 ] && [ "$1" != -- ]; do export "${1?}"; shift; done
+      shift
+      "$ROOT/scripts/set-gpu-memory.sh" "$@" >/dev/null 2>&1 )
+}
+helper_case "$TMP/h27b/a1.log" -- 85; check "helper: an argument sets the limit" "sysctl iogpu.wired_limit_mb=111411" "$(cat "$TMP/h27b/a1.log")"
+helper_case "$TMP/h27b/a2.log" -- system; check "helper: system writes 0" "sysctl iogpu.wired_limit_mb=0" "$(cat "$TMP/h27b/a2.log")"
+helper_case "$TMP/h27b/a3.log" OLLAMA_GPU_PERCENT=80 --; check "helper: legacy environment with no argument" "sysctl iogpu.wired_limit_mb=104857" "$(cat "$TMP/h27b/a3.log")"
+helper_case "$TMP/h27b/a4.log" MSS_GPU_PERCENT=70 OLLAMA_GPU_PERCENT=80 --; RC=$?
+check "helper: differing environment keys exit 2" 2 "$RC"
+check "helper: differing keys write nothing" "" "$(cat "$TMP/h27b/a4.log")"
+helper_case "$TMP/h27b/a5.log" --; RC=$?
+check "helper: nothing given exits 2" 2 "$RC"
+check "helper: nothing given writes nothing (never 80 silently)" "" "$(cat "$TMP/h27b/a5.log")"
+helper_case "$TMP/h27b/a6.log" MSS_GPU_PERCENT=70 -- 85; check "helper: the argument wins over the environment" "sysctl iogpu.wired_limit_mb=111411" "$(cat "$TMP/h27b/a6.log")"
+# MSS_SYSCTL is a test hook: outside a test sysroot the helper uses the real
+# sysctl however it is set, so a stray variable cannot redirect a root run.
+helper_case "$TMP/h27b/a7.log" MSS_TEST_SYSROOT= -- 85
+check "helper: MSS_SYSCTL is ignored outside a test sysroot" "" "$(cat "$TMP/h27b/a7.log")"
+
+echo "== phase A: #27 D5 start-colima.sh (existing VM keeps its size) =="
+mkdir -p "$TMP/h27c"
+cat > "$TMP/h27c/colima" <<'XS'
+#!/bin/sh
+echo "colima $*" >> "$MSS_H27_LOG"
+[ "${1:-}" = list ] || exit 0
+[ "${MSS_H27_LIST_RC:-0}" = 0 ] || exit 1
+[ -n "${MSS_H27_LIST:-}" ] && cat "$MSS_H27_LIST"
+XS
+cat > "$TMP/h27c/docker" <<'XS'
+#!/bin/sh
+# docker stub: `info` fails until `colima start` has run, so start-colima
+# proceeds to its start line and then leaves its wait loop at once.
+[ "${1:-}" = info ] && ! grep -q '^colima start' "$MSS_H27_LOG" 2>/dev/null && exit 1
+exit 0
+XS
+chmod +x "$TMP/h27c/colima" "$TMP/h27c/docker"
+start_case() { # start_case <list-file|-> <list-rc> [home]: the colima start argv
+    : > "$TMP/h27c/log"
+    ( export MSS_H27_LOG="$TMP/h27c/log" OLLAMA_BASE_DIR="$TMP/h27c"
+      [ -z "${3:-}" ] || export HOME="$3"
+      [ "$1" = - ] && unset MSS_H27_LIST || export MSS_H27_LIST="$1"
+      export MSS_H27_LIST_RC=$2
+      PATH="$TMP/h27c:$PATH"
+      "$ROOT/scripts/start-colima.sh" >/dev/null 2>&1 )
+    sed -n 's/^colima start.*/&/p' "$TMP/h27c/log" | head -n 1
+}
+printf '{"name":"default","runtime":"docker","status":"Stopped"}\n' > "$TMP/h27c/compact.json"
+printf '{"name": "default", "status": "Stopped", "cpus": 8}\n' > "$TMP/h27c/spaced.json"
+: > "$TMP/h27c/empty.json"
+printf '{"name":"other","status":"Stopped"}\n{"name":"second"}\n' > "$TMP/h27c/other.json"
+check "an existing default starts with no flags" "colima start" "$(start_case "$TMP/h27c/compact.json" 0)"
+check "spaced JSON also starts with no flags" "colima start" "$(start_case "$TMP/h27c/spaced.json" 0)"
+check "empty list creates with today's flags" \
+    "colima start --cpu 4 --memory 8 --disk 50 --vm-type=vz --mount-type=virtiofs" "$(start_case "$TMP/h27c/empty.json" 0)"
+check "other names only create with today's flags" \
+    "colima start --cpu 4 --memory 8 --disk 50 --vm-type=vz --mount-type=virtiofs" "$(start_case "$TMP/h27c/other.json" 0)"
+check "a failing list starts with no flags (never resize)" "colima start" "$(start_case "$TMP/h27c/compact.json" 1)"
+# Manual step 9 at a44b988: a 6/12/80 VM came back 4/8/50 after a reboot. A VM
+# that Colima's own files show is never resized, even when the list misses it.
+mkdir -p "$TMP/h27c/home-yaml/.colima/default" "$TMP/h27c/home-lima/.colima/_lima/colima" "$TMP/h27c/home-none"
+printf 'cpu: 6\nmemory: 12\ndisk: 80\n' > "$TMP/h27c/home-yaml/.colima/default/colima.yaml"
+check "an empty list over an existing colima.yaml starts with no flags" "colima start" \
+    "$(start_case "$TMP/h27c/empty.json" 0 "$TMP/h27c/home-yaml")"
+check "other names over an existing Lima instance start with no flags" "colima start" \
+    "$(start_case "$TMP/h27c/other.json" 0 "$TMP/h27c/home-lima")"
+check "an empty list with nothing on disk still creates with today's flags" \
+    "colima start --cpu 4 --memory 8 --disk 50 --vm-type=vz --mount-type=virtiofs" \
+    "$(start_case "$TMP/h27c/empty.json" 0 "$TMP/h27c/home-none")"
+check "COLIMA_HOME is where the VM is looked for" "colima start" \
+    "$(export COLIMA_HOME="$TMP/h27c/home-yaml/.colima"; start_case "$TMP/h27c/empty.json" 0 "$TMP/h27c/home-none")"
+check "the existing VM's colima.yaml is untouched" "$(printf 'cpu: 6\nmemory: 12\ndisk: 80')" \
+    "$(cat "$TMP/h27c/home-yaml/.colima/default/colima.yaml")"
+
+echo "== phase A: #27 D6 power apply =="
+HS_STUBBED="$TMP/h27d"
+mkdir -p "$HS_STUBBED"
+# _mss_root runs the command directly on a root pass, so the pmset stub would be
+# exec'd by root here. MSS_SUDO points every privileged call at the same shim the
+# apply helpers use, which is what makes a stubbed privileged write observable
+# regardless of who runs phase A.
+mkdir -p "$TMP/nosudo"
+printf '#!/bin/sh\ncase $1 in -v) exit 0 ;; -n) shift ;; esac\nexec "$@"\n' > "$TMP/nosudo/sudo"
+chmod +x "$TMP/nosudo/sudo"
+# power_case <pmset-stub> [env=...]: the D8 line(s) then rc. Every row gets a
+# private state directory, because the autorestart stubs are stateful and one
+# row's write must not become the next row's starting value. Directories are
+# named after the row rather than a counter: power_case always runs inside a
+# command substitution, and a counter bumped there dies with the subshell, so
+# every row would share one directory and the "unchanged" rows would read back a
+# previous row's write and report "changed".
+power_dir() { printf '%s/h27d/%s-%s\n' "$TMP" "$1" "$(shift; printf '%s' "$*" | tr -c 'A-Za-z0-9._-' '_')"; }
+# power_writes <stub> <env...>: the `pmset -a` calls the last power_case with
+# the same arguments made, one line each.
+power_writes() { grep '^pmset -a' "$(power_dir "$@")/pmset.log" 2>/dev/null || true; }
+power_case() {
+    _stub=$1
+    _state=$(power_dir "$@"); shift
+    rm -rf "$_state"; mkdir -p "$_state"
+    ( export MSS_PMSET="$ROOT/tests/stubs/$_stub" MSS_SUDO="$TMP/nosudo/sudo" MSS_STUB_STATE="$_state"
+      while [ "$#" -gt 0 ]; do export "${1?}"; shift; done
+      mss_power_apply 2>&1; echo "rc=$?" )
+}
+check "power unset on a supported Mac reports the current state" "Restart after power failure: left as is (off)
+rc=0" "$(power_case pmset-autorestart-0)"
+check "power unset on an unsupported Mac is a line, not an error" "Restart after power failure: left as is (unsupported)
+rc=0" "$(power_case pmset-none)"
+check "power=yes against 0 writes once" "Restart after power failure: on, changed
+rc=0" "$(power_case pmset-autorestart-0 MSS_POWER_AUTORESTART=yes)"
+check "power=no against 0 is unchanged" "Restart after power failure: off, unchanged
+rc=0" "$(power_case pmset-autorestart-0 MSS_POWER_AUTORESTART=no)"
+check "power=yes against 1 is unchanged" "Restart after power failure: on, unchanged
+rc=0" "$(power_case pmset-autorestart-1 MSS_POWER_AUTORESTART=yes)"
+check "power=no against 1 writes once" "Restart after power failure: off, changed
+rc=0" "$(power_case pmset-autorestart-1 MSS_POWER_AUTORESTART=no)"
+# constraint 4, counted: zero writes when unset or equal, exactly one when different
+check "A6 unset makes no pmset -a call" "" "$(power_writes pmset-autorestart-0)"
+check "A6 unset on 1 makes no pmset -a call" "" "$(power_writes pmset-autorestart-1)"
+check "A6 equal (no against 0) makes no pmset -a call" "" "$(power_writes pmset-autorestart-0 MSS_POWER_AUTORESTART=no)"
+check "A6 equal (yes against 1) makes no pmset -a call" "" "$(power_writes pmset-autorestart-1 MSS_POWER_AUTORESTART=yes)"
+check "A6 yes against 0 makes exactly one write" "pmset -a autorestart 1" "$(power_writes pmset-autorestart-0 MSS_POWER_AUTORESTART=yes)"
+check "A6 no against 1 makes exactly one write" "pmset -a autorestart 0" "$(power_writes pmset-autorestart-1 MSS_POWER_AUTORESTART=no)"
+check "A6 unsupported makes no pmset -a call" "" "$(power_writes pmset-none)"
+OUT=$(power_case pmset-sticky MSS_POWER_AUTORESTART=yes); RCline=${OUT##*rc=}
+check "a sticky pmset fails the readback" 1 "$RCline"
+printf '%s' "$OUT" | grep -q 'pmset did not apply autorestart=1 (reads 0)' && ok "the mismatch names both values" || fail "sticky: $OUT"
+OUT=$(power_case pmset-none MSS_POWER_AUTORESTART=yes); RCline=${OUT##*rc=}
+check "a key on a Mac without the setting exits 1" 1 "$RCline"
+check "a key on a Mac without the setting writes nothing" "" "$(power_writes pmset-none MSS_POWER_AUTORESTART=yes)"
+printf '%s' "$OUT" | grep -q 'no restart-after-power-failure setting' && ok "the missing-setting message names the unset" || fail "none: $OUT"
+# constraint 4: pmset -a only when set and different
+for f in scripts/optimize-mac-server.sh; do
+    grep -q autorestart "$ROOT/$f" && fail "$f gained autorestart (constraint 4)" || ok "$f never touches autorestart (constraint 4)"
+done
+
 
 echo "== phase A: guard --evaluate fixtures =="
 E="$ROOT/libexec/mss-guard.sh"
@@ -406,6 +591,30 @@ fi
 check_fail "--check-only rejects a wrong sha" env MSS_BACKENDS=ds4 OLLAMA_USER="$TUSER" DS4_BIN="$TMP/fix/ds4/ds4-server" \
     DS4_MODEL="$TMP/fix/ds4/model.gguf" DS4_MODEL_SHA256="$(printf '0%.0s' $(seq 64))" DS4_PORT=18999 \
     sh "$ROOT/scripts/install-backends.sh" --check-only
+
+# install-backends.sh: only MSS_GPU_PERCENT is read, the exemption stays (A17).
+# These rows need the fixtures and TUSER above. stat-bsd lets a Linux runner
+# pass the model file's BSD stat and steps aside on macOS; the sysctl stub pins
+# hw.memsize at 128 GiB so the wired limit is computed the same everywhere.
+mkdir -p "$TMP/h27b/bin-bsd"
+cp "$ROOT/tests/stubs/stat-bsd" "$TMP/h27b/bin-bsd/stat"; cp "$ROOT/tests/stubs/sysctl-state" "$TMP/h27b/bin-bsd/sysctl"
+chmod +x "$TMP/h27b/bin-bsd/stat" "$TMP/h27b/bin-bsd/sysctl"
+a17() { # a17 <extra env...> -- <install-backends args...>
+    _a17env=""
+    while [ "$1" != -- ]; do _a17env="$_a17env $1"; shift; done
+    shift
+    # shellcheck disable=SC2086  # the extra env is our own KEY=value words
+    env PATH="$TMP/h27b/bin-bsd:$PATH" MSS_STUB_STATE="$TMP/h27b" MSS_BACKENDS=ds4 OLLAMA_USER="$TUSER" DS4_BIN="$TMP/fix/ds4/ds4-server" \
+        DS4_MODEL="$TMP/fix/ds4/model.gguf" DS4_MODEL_SHA256="$(cat "$TMP/fix/ds4/model.sha")" DS4_PORT=18997 \
+        $_a17env sh "$ROOT/scripts/install-backends.sh" "$@" 2>&1
+}
+OUT=$(a17 MSS_GPU_PERCENT=80 -- --check-only)
+check "A17 --check-only with 80 and no plist still passes" 0 $?
+OUT=$(a17 MSS_GPU_PERCENT=80 -- --render-only "$TMP/h27b/ro")
+check "A17 --render-only with 80 and no plist still passes" 0 $?
+OUT=$(a17 OLLAMA_GPU_PERCENT=80 -- --render-only "$TMP/h27b/ro2")
+check "A17 --render-only refuses a legacy key in the environment" 1 $?
+printf '%s' "$OUT" | grep -q 'OLLAMA_GPU_PERCENT is replaced by MSS_GPU_PERCENT' && ok "A17 names the replacement" || fail "A17 message: $OUT"
 
 echo "== phase A: wired-limit formula parity (A15b) =="
 if [ "$(uname)" = Darwin ]; then
@@ -699,6 +908,1105 @@ else
     echo "skip - U3 needs macOS (mkfile, BSD dd) and a non-root user"
 fi
 
+
+echo "== phase A: #27 D1 resolver and validation =="
+mkdir -p "$TMP/h27" "$TMP/h27stub" "$TMP/h27e" "$TMP/h27f" "$TMP/h27g" "$TMP/h27b" "$TMP/h27c" "$TMP/h27d" "$TMP/h27e/state"
+cat > "$TMP/h27stub/sysctl" <<'XS'
+#!/bin/sh
+# sysctl stub: hw.memsize reads 128 GiB, iogpu reads 0; MSS_SYSCTL_MODE=fail
+# fails every read (a Mac with no iogpu key).
+if [ "${MSS_SYSCTL_MODE:-}" = fail ]; then
+    [ "${1:-}" = -n ] && [ "${2:-}" = hw.memsize ] && { echo 137438953472; exit 0; }
+    exit 1
+fi
+[ "${1:-}" = -n ] || exit 1
+case $2 in
+    hw.memsize) echo 137438953472 ;;
+    *) echo 0 ;;
+esac
+XS
+chmod +x "$TMP/h27stub/sysctl"
+resolve_case() { # resolve_case <env=...>...: the resolved result, or rc=1
+    ( unset MSS_GPU_PERCENT OLLAMA_GPU_PERCENT MSS_DOCKER_AUTOSTART MSS_DOCKER_INSTALL \
+          MSS_POWER_AUTORESTART DOCKER_AUTOSTART MSS_ENVFILE_LOADED MSS_CHOICES_RESOLVED
+      for _a in "$@"; do export "${_a?}"; done
+      mss_choices_resolve 2>/dev/null || { echo rc=1; return 0; }
+      printf 'GPU=%s DA=%s DI=%s LEG=%s\n' "${MSS_GPU_PERCENT:-unset}" \
+          "${MSS_DOCKER_AUTOSTART:-unset}" "${MSS_DOCKER_INSTALL:-unset}" "${OLLAMA_GPU_PERCENT:-unset}" )
+}
+check "resolver: both GPU keys unset" "GPU=unset DA=unset DI=unset LEG=unset" "$(resolve_case)"
+check "resolver: MSS_GPU_PERCENT alone" "GPU=85 DA=unset DI=unset LEG=unset" "$(resolve_case MSS_GPU_PERCENT=85)"
+check "resolver: same values, legacy unset after" "GPU=80 DA=unset DI=unset LEG=unset" "$(resolve_case MSS_GPU_PERCENT=80 OLLAMA_GPU_PERCENT=80)"
+OUT=$(resolve_case OLLAMA_GPU_PERCENT=80); check "resolver: legacy alone migrates, legacy unset after" "GPU=80 DA=unset DI=unset LEG=unset" "$OUT"
+( unset MSS_GPU_PERCENT MSS_ENVFILE_LOADED MSS_CHOICES_RESOLVED OLLAMA_GPU_PERCENT
+  export OLLAMA_GPU_PERCENT=80; mss_choices_resolve >/dev/null 2>"$TMP/h27/dep-env.err" )
+grep -q 'OLLAMA_GPU_PERCENT is deprecated; using it as MSS_GPU_PERCENT=80. Set MSS_GPU_PERCENT instead.' "$TMP/h27/dep-env.err" \
+    && ok "resolver: the environment notice names where to set it" || fail "env notice: $(cat "$TMP/h27/dep-env.err")"
+( unset MSS_GPU_PERCENT MSS_ENVFILE_LOADED MSS_CHOICES_RESOLVED OLLAMA_GPU_PERCENT
+  export OLLAMA_GPU_PERCENT=80 MSS_ENVFILE_LOADED=' OLLAMA_GPU_PERCENT '; mss_choices_resolve >/dev/null 2>"$TMP/h27/dep-file.err" )
+grep -q 'OLLAMA_GPU_PERCENT is deprecated; using it as MSS_GPU_PERCENT=80. Rename it in backends.env' "$TMP/h27/dep-file.err" \
+    && ok "resolver: the file notice names backends.env" || fail "file notice: $(cat "$TMP/h27/dep-file.err")"
+( unset MSS_ENVFILE_LOADED MSS_CHOICES_RESOLVED
+  export MSS_GPU_PERCENT=85 OLLAMA_GPU_PERCENT=80
+  mss_choices_resolve 2>"$TMP/h27/conf.err" ) && _crc=0 || _crc=1
+check "resolver: a conflict exits 1" 1 "$_crc"
+grep -q 'MSS_GPU_PERCENT=85 (environment) and OLLAMA_GPU_PERCENT=80 (environment) differ; keep one' "$TMP/h27/conf.err" \
+    && ok "conflict names both keys and their sources" || fail "conflict: $(cat "$TMP/h27/conf.err")"
+check "resolver: DOCKER_AUTOSTART=true sets both" "GPU=unset DA=yes DI=yes LEG=unset" "$(resolve_case DOCKER_AUTOSTART=true)"
+check "resolver: true against autostart=no is a conflict" "rc=1" "$(resolve_case DOCKER_AUTOSTART=true MSS_DOCKER_AUTOSTART=no)"
+check "resolver: DOCKER_AUTOSTART=false is ignored" "GPU=unset DA=unset DI=unset LEG=unset" "$(resolve_case DOCKER_AUTOSTART=false)"
+check "resolver: any other DOCKER_AUTOSTART exits 1" "rc=1" "$(resolve_case DOCKER_AUTOSTART=maybe)"
+for bad in 0 101 08 080 8O ' 80'; do
+    ( unset MSS_ENVFILE_LOADED MSS_SYSCTL_MODE; MSS_GPU_PERCENT="$bad" MSS_SYSCTL="$TMP/h27stub/sysctl" mss_choices_check_format >/dev/null 2>&1 ) \
+        && fail "format accepts '$bad'" || ok "format rejects '$bad'"
+done
+for good in 1 80 100 system; do
+    ( unset MSS_ENVFILE_LOADED; MSS_GPU_PERCENT="$good" MSS_SYSCTL="$TMP/h27stub/sysctl" mss_choices_check_format >/dev/null 2>&1 ) \
+        && ok "format accepts $good" || fail "format accepts $good"
+done
+for bad in Yes true maybe; do
+    for k in MSS_DOCKER_INSTALL MSS_DOCKER_AUTOSTART MSS_POWER_AUTORESTART; do
+        ( export "$k=$bad"; MSS_GPU_PERCENT= MSS_SYSCTL="$TMP/h27stub/sysctl" mss_choices_check_format >/dev/null 2>&1 ) \
+            && fail "$k accepts $bad" || ok "$k rejects $bad"
+    done
+done
+OUT=$( (unset MSS_ENVFILE_LOADED; MSS_SYSCTL_MODE=fail MSS_GPU_PERCENT=80 MSS_SYSCTL="$TMP/h27stub/sysctl" mss_choices_check_format 2>&1) ) \
+    && fail 'a Mac with no iogpu key accepted a number' \
+    || { printf '%s' "$OUT" | grep -q 'no iogpu.wired_limit_mb; use MSS_GPU_PERCENT=system' && ok 'no iogpu key refuses a number' || fail "iogpu message: $OUT"; }
+check "MSS_DOCKER_JOB_PATH equals the colima plist PATH" \
+    "$(sed -n 's|.*<string>\(/usr/local/bin[^<]*\)</string>.*|\1|p' "$ROOT/config/com.colima.daemon.plist" | head -n 1)" "$MSS_DOCKER_JOB_PATH"
+# A1 validation rows: Docker tools against the boot job's PATH, the root rules
+# and the power setting. The caller's PATH drops every directory holding a real
+# colima or docker, so the runner's own tools cannot change a row's answer.
+V=$TMP/h27v; mkdir -p "$V/job-both" "$V/job-none" "$V/elsewhere" "$V/root" "$V/brew"
+cp "$ROOT/tests/stubs/colima" "$ROOT/tests/stubs/docker" "$V/job-both/"; cp "$ROOT/tests/stubs/colima" "$V/elsewhere/"
+cp "$ROOT/tests/stubs/brew" "$V/brew/"
+printf '#!/bin/sh\n[ "${1:-}" = -u ] && { echo 0; exit 0; }\nexec /usr/bin/id "$@"\n' > "$V/root/id"
+chmod +x "$V"/*/*
+V_PATH=$(printf '%s\n' "$PATH" | tr ':' '\n' | while IFS= read -r _d; do
+    [ -n "$_d" ] || continue; [ -x "$_d/colima" ] || [ -x "$_d/docker" ] || printf '%s:' "$_d"; done)
+V_PATH=${V_PATH%:}
+validate_case() { # validate_case <job-dir> <extra-path> <env=...>...: rc=N, then the error
+    _vjob=$1; _vpath=$2; shift 2
+    ( unset MSS_GPU_PERCENT MSS_DOCKER_INSTALL MSS_DOCKER_AUTOSTART MSS_POWER_AUTORESTART OLLAMA_USER
+      export MSS_DOCKER_JOB_PATH="$V/$_vjob" MSS_STUB_LOG="$V/stub.log" MSS_STUB_STATE="$V" \
+          MSS_PMSET="$ROOT/tests/stubs/pmset-autorestart-0" PATH="${_vpath:+$_vpath:}${V_PATH:-$PATH}"
+      while [ "$#" -gt 0 ]; do export "${1?}"; shift; done
+      _verr=$(mss_choices_validate 2>&1); echo "rc=$?"; printf '%s\n' "$_verr" )
+}
+check "A1 DI=yes with the tools missing and Homebrew present passes" "rc=0" \
+    "$(validate_case job-none "$V/brew" MSS_DOCKER_INSTALL=yes | head -n 1)"
+check "A1 DI=yes as root with a tool missing exits 1" "rc=1
+ERROR: MSS_DOCKER_INSTALL=yes: run install.sh as your user; Homebrew refuses root" \
+    "$(validate_case job-none "$V/root:$V/brew" MSS_DOCKER_INSTALL=yes)"
+check "A1 DI=yes as root with both tools present passes" "rc=0" \
+    "$(validate_case job-both "$V/root" MSS_DOCKER_INSTALL=yes | head -n 1)"
+check "A1 DA=yes as root without OLLAMA_USER exits 1" "rc=1
+ERROR: MSS_DOCKER_AUTOSTART=yes needs a non-root user: run install.sh as your user or set OLLAMA_USER" \
+    "$(validate_case job-both "$V/root" MSS_DOCKER_AUTOSTART=yes)"
+check "A1 DA=yes as root with OLLAMA_USER passes" "rc=0" \
+    "$(validate_case job-both "$V/root" MSS_DOCKER_AUTOSTART=yes OLLAMA_USER=someone | head -n 1)"
+check "A1 DA=yes with the tools missing and DI unset exits 1" "rc=1
+ERROR: MSS_DOCKER_AUTOSTART=yes needs Colima and the Docker CLI; set MSS_DOCKER_INSTALL=yes or install them" \
+    "$(validate_case job-none "" MSS_DOCKER_AUTOSTART=yes)"
+check "A1 DA=yes with DI=yes and the tools missing passes" "rc=0" \
+    "$(validate_case job-none "$V/brew" MSS_DOCKER_AUTOSTART=yes MSS_DOCKER_INSTALL=yes | head -n 1)"
+for k in MSS_DOCKER_INSTALL MSS_DOCKER_AUTOSTART; do
+    check "A1 $k=yes with colima outside the job's PATH exits 1" "rc=1
+ERROR: colima is at $V/elsewhere/colima, outside the boot job's PATH; move or link it into /opt/homebrew/bin or /usr/local/bin" \
+        "$(validate_case job-none "$V/elsewhere:$V/brew" "$k=yes")"
+done
+check "A1 DI=no with colima outside the job's PATH passes" "rc=0" \
+    "$(validate_case job-none "$V/elsewhere" MSS_DOCKER_INSTALL=no | head -n 1)"
+check "A1 power set on a Mac without the setting exits 1" "rc=1
+ERROR: this Mac has no restart-after-power-failure setting; unset MSS_POWER_AUTORESTART" \
+    "$(validate_case job-none "" MSS_POWER_AUTORESTART=yes MSS_PMSET="$ROOT/tests/stubs/pmset-none")"
+check "A1 power set on a Mac with the setting passes" "rc=0" \
+    "$(validate_case job-none "" MSS_POWER_AUTORESTART=no | head -n 1)"
+check "A1 validation never runs brew, colima or docker" "" "$(cat "$V/stub.log" 2>/dev/null)"
+
+
+echo "== phase A: #27 D2 backends.env keys =="
+# mss_envfile_check_file guards ownership and mode with BSD `stat -f`. For this
+# block `stat` is the stat-bsd stub, which answers on Linux and steps aside on
+# macOS, so the parser and writer rows run on every runner.
+stat() { "$ROOT/tests/stubs/stat-bsd" "$@"; }
+mkdir -p "$TMP/h27"
+EFH="$TMP/h27/legacy.env"
+printf 'MSS_BACKENDS=ds4\nOLLAMA_GPU_PERCENT=80\n' > "$EFH"; chmod 600 "$EFH"
+OUT=$( (unset MSS_BACKENDS MSS_GPU_PERCENT OLLAMA_GPU_PERCENT MSS_ENVFILE_LOADED
+        mss_envfile_load "$EFH" >/dev/null 2>&1 && printf 'file=%s loaded=%s' "${OLLAMA_GPU_PERCENT:-unset}" "$MSS_ENVFILE_LOADED") 2>/dev/null )
+check "the legacy key still loads and is recorded as loaded" "file=80 loaded= MSS_BACKENDS OLLAMA_GPU_PERCENT" "$OUT"
+EFH2="$TMP/h27/out.env"
+( export MSS_BACKENDS=ds4 MSS_GPU_PERCENT=80; unset OLLAMA_GPU_PERCENT; mss_envfile_write "$EFH2" ) >/dev/null 2>&1
+grep -q '^MSS_GPU_PERCENT=80$' "$EFH2" && ! grep -q OLLAMA_GPU_PERCENT "$EFH2" \
+    && ok "mss_envfile_write writes the new key and never the legacy" || fail "write: $(cat "$EFH2" 2>/dev/null)"
+# OLLAMA_BIN belongs to Ollama: a save without Ollama selected drops it, so a
+# binary removed on purpose cannot fail the next run's validation.
+for _sel in ds4 llamacpp ollama,ds4 ollama; do
+    ( export MSS_BACKENDS=$_sel OLLAMA_BIN=/opt/homebrew/bin/ollama; mss_envfile_write "$TMP/h27/bin-$_sel.env" ) >/dev/null 2>&1
+done
+check "the writer drops OLLAMA_BIN for ds4 and llamacpp, keeps it with ollama" "0 0 1 1" \
+    "$(for _sel in ds4 llamacpp ollama,ds4 ollama; do grep -c '^OLLAMA_BIN=/opt/homebrew/bin/ollama$' "$TMP/h27/bin-$_sel.env"; done | tr '\n' ' ' | sed 's/ $//')"
+# A file OLLAMA_GPU_PERCENT beside an environment MSS_GPU_PERCENT: the loader
+# exports both names, so the resolver can compare them (the conflict row below).
+OUT=$( (unset MSS_GPU_PERCENT OLLAMA_GPU_PERCENT MSS_ENVFILE_LOADED MSS_CHOICES_RESOLVED; \
+        export MSS_GPU_PERCENT=85; mss_envfile_load "$EFH" >/dev/null 2>&1
+        printf '%s|%s|%s' "${MSS_GPU_PERCENT}" "${OLLAMA_GPU_PERCENT:-unset}" "$MSS_ENVFILE_LOADED") 2>/dev/null )
+check "the loader exports the file's legacy key beside an environment MSS_GPU_PERCENT" "85|80| MSS_BACKENDS OLLAMA_GPU_PERCENT" "$OUT"
+# The legacy key in both places: the environment wins, as for every other key,
+# and the resolver names the environment as the source.
+OUT=$( (unset MSS_GPU_PERCENT OLLAMA_GPU_PERCENT MSS_ENVFILE_LOADED MSS_ENVFILE_OVERRIDDEN MSS_CHOICES_RESOLVED
+        export OLLAMA_GPU_PERCENT=85; mss_envfile_load "$EFH" >/dev/null 2>&1
+        printf '%s|%s|' "$OLLAMA_GPU_PERCENT" "$MSS_ENVFILE_OVERRIDDEN"
+        mss_choices_resolve 2>&1 >/dev/null) 2>/dev/null )
+check "an environment OLLAMA_GPU_PERCENT beats the file's" \
+    "85| OLLAMA_GPU_PERCENT|OLLAMA_GPU_PERCENT is deprecated; using it as MSS_GPU_PERCENT=85. Set MSS_GPU_PERCENT instead." "$OUT"
+OUT=$( (unset MSS_GPU_PERCENT OLLAMA_GPU_PERCENT MSS_DOCKER_AUTOSTART MSS_DOCKER_INSTALL \
+          MSS_POWER_AUTORESTART DOCKER_AUTOSTART MSS_ENVFILE_LOADED MSS_ENVFILE_OVERRIDDEN MSS_CHOICES_RESOLVED
+        export MSS_BACKENDS=ds4 MSS_GPU_PERCENT=85
+        mss_envfile_load "$EFH" >/dev/null 2>&1 && mss_choices_resolve) 2>&1 )
+printf '%s' "$OUT" | grep -q 'differ; keep one' \
+    && ok "a legacy file key against a new env key is a conflict" || fail "conflict row: $OUT"
+HS1=$(mss_shasum256 "$EFH" | awk '{print $1}')
+( export MSS_BACKENDS=ds4; mss_envfile_load "$EFH" >/dev/null 2>&1 ) ; HS2=$(mss_shasum256 "$EFH" | awk '{print $1}')
+check "loaded mode never writes the file" "$HS1" "$HS2"
+printf 'MSS_BACKENDS=ollama\nMSS_PMSET=/bin/true\n' > "$TMP/h27/hook.env"; chmod 600 "$TMP/h27/hook.env"
+check_fail "the parser refuses a test-only hook key" mss_envfile_load "$TMP/h27/hook.env"
+# A test hook outside a test sysroot must not redirect a real call: with the
+# sysroot unset, mss-host.sh uses /usr/sbin/sysctl however MSS_SYSCTL is set.
+( unset MSS_TEST_SYSROOT; export MSS_SYSCTL="$ROOT/tests/stubs/sysctl-state"
+  . "$ROOT/scripts/lib/mss-common.sh"; . "$ROOT/scripts/lib/mss-host.sh"
+  _mss_sysctl -n hw.memsize 2>/dev/null ) > "$TMP/h27/hook-off.out" 2>&1
+grep -q 137438953472 "$TMP/h27/hook-off.out" \
+    && fail "a stray MSS_SYSCTL redirected a call with no sysroot" \
+    || ok "a stray MSS_SYSCTL is ignored outside a sysroot"
+( export MSS_TEST_SYSROOT=$TMP/h27 MSS_SYSCTL="$ROOT/tests/stubs/sysctl-state" MSS_STUB_STATE=$TMP/h27
+  . "$ROOT/scripts/lib/mss-common.sh"; . "$ROOT/scripts/lib/mss-host.sh"
+  [ "$(_mss_sysctl -n hw.memsize)" = 137438953472 ] ) \
+    && ok "MSS_SYSCTL still works inside a sysroot" || fail "MSS_SYSCTL ignored inside a sysroot"
+# mss_host_root_guard is a no-op for a non-root run; CI phase A is never root
+# (checked at the top of this file), so a set sysroot must not stop the run.
+MSS_TEST_SYSROOT=$TMP/h27 mss_host_root_guard && ok "mss_host_root_guard passes a non-root run" || fail "mss_host_root_guard blocked a non-root run"
+# Restored, not merely unset: the apply rows below rely on the exported phase A
+# sysroot, and the test hooks in mss-host.sh are honoured only inside it.
+MSS_TEST_SYSROOT=$TMP/sysroot; export MSS_TEST_SYSROOT
+unset -f stat
+
+
+
+echo "== phase A: #27 D4/D5 apply, D9 status, D10 (phase A, launchctl-state) =="
+# the apply helpers call sudo when not root; MSS_SUDO points them at a shim
+# that runs the command as this user (the picker block reuses the same file).
+mkdir -p "$TMP/nosudo"
+printf '#!/bin/sh\ncase $1 in -v) exit 0 ;; -n) shift ;; esac\nexec "$@"\n' > "$TMP/nosudo/sudo"
+chmod +x "$TMP/nosudo/sudo"
+# HS_STATE and HSD are exported: the #27 blocks define the apply/seed
+# helpers as functions whose bodies run in a command substitution so
+# the caller can read rc. An unexported variable disappears inside that
+# subshell, daemon_dir() then resolves to /Library/LaunchDaemons instead
+# of the phase A sysroot, and the state file and the plist land in
+# different places: every row after the first reads stale.
+export HS_STATE=$TMP/h27e/state
+export HSD="$TMP/sysroot/Library/LaunchDaemons"
+mkdir -p "$HS_STATE" "$HSD"
+# stubs first on PATH, kept after the audit dir; sudo stays the picker's nosudo
+mkdir -p "$TMP/h27e-bin"
+cp "$ROOT/tests/stubs/launchctl-state" "$TMP/h27e-bin/launchctl"
+cp "$ROOT/tests/stubs/sysctl-state" "$TMP/h27e-bin/sysctl"
+cp "$ROOT/tests/stubs/plutil" "$TMP/h27e-bin/plutil"
+chmod +x "$TMP/h27e-bin/"*
+# apply_gpu <env=...>...: the D8 line and any mss_error text, then rc. The
+# 2>&1 merges the two streams in the order they were written — the unset-row
+# migrate note (A10h) and the stuck-row failure (A10e) are stderr-only.
+apply_gpu() {
+    ( export MSS_STUB_STATE=$HS_STATE MSS_SYSCTL="$TMP/h27e-bin/sysctl" MSS_LAUNCHD_TIMEOUT=1 MSS_SUDO=$TMP/nosudo/sudo PATH="$TMP/h27e-bin:$PATH"
+      export MSS_TEST_SYSROOT=$TMP/sysroot
+      while [ "$#" -gt 0 ]; do export "${1?}"; shift; done
+      mss_gpu_apply "${MSS_GPU_PERCENT:-}" 2>&1; echo "rc=$?" )
+}
+# seed_new <percent> <mb>: the rendered plist plus the loaded/runs state. The
+# plist is also copied to the stub's $HS_STATE/plist-<label>, which is where the
+# stub reads the limit from when kickstart asks it to simulate RunAtLoad (a real
+# kickstart is given no path either). Seeded without that copy, the job looks
+# loaded but the stub cannot apply it, and the row fails on the harness.
+seed_new() {
+    mss_gpu_render "$1" "$2" > "$HSD/com.mac-studio-server.gpumemory.plist"
+    cp "$HSD/com.mac-studio-server.gpumemory.plist" "$HS_STATE/plist-com.mac-studio-server.gpumemory"
+    printf 'loaded-com.mac-studio-server.gpumemory\n' > "$HS_STATE/loaded-com.mac-studio-server.gpumemory"
+    echo "$2" > "$HS_STATE/live"
+}
+seed_legacy() { # the legacy job as v1.5.0 installed it, reduced to what is read
+    cat > "$HSD/com.ollama.gpumemory.plist" <<LP
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+    <key>Label</key><string>com.ollama.gpumemory</string>
+    <key>EnvironmentVariables</key><dict>
+        <key>OLLAMA_GPU_PERCENT</key><string>80</string>
+    </dict>
+</dict></plist>
+LP
+    printf 'loaded-com.ollama.gpumemory\n' > "$HS_STATE/loaded-com.ollama.gpumemory"
+}
+rm_gpu() { rm -f "$HSD/com.mac-studio-server.gpumemory.plist" "$HSD/com.ollama.gpumemory.plist" "$HS_STATE"/loaded-com.*gpumemory; }
+
+# (a) identical, loaded, live = MB
+rm_gpu; seed_new 80 104857; : > "$HS_STATE/calls.log"
+OUT=$(apply_gpu MSS_GPU_PERCENT=80)
+check "A10a identical loaded live=MB is unchanged" "GPU memory: 80% (104857 MB), unchanged
+rc=0" "$OUT"
+grep -Eq 'bootstrap|bootout|kickstart' "$HS_STATE/calls.log" && fail "A10a touched launchctl: $(cat "$HS_STATE/calls.log")" || ok "A10a made no launchctl call"
+# (b) identical, loaded, live != MB -> kickstart
+seed_new 80 104857; echo 0 > "$HS_STATE/live"; : > "$HS_STATE/calls.log"
+OUT=$(apply_gpu MSS_GPU_PERCENT=80)
+check "A10b live != MB applies after one kickstart" "GPU memory: 80% (104857 MB), applied
+rc=0" "$OUT"
+check "A10b exactly one kickstart" 1 "$(grep -c 'kickstart system/com.mac-studio-server.gpumemory' "$HS_STATE/calls.log")"
+check "A10b live equals MB now" 104857 "$(cat "$HS_STATE/live")"
+# (c) absent -> write, enable, bootstrap
+rm_gpu; : > "$HS_STATE/calls.log"
+OUT=$(apply_gpu MSS_GPU_PERCENT=80)
+check "A10c absent installs and applies" "GPU memory: 80% (104857 MB), applied
+rc=0" "$OUT"
+cmp -s "$HSD/com.mac-studio-server.gpumemory.plist" "$ROOT/tests/golden/com.mac-studio-server.gpumemory.80.plist" \
+    && ok "A10c the plist equals the golden" || fail "A10c plist differs"
+check "A10c one enable and one bootstrap" "1 1" \
+    "$(grep -c 'enable system/com.mac-studio-server.gpumemory' "$HS_STATE/calls.log") $(grep -c 'bootstrap system' "$HS_STATE/calls.log")"
+# (d) legacy seeded -> legacy removal before the new bootstrap
+rm_gpu; seed_legacy; : > "$HS_STATE/calls.log"
+OUT=$(apply_gpu MSS_GPU_PERCENT=80)
+check "A10d legacy migrates" "GPU memory: 80% (104857 MB), applied
+rc=0" "$OUT"
+_lb=$(grep -n 'bootout system/com.ollama.gpumemory' "$HS_STATE/calls.log" | head -n1 | cut -d: -f1)
+_nb=$(grep -n 'bootstrap system' "$HS_STATE/calls.log" | head -n1 | cut -d: -f1)
+[ -n "$_lb" ] && [ -n "$_nb" ] && [ "$_lb" -lt "$_nb" ] && ok "A10d the legacy bootout precedes the bootstrap" || fail "A10d order: $(cat "$HS_STATE/calls.log")"
+[ ! -e "$HSD/com.ollama.gpumemory.plist" ] && ok "A10d the legacy plist is gone" || fail "A10d legacy plist kept"
+check "A10d exactly one GPU plist remains" 1 "$(ls "$HSD" | grep -c gpumemory)"
+# (e) stuck -> exit 1 with last exit code, plist kept
+rm_gpu; : > "$HS_STATE/calls.log"
+export MSS_SYSCTL_MODE=stuck
+OUT=$(apply_gpu MSS_GPU_PERCENT=80)
+unset MSS_SYSCTL_MODE
+RCline=${OUT##*rc=}
+check "A10e a stuck sysctl exits 1" 1 "$RCline"
+printf '%s' "$OUT" | grep -q 'last exit code' && ok "A10e names the last exit code" || fail "A10e: $OUT"
+[ -e "$HSD/com.mac-studio-server.gpumemory.plist" ] && ok "A10e keeps the plist for the next boot" || fail "A10e plist removed"
+# (f) system with both -> both removed, no sysctl write
+rm_gpu; seed_new 80 104857; seed_legacy; : > "$HS_STATE/calls.log"; echo 104857 > "$HS_STATE/live"
+OUT=$(apply_gpu MSS_GPU_PERCENT=system)
+check "A10f system removes both jobs" "GPU memory: system default from the next boot
+rc=0" "$OUT"
+check "A10f both plists are gone" 0 "$(ls "$HSD" | grep -c gpumemory)"
+check "A10f system never touches the live value" 0 "$(grep -c 'sysctl iogpu' "$HS_STATE/calls.log")"
+# (g) system with none -> no calls, rc 0
+rm_gpu; : > "$HS_STATE/calls.log"
+OUT=$(apply_gpu MSS_GPU_PERCENT=system)
+check "A10g system with nothing installed is a no-op" "GPU memory: system default from the next boot
+rc=0" "$OUT"
+check "A10g no launchctl call" "" "$(grep -E 'bootout|bootstrap' "$HS_STATE/calls.log" || true)"
+# (h) unset with legacy -> no calls + the migrate note
+rm_gpu; seed_legacy; : > "$HS_STATE/calls.log"
+OUT=$(apply_gpu)
+# The migrate note is stderr and the D8 line is stdout; apply_gpu merges them in
+# write order, so the note is part of what this row asserts.
+check "A10h unset leaves the job and notes the legacy" "com.ollama.gpumemory (80%) is left in place. It runs scripts/set-gpu-memory.sh, a file your user can edit, as root at every boot; set MSS_GPU_PERCENT=80 to migrate it.
+GPU memory: left as is
+rc=0" "$OUT"
+check "A10h no launchctl call" "" "$(grep -E 'bootout|bootstrap|kickstart' "$HS_STATE/calls.log" || true)"
+( export MSS_STUB_STATE=$HS_STATE MSS_SYSCTL="$TMP/h27e-bin/sysctl" PATH="$TMP/h27e-bin:$PATH"
+  mss_gpu_apply "" 2>"$TMP/h27e/h.err" >/dev/null )
+grep -q 'as root at every boot' "$TMP/h27e/h.err" && ok "A10h the note names the root-at-boot risk" || fail "A10h note: $(cat "$TMP/h27e/h.err")"
+# (i) unset with nothing -> left as is, no calls
+rm_gpu; : > "$HS_STATE/calls.log"
+OUT=$(apply_gpu)
+check "A10i unset with nothing installed" "GPU memory: left as is
+rc=0" "$OUT"
+check "A10i no calls" "" "$(cat "$HS_STATE/calls.log")"
+
+echo "== phase A: #27 D5 autostart apply, D10, model.sh pre-check =="
+mkdir -p "$TMP/h27f"
+# Every helper here addresses the daemon plist by full path under the phase A
+# sysroot, and every helper that calls into mss-host.sh re-exports
+# MSS_TEST_SYSROOT: the D2 block unset it once, and daemon_dir() falls back to
+# the real /Library/LaunchDaemons when it is empty. A row that silently read the
+# real path reported "off, unchanged" for a job that was plainly installed.
+DA_F="$TMP/sysroot/Library/LaunchDaemons/com.colima.daemon.plist"
+da_apply() { # da_apply <env=...>...
+    ( export MSS_STUB_STATE=$HS_STATE MSS_LAUNCHD_TIMEOUT=1 MSS_SUDO=$TMP/nosudo/sudo PATH="$TMP/h27e-bin:$PATH"
+      export MSS_TEST_SYSROOT=$TMP/sysroot
+      while [ "$#" -gt 0 ]; do export "${1?}"; shift; done
+      mss_docker_autostart_apply 2>&1; echo "rc=$?" )
+}
+# seed_daemon / rm_daemon manage the rendered com.colima.daemon plist for the
+# A11 rows. Both address $DA_F directly rather than resolving daemon_dir(): a
+# helper that called daemon_dir() in the outer scope would pick up whatever
+# sysroot an earlier row had left set and touch the wrong file.
+seed_daemon() {
+    sed "s|<OLLAMA_USER>|$TUSER|g" "$ROOT/config/com.colima.daemon.plist" > "$DA_F"
+    printf 'loaded-com.colima.daemon\n' > "$HS_STATE/loaded-com.colima.daemon"
+    echo 1 > "$HS_STATE/runs-com.colima.daemon"
+}
+rm_daemon() {
+    rm -f "$DA_F" "$HS_STATE/loaded-com.colima.daemon" "$HS_STATE/runs-com.colima.daemon"
+}
+# (a) yes, identical and loaded
+rm_daemon; seed_daemon; : > "$HS_STATE/calls.log"
+OUT=$(da_apply MSS_DOCKER_AUTOSTART=yes USER="$TUSER")
+check "A11a identical loaded job is unchanged" "Docker at boot: on, unchanged
+rc=0" "$OUT"
+grep -Eq 'bootstrap|bootout|kickstart' "$HS_STATE/calls.log" && fail "A11a reloaded the job" || ok "A11a made no launchctl call (constraint 2)"
+check "A11a runs unchanged" 1 "$(cat "$HS_STATE/runs-com.colima.daemon")"
+# (b) yes and absent
+rm_daemon; : > "$HS_STATE/calls.log"
+OUT=$(da_apply MSS_DOCKER_AUTOSTART=yes USER="$TUSER")
+check "A11b absent installs and starts now if stopped" "Docker at boot: on, changed
+rc=0" "$OUT"
+check "A11b one enable and one bootstrap" "1 1" \
+    "$(grep -c 'enable system/com.colima.daemon' "$HS_STATE/calls.log") $(grep -c 'bootstrap system' "$HS_STATE/calls.log")"
+sed "s|<OLLAMA_USER>|$TUSER|g" "$ROOT/config/com.colima.daemon.plist" > "$TMP/h27f/expect-daemon.plist"
+cmp -s "$DA_F" "$TMP/h27f/expect-daemon.plist" && ok "A11b the rendered plist is the template with the user" || fail "A11b render differs"
+# (c) yes and a different plist: bootout, wait, enable, bootstrap in that order
+rm_daemon; printf 'different\n' > "$DA_F"; printf 'loaded-com.colima.daemon\n' > "$HS_STATE/loaded-com.colima.daemon"; : > "$HS_STATE/calls.log"
+OUT=$(da_apply MSS_DOCKER_AUTOSTART=yes USER="$TUSER")
+check "A11c a changed plist reloads" "Docker at boot: on, changed
+rc=0" "$OUT"
+# 1 bootout, w the wait (the print polls after it), 2 enable, 3 bootstrap. awk,
+# not sed: BSD sed rejects the one-line {…} blocks GNU sed accepts.
+_o=$(awk '/bootout system\/com\.colima\.daemon/ { s = 1; printf "1"; next }
+    s && /print system\/com\.colima\.daemon/ { if (l != "w") printf "w"; l = "w"; next }
+    /enable system\/com\.colima\.daemon/ { printf "2"; l = "" }
+    /bootstrap system / { printf "3"; l = "" }' "$HS_STATE/calls.log")
+check "A11c bootout, the wait, enable, bootstrap in order" "1w23" "$_o"
+# (d) yes, identical but not loaded
+rm_daemon; seed_daemon; rm -f "$HS_STATE/loaded-com.colima.daemon"; : > "$HS_STATE/calls.log"
+OUT=$(da_apply MSS_DOCKER_AUTOSTART=yes USER="$TUSER")
+check "A11d identical but unloaded bootstraps" "Docker at boot: on, changed
+rc=0" "$OUT"
+check "A11d no bootout" "" "$(grep bootout "$HS_STATE/calls.log" || true)"
+# (e) no and present: the job is installed, so `no` removes it, and colima is
+# never called. seed_daemon first — "present" has to be true before apply runs.
+rm_daemon; seed_daemon; : > "$TMP/h27f/colima.log"
+OUT=$( (export MSS_STUB_STATE=$HS_STATE MSS_SUDO=$TMP/nosudo/sudo PATH="$TMP/h27e-bin:$PATH" MSS_STUB_LOG="$TMP/h27f/colima.log" MSS_TEST_SYSROOT=$TMP/sysroot; MSS_DOCKER_AUTOSTART=no mss_docker_autostart_apply 2>&1; echo "rc=$?") )
+check "A11e no removes the job" "Docker at boot: off, changed
+rc=0" "$OUT"
+[ ! -e "$DA_F" ] && ok "A11e the plist is gone" || fail "A11e plist kept"
+check "A11e colima was never run (constraint 1)" "" "$(cat "$TMP/h27f/colima.log")"
+# (f) no and absent
+rm_daemon; : > "$HS_STATE/calls.log"
+OUT=$(da_apply MSS_DOCKER_AUTOSTART=no USER="$TUSER")
+check "A11f no with nothing installed" "Docker at boot: off, unchanged
+rc=0" "$OUT"
+check "A11f no calls" "" "$(cat "$HS_STATE/calls.log")"
+# (g) unset
+: > "$HS_STATE/calls.log"
+OUT=$(da_apply USER="$TUSER")
+check "A11g unset leaves the job as it is" "Docker at boot: left as is
+rc=0" "$OUT"
+check "A11g no calls" "" "$(cat "$HS_STATE/calls.log")"
+
+# D7 step 6: brew installs only the missing tools, never upgrade (#27)
+H27G="$TMP/h27g"; mkdir -p "$H27G/tools" "$H27G/jobin"
+cp "$ROOT/tests/stubs/colima" "$ROOT/tests/stubs/docker" "$H27G/jobin/"
+cp "$ROOT/tests/stubs/brew" "$H27G/tools/"   # the "present" run has a brew too
+docker_install_case() { # docker_install_case <tools-present...>: brew calls
+    _have=$1; : > "$H27G/log"
+    rm -f "$H27G/tools"/* "$H27G/jobin"/*
+    cp "$ROOT/tests/stubs/brew" "$H27G/tools/"
+    for _t in $_have; do printf '#!/bin/sh\nexit 0\n' > "$H27G/jobin/$_t"; chmod +x "$H27G/jobin/$_t"; done
+    ( export MSS_STUB_LOG="$H27G/log" MSS_STUB_BREW_PREFIX="$H27G/prefix"
+      MSS_DOCKER_JOB_PATH="$H27G/jobin" PATH="$H27G/tools:$PATH"
+      MSS_DOCKER_INSTALL=yes mss_choices_validate || echo "validate-failed"
+      mss_acquire_docker_brew ) > /dev/null 2>&1
+    grep '^brew ' "$H27G/log" | sed 's/^brew //' | tr '\n' '|'
+}
+check "A7 both present: brew is never called" "" "$(docker_install_case 'colima docker')"
+check "A7 both missing: one install of both" "install colima docker|" "$(docker_install_case '')"
+check "A7 colima missing: only colima" "install colima|" "$(docker_install_case docker)"
+check "A7 docker missing: only docker" "install docker|" "$(docker_install_case colima)"
+grep -E 'upgrade|reinstall|uninstall' "$H27G/log" >/dev/null && fail "A7 brew was asked to upgrade/reinstall" || ok "A7 never upgrade/reinstall/uninstall"
+
+# A7b: the picker's Docker skip. _mss_docker_outside_job_path returns 0 when a
+# tool exists that the boot job cannot reach and 1 when every Docker choice is
+# appliable. Read the wrong way round it dropped DI and DA on every ordinary Mac
+# (#27 r3), so both branches are asserted here, not by grepping the source.
+docker_skip_case() { # docker_skip_case <caller-tools>|<job-tools>: "rc" then the keys
+    _have=$1
+    rm -f "$H27G/tools"/* "$H27G/jobin"/*
+    # <caller-tools> go on the caller's PATH only, <job-tools> on the boot job's
+    # PATH. A tool the caller can run that the job cannot is the conflict that
+    # skips both questions; with every tool on the job PATH nothing is skipped.
+    # Nothing is put on the caller's PATH in the second case, so the two states
+    # are distinguishable: one skips, the other asks.
+    _outside=${_have%%|*}; _inj=${_have#*|}
+    for _t in $_inj; do
+        printf '#!/bin/sh\nexit 0\n' > "$H27G/jobin/$_t"; chmod +x "$H27G/jobin/$_t"
+        printf '#!/bin/sh\nexit 0\n' > "$H27G/tools/$_t"; chmod +x "$H27G/tools/$_t"
+    done
+    for _t in $_outside; do
+        [ -f "$H27G/tools/$_t" ] && continue
+        printf '#!/bin/sh\nexit 0\n' > "$H27G/tools/$_t"; chmod +x "$H27G/tools/$_t"
+    done
+    ( export MSS_DOCKER_JOB_PATH="$H27G/jobin" PATH="$H27G/tools:$PATH"
+      unset MSS_DOCKER_INSTALL MSS_DOCKER_AUTOSTART
+      . "$ROOT/scripts/lib/mss-common.sh"; . "$ROOT/scripts/lib/mss-acquire.sh"
+      . "$ROOT/scripts/lib/mss-run.sh"; . "$ROOT/scripts/lib/mss-host.sh"
+      . "$ROOT/scripts/lib/mss-picker.sh"
+      # mss_ask_yn stands in for the terminal: every question is answered yes.
+      mss_ask_yn() { MSS_ANSWER=y; return 0; }
+      mss_ask() { MSS_ANSWER="$2"; return 0; }
+      _mss_pick_docker_install 2>"$H27G/skip.err"; echo "rc=$?"
+      printf 'DI=%s DA=%s\n' "${MSS_DOCKER_INSTALL:-unset}" "${MSS_DOCKER_AUTOSTART:-unset}" )
+}
+# colima is reachable by the caller but not the job: skip both questions.
+OUT=$(docker_skip_case "colima|docker")
+printf '%s' "$OUT" | grep -q 'rc=1' \
+    && ok "A7b the skip returns 1 so DA is not asked either" \
+    || fail "A7b skip rc: $OUT"
+check "A7b the skip names the tool and its path (D1)" \
+    "colima is at $H27G/tools/colima, outside the boot job's PATH; move or link it into /opt/homebrew/bin or /usr/local/bin" \
+    "$(cat "$H27G/skip.err")"
+check "A7b the skip leaves both keys unset" "DI=unset DA=unset" "$(printf '%s\n' "$OUT" | tail -n 1)"
+# Both tools are on the job PATH: nothing is skipped and DI is asked.
+OUT=$(docker_skip_case "|colima docker")
+grep -q "outside the boot job's PATH" "$H27G/skip.err" \
+    && fail "A7b skipped on an ordinary Mac" || ok "A7b an ordinary Mac is not skipped"
+# Nothing is missing here, so DI prints its own line and sets nothing — the
+# point of the row is that the skip did not fire and DI ran to its end.
+check "A7b the ordinary path reports both tools installed" \
+    "Colima and the Docker CLI are installed" "$(cat "$H27G/skip.err")"
+check "A7b the ordinary path returns 0" "0" "$(printf '%s\n' "$OUT" | grep -o 'rc=[0-9]*' | cut -d= -f2)"
+
+echo "== phase A: #27 D10 mss_gpu_jobs_remove =="
+rm_gpu; seed_new 80 104857; seed_legacy; : > "$HS_STATE/calls.log"
+( export MSS_STUB_STATE=$HS_STATE MSS_SUDO=$TMP/nosudo/sudo PATH="$TMP/h27e-bin:$PATH" MSS_TEST_SYSROOT=$TMP/sysroot; mss_gpu_jobs_remove ) && _rc=0 || _rc=1
+check "A14a both GPU jobs are removed" 0 "$_rc"
+check "A14a one bootout per label" "1 1" \
+    "$(grep -c 'bootout system/com.mac-studio-server.gpumemory' "$HS_STATE/calls.log") $(grep -c 'bootout system/com.ollama.gpumemory' "$HS_STATE/calls.log")"
+check "A14a both plists are gone" 0 "$(ls "$HSD" | grep -c gpumemory)"
+: > "$HS_STATE/calls.log"
+( export MSS_STUB_STATE=$HS_STATE MSS_SUDO=$TMP/nosudo/sudo PATH="$TMP/h27e-bin:$PATH" MSS_TEST_SYSROOT=$TMP/sysroot; mss_gpu_jobs_remove ) && _rc=0 || _rc=1
+check "A14b removing nothing makes no launchctl call" 0 "$_rc"
+check "A14b calls.log stays empty" "" "$(cat "$HS_STATE/calls.log")"
+
+echo "== phase A: #27 D4b model.sh GPU pre-check =="
+# precheck_case <MSS_GPU_PERCENT>: "rc=N" plus the message. mss_error writes to
+# stderr, so the 2>&1 is what makes the wording assertable. MSS_TEST_SYSROOT is
+# re-exported because the rows below unset it once in the D2 block, and the
+# pre-check resolves plists through daemon_dir().
+precheck_case() {
+    ( export MSS_STUB_STATE=$HS_STATE MSS_SUDO=$TMP/nosudo/sudo PATH="$TMP/h27e-bin:$PATH"
+      export MSS_TEST_SYSROOT=$TMP/sysroot
+      MSS_GPU_PERCENT="$1" mss_gpu_job_precheck 2>&1; echo "rc=$?" )
+}
+rm_gpu; seed_new 80 104857
+check "precheck: matching job passes" "rc=0" "$(precheck_case 80)"
+# A job that records 80 while backends.env asks for 85: seeding the same value
+# the row asks for would make the pre-check pass, and the row would assert a
+# mismatch that never existed.
+rm_gpu; mss_gpu_render 80 104857 > "$HSD/com.mac-studio-server.gpumemory.plist"
+printf 'loaded-com.mac-studio-server.gpumemory\n' > "$HS_STATE/loaded-com.mac-studio-server.gpumemory"
+OUT=$(precheck_case 85)
+printf '%s' "$OUT" | grep -q 'the boot job applies 80; run scripts/install.sh first' \
+    && check "precheck: a differing job exits 1" 1 "${OUT##*rc=}" || fail "precheck mismatch: $OUT"
+rm_gpu; seed_legacy
+OUT=$(precheck_case 80)
+printf '%s' "$OUT" | grep -q 'still com.ollama.gpumemory; run scripts/install.sh first to migrate it' \
+    && check "precheck: legacy only exits 1" 1 "${OUT##*rc=}" || fail "precheck legacy: $OUT"
+rm_gpu
+OUT=$(precheck_case 80)
+printf '%s' "$OUT" | grep -q 'needs com.mac-studio-server.gpumemory; run scripts/install.sh first' \
+    && check "precheck: no job exits 1" 1 "${OUT##*rc=}" || fail "precheck none: $OUT"
+check "precheck: system runs no pre-check" "rc=0" "$(precheck_case system)"
+check "precheck: unset runs no pre-check" "rc=0" "$(precheck_case '')"
+rm_gpu; printf 'garbage\n' > "$HSD/com.mac-studio-server.gpumemory.plist"
+OUT=$(precheck_case 80)
+printf '%s' "$OUT" | grep -q 'cannot read com.mac-studio-server.gpumemory; run scripts/install.sh' \
+    && check "precheck: an unreadable plist exits 1" 1 "${OUT##*rc=}" || fail "precheck unreadable: $OUT"
+rm_gpu
+
+echo "== phase A: #27 A12 D8 variants, A13 D9 exit codes, A14/A15 pins =="
+# A12: every D8 variant string must be produced by at least one scenario in this
+# file. The variants are listed here and matched exactly, so a variant that no
+# row reaches is a failure rather than a silent gap.
+# GPU (D4 apply + D3 summary share the classifier, so both wordings are checked).
+gpu_line() { # gpu_line <percent> <env...>: the D8 line
+    ( export MSS_STUB_STATE=$HS_STATE MSS_SYSCTL="$TMP/h27e-bin/sysctl" \
+          MSS_LAUNCHD_TIMEOUT=1 MSS_SUDO=$TMP/nosudo/sudo PATH="$TMP/h27e-bin:$PATH" \
+          MSS_TEST_SYSROOT=$TMP/sysroot
+      while [ "$#" -gt 0 ]; do export "${1?}"; shift; done
+      mss_gpu_apply "${MSS_GPU_PERCENT:-}" 2>/dev/null )
+}
+rm_gpu; seed_new 80 104857; echo 104857 > "$HS_STATE/live"
+check "A12 gpu unchanged line" "GPU memory: 80% (104857 MB), unchanged" "$(gpu_line MSS_GPU_PERCENT=80)"
+rm_gpu; seed_new 80 104857; echo 0 > "$HS_STATE/live"
+check "A12 gpu applied line" "GPU memory: 80% (104857 MB), applied" "$(gpu_line MSS_GPU_PERCENT=80)"
+rm_gpu; seed_new 80 104857
+check "A12 gpu system-default line" "GPU memory: system default from the next boot" "$(gpu_line MSS_GPU_PERCENT=system)"
+rm_gpu
+check "A12 gpu left-as-is line" "GPU memory: left as is" "$(gpu_line)"
+rm_gpu
+# Power (D6): every variant, each on its own state directory. power_case emits
+# the D8 line and then an rc line, so the first line is the variant.
+check "A12 power on, changed" "Restart after power failure: on, changed" \
+    "$(power_case pmset-autorestart-0 MSS_POWER_AUTORESTART=yes | head -n 1)"
+check "A12 power on, unchanged" "Restart after power failure: on, unchanged" \
+    "$(power_case pmset-autorestart-1 MSS_POWER_AUTORESTART=yes | head -n 1)"
+check "A12 power off, changed" "Restart after power failure: off, changed" \
+    "$(power_case pmset-autorestart-1 MSS_POWER_AUTORESTART=no | head -n 1)"
+check "A12 power left as is (off)" "Restart after power failure: left as is (off)" \
+    "$(power_case pmset-autorestart-0 | head -n 1)"
+check "A12 power left as is (on)" "Restart after power failure: left as is (on)" \
+    "$(power_case pmset-autorestart-1 | head -n 1)"
+check "A12 power left as is (unsupported)" "Restart after power failure: left as is (unsupported)" \
+    "$(power_case pmset-none | head -n 1)"
+
+# Docker install (D5) and Docker at boot (D5): the four install variants and the
+# five autostart variants come from the classifier, asserted directly.
+dk_line() { # dk_line <install-answer> <seed...>: the D8 install line. <seed>
+    # tools are placed on the boot job's PATH before the call, so "already
+    # installed" is a seeded state and "installed colima docker" is the run that
+    # found nothing there.
+    _ans=$1; shift
+    rm -f "$H27G/jobin"/*
+    for _t in "$@"; do printf '#!/bin/sh\nexit 0\n' > "$H27G/jobin/$_t"; chmod +x "$H27G/jobin/$_t"; done
+    cp "$ROOT/tests/stubs/brew" "$H27G/tools/brew"; chmod +x "$H27G/tools/brew"
+    : > "$H27G/log"
+    ( export MSS_STUB_LOG="$H27G/log" MSS_STUB_BREW_PREFIX="$H27G/prefix" \
+          MSS_STUB_STATE=$HS_STATE MSS_SUDO=$TMP/nosudo/sudo \
+          MSS_DOCKER_INSTALL=$_ans MSS_DOCKER_JOB_PATH="$H27G/jobin" \
+          PATH="$H27G/tools:$TMP/h27e-bin:$PATH"
+      mss_docker_install_apply )
+}
+rm -f "$H27G/tools"/*
+check "A12 docker install not requested" "Docker install: not requested" "$(dk_line '' )"
+check "A12 docker install installed both" "Docker install: installed colima docker" \
+    "$(dk_line yes)"
+check "A12 docker install installed colima only" "Docker install: installed colima" \
+    "$(dk_line yes docker)"
+check "A12 docker install already installed" "Docker install: already installed" \
+    "$(dk_line yes colima docker)"
+da_line() { # da_line <env...>: the autostart line
+    ( export MSS_STUB_STATE=$HS_STATE MSS_SUDO=$TMP/nosudo/sudo PATH="$TMP/h27e-bin:$PATH" \
+          MSS_TEST_SYSROOT=$TMP/sysroot
+      while [ "$#" -gt 0 ]; do export "${1?}"; shift; done
+      mss_docker_autostart_apply )
+}
+check "A12 docker at boot left as is" "Docker at boot: left as is" "$(da_line MSS_DOCKER_AUTOSTART=)"
+rm_daemon; seed_daemon
+check "A12 docker at boot on, unchanged" "Docker at boot: on, unchanged" "$(da_line MSS_DOCKER_AUTOSTART=yes)"
+rm_daemon; printf 'different\n' > "$DA_F"
+check "A12 docker at boot on, changed" "Docker at boot: on, changed" "$(da_line MSS_DOCKER_AUTOSTART=yes)"
+rm_daemon
+check "A12 docker at boot off, unchanged" "Docker at boot: off, unchanged" "$(da_line MSS_DOCKER_AUTOSTART=no)"
+rm_daemon; printf 'different\n' > "$DA_F"; printf 'loaded-com.colima.daemon\n' > "$HS_STATE/loaded-com.colima.daemon"
+check "A12 docker at boot off, changed" "Docker at boot: off, changed" "$(da_line MSS_DOCKER_AUTOSTART=no)"
+rm_daemon
+
+# A13: the D9 exit code, pinned on every runner. The Ollama service is stubbed
+# healthy (launchctl-state marks it loaded, a curl stub answers 200), so the only
+# thing that changes between rows is the GPU state, and the code is asserted.
+mkdir -p "$TMP/h27a" "$TMP/h27s-bin"
+printf 'MSS_BACKENDS=ollama\n' > "$TMP/h27a/ollama.conf"
+printf '#!/bin/sh\nprintf 200\n' > "$TMP/h27s-bin/curl"; chmod +x "$TMP/h27s-bin/curl"
+status_run() { # status_run [env=...]: status.sh output, then rc=N
+    ( export MSS_TEST_SYSROOT=$TMP/sysroot MSS_STUB_STATE=$HS_STATE \
+          MSS_SYSCTL="$TMP/h27e-bin/sysctl" MSS_PMSET="$ROOT/tests/stubs/pmset-autorestart-0" \
+          PATH="$TMP/h27s-bin:$TMP/h27e-bin:$PATH" MSS_CONF="$TMP/h27a/ollama.conf"
+      while [ "$#" -gt 0 ]; do export "${1?}"; shift; done
+      sh "$ROOT/scripts/status.sh" 2>&1; echo "rc=$?" )
+}
+status_rc() { _sr=$(status_run "$@"); echo "${_sr##*rc=}"; }
+status_gpu_line() { status_run "$@" | grep 'gpu memory' || true; }
+: > "$HS_STATE/loaded-com.ollama.service"
+rm_gpu; seed_new 80 104857; echo 104857 > "$HS_STATE/live"
+check "A13 live = MB exits 0" 0 "$(status_rc)"
+printf '%s' "$(status_gpu_line)" | grep -q '80% (104857 MB), live 104857 MB' \
+    && ok "A13 live = MB is healthy" || fail "A13 healthy: $(status_gpu_line)"
+rm_gpu; seed_new 80 104857; echo 0 > "$HS_STATE/live"
+check "A13 live != MB exits 1" 1 "$(status_rc)"
+printf '%s' "$(status_gpu_line)" | grep -q 'wants 104857 MB, live 0 MB' \
+    && ok "A13 live != MB is unhealthy" || fail "A13 live: $(status_gpu_line)"
+rm_gpu; seed_new 80 104857; seed_legacy
+check "A13 both labels exit 1" 1 "$(status_rc)"
+printf '%s' "$(status_gpu_line)" | grep -q 'both GPU boot jobs installed' \
+    && ok "A13 both labels are unhealthy" || fail "A13 both: $(status_gpu_line)"
+rm_gpu; printf 'garbage\n' > "$HSD/com.mac-studio-server.gpumemory.plist"
+check "A13 an unreadable plist exits 1" 1 "$(status_rc)"
+printf '%s' "$(status_gpu_line)" | grep -q 'is unreadable' \
+    && ok "A13 an unreadable plist is unhealthy" || fail "A13 unreadable: $(status_gpu_line)"
+# A recorded percent that is not 1-100 never reaches the arithmetic.
+for bad in 8O 080 101; do
+    rm_gpu; mss_gpu_render "$bad" 104857 > "$HSD/com.mac-studio-server.gpumemory.plist"
+    check "A13 a recorded percent of $bad is unreadable and exits 1" "1 unreadable" \
+        "$(status_rc) $(status_gpu_line | grep -q 'is unreadable' && echo unreadable || status_gpu_line)"
+done
+rm_gpu; seed_legacy; echo 0 > "$HS_STATE/live"
+check "A13 legacy alone exits 0" 0 "$(status_rc)"
+status_run | grep -q 'com.ollama.gpumemory runs a user-editable script as root at boot; re-run install.sh with MSS_GPU_PERCENT to migrate' \
+    && ok "A13 legacy alone prints the migrate note" || fail "A13 legacy: $(status_run)"
+rm_gpu
+check "A13 no job exits 0" 0 "$(status_rc)"
+printf '%s' "$(status_gpu_line)" | grep -q 'system default' \
+    && ok "A13 no job prints system default" || fail "A13 none: $(status_gpu_line)"
+# Docker and power never change the code: no Colima job and no power setting.
+rm_daemon
+check "A13 Docker off with pmset-none keeps exit 0" 0 "$(status_rc MSS_PMSET="$ROOT/tests/stubs/pmset-none")"
+rm_gpu; seed_new 80 104857; echo 0 > "$HS_STATE/live"
+check "A13 Docker off with pmset-none keeps exit 1" 1 "$(status_rc MSS_PMSET="$ROOT/tests/stubs/pmset-none")"
+rm_gpu; rm -f "$HS_STATE/loaded-com.ollama.service"
+
+# A14 static check: uninstall.sh --all must call mss_gpu_jobs_remove and must
+# never touch the Colima boot job.
+grep -A40 '^    all)' "$ROOT/scripts/uninstall.sh" | grep -q 'mss_gpu_jobs_remove' \
+    && ok "A14 the all) branch calls mss_gpu_jobs_remove" \
+    || fail "A14: $(grep -n 'mss_gpu_jobs_remove' "$ROOT/scripts/uninstall.sh")"
+grep -q 'com.colima.daemon' "$ROOT/scripts/uninstall.sh" \
+    && fail "A14 uninstall.sh touches com.colima.daemon" || ok "A14 uninstall.sh never names com.colima.daemon"
+# A15 new pin: install.sh must not use the legacy load/unload verbs for the two
+# new boot jobs. The com.ollama.service lines stay and are out of scope.
+BADLOAD=$(grep -nE 'launchctl +(load|unload)' "$ROOT/scripts/install.sh" \
+    | grep -E 'gpumemory|com\.colima\.daemon' || true)
+[ -z "$BADLOAD" ] && ok "A15 install.sh has no load/unload for the new jobs" || fail "A15: $BADLOAD"
+
+echo "== phase A: #27 A16 model.sh order =="
+# model.sh must resolve and validate before any download or save, and the save
+# must migrate the legacy key. Each row runs the real script with --path and a
+# fixture sha, so the order is proved by what it writes, not by reading it.
+mkdir -p "$TMP/h27m" "$TMP/h27m/sysroot/Library/LaunchDaemons"
+# model.sh reads the env file's owner and mode with BSD `stat -f`.
+mkdir -p "$TMP/h27r/bin-bsd"; cp "$ROOT/tests/stubs/stat-bsd" "$TMP/h27r/bin-bsd/stat"
+chmod +x "$TMP/h27r/bin-bsd/stat"
+MSD="$TMP/h27m/sysroot/Library/LaunchDaemons"
+MSTATE=$TMP/h27m/state; mkdir -p "$MSTATE"
+# model.sh refuses to run without a terminal, so each row drives it on a pty
+# with no prompts expected: every row below must fail before it asks anything.
+model_case() { # model_case <env-file> [env=...]: script output, rc, file body
+    _ef=$1; shift
+    : > "$TMP/h27m/steps"
+    env MSS_TEST_SYSROOT=$TMP/h27m/sysroot MSS_STUB_STATE=$MSTATE \
+        MSS_SYSCTL="$TMP/h27e-bin/sysctl" MSS_SUDO=$TMP/nosudo/sudo \
+        PATH="$TMP/h27r/bin-bsd:$TMP/h27e-bin:$PATH" MSS_ENV_FILE="$_ef" \
+        MSS_IFCONFIG="$ROOT/tests/stubs/ifconfig-lan" "$@" \
+        expect "$ROOT/tests/expect/drive.exp" "$TMP/h27m/steps" "$TMP/h27m/transcript" \
+        /bin/sh "$ROOT/scripts/model.sh" --path "$TMP/fix/llamacpp/model.gguf" \
+        --sha256 "$(cat "$TMP/fix/llamacpp/model.sha")" >/dev/null 2>&1
+    echo "rc=$?"
+    cat "$TMP/h27m/transcript"
+    printf 'BODY:%s\n' "$(grep -v '^#' "$_ef" 2>/dev/null | tr '\n' ' ')"
+}
+# (a) legacy key in the file, new key in the environment: a conflict, and the
+# file is untouched.
+printf 'MSS_BACKENDS=llamacpp\nOLLAMA_GPU_PERCENT=80\n' > "$TMP/h27m/a.env"; chmod 600 "$TMP/h27m/a.env"
+SHA_A=$(mss_shasum256 "$TMP/h27m/a.env" | awk '{print $1}')
+OUT=$(model_case "$TMP/h27m/a.env" MSS_GPU_PERCENT=85)
+printf '%s' "$OUT" | grep -q 'differ; keep one' \
+    && ok "A16a a conflict exits 1 with the conflict line" || fail "A16a: $OUT"
+printf '%s' "$OUT" | grep -q 'Saved' && fail "A16a saved before validating" || ok "A16a nothing was saved"
+SHA_A2=$(mss_shasum256 "$TMP/h27m/a.env" | awk '{print $1}')
+check "A16a the file is unchanged" "$SHA_A" "$SHA_A2"
+# (b) legacy key, legacy plist only: the migrate line, before any save.
+printf 'MSS_BACKENDS=llamacpp\nOLLAMA_GPU_PERCENT=80\n' > "$TMP/h27m/b.env"; chmod 600 "$TMP/h27m/b.env"
+rm -f "$MSD"/*.plist
+cat > "$MSD/com.ollama.gpumemory.plist" <<'LPM'
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>Label</key><string>com.ollama.gpumemory</string>
+<key>EnvironmentVariables</key><dict><key>OLLAMA_GPU_PERCENT</key><string>80</string></dict>
+</dict></plist>
+LPM
+printf 'loaded-com.ollama.gpumemory\n' > "$MSTATE/loaded-com.ollama.gpumemory"
+OUT=$(model_case "$TMP/h27m/b.env")
+printf '%s' "$OUT" | grep -q 'still com.ollama.gpumemory; run scripts/install.sh first to migrate it' \
+    && ok "A16b a legacy job stops model.sh" || fail "A16b: $OUT"
+printf '%s' "$OUT" | grep -q 'Saved' && fail "A16b saved over a legacy job" || ok "A16b nothing was saved"
+# (c) legacy key, new plist recording 80: saves, and migrates the key.
+printf 'MSS_BACKENDS=llamacpp\nOLLAMA_GPU_PERCENT=80\n' > "$TMP/h27m/c.env"; chmod 600 "$TMP/h27m/c.env"
+rm -f "$MSD"/*.plist "$MSTATE"/loaded-com.*gpumemory
+sed "s|<GPU_PERCENT>|80|;s|<WIRED_LIMIT_MB>|104857|" "$ROOT/config/com.mac-studio-server.gpumemory.plist" > "$MSD/com.mac-studio-server.gpumemory.plist"
+printf 'loaded-com.mac-studio-server.gpumemory\n' > "$MSTATE/loaded-com.mac-studio-server.gpumemory"
+OUT=$(model_case "$TMP/h27m/c.env")
+printf '%s' "$OUT" | grep -q 'Saved' \
+    && ok "A16c a matching job lets model.sh save" || fail "A16c: $OUT"
+printf '%s' "$OUT" | grep -q 'BODY:.*MSS_GPU_PERCENT=80' \
+    && ok "A16c the save writes the new key" || fail "A16c body: $OUT"
+printf '%s' "$OUT" | grep -q 'OLLAMA_GPU_PERCENT=80' \
+    && fail "A16c the save kept the legacy key" || ok "A16c the legacy key is dropped by the save"
+# (d) new plist recording 80, file asking 85: the mismatch line, file unchanged.
+printf 'MSS_BACKENDS=llamacpp\nMSS_GPU_PERCENT=85\n' > "$TMP/h27m/d.env"; chmod 600 "$TMP/h27m/d.env"
+SHA_D=$(mss_shasum256 "$TMP/h27m/d.env" | awk '{print $1}')
+OUT=$(model_case "$TMP/h27m/d.env")
+printf '%s' "$OUT" | grep -q 'the boot job applies 80; run scripts/install.sh first' \
+    && ok "A16d a differing job stops model.sh" || fail "A16d: $OUT"
+SHA_D2=$(mss_shasum256 "$TMP/h27m/d.env" | awk '{print $1}')
+check "A16d the file is unchanged" "$SHA_D" "$SHA_D2"
+
+echo "== phase A: #27 r2 entry points (install.sh, install-backends.sh, status.sh) =="
+# Every row above exercises a library function through a stub. Findings 1 to 5
+# of round 2 all passed that suite, because nothing ran the scripts that call
+# these functions. These rows run the real entry points: install.sh end to end
+# against a sysroot, and install-backends.sh's render pass.
+mkdir -p "$TMP/h27r" "$TMP/h27r-bin"
+cp "$ROOT/tests/stubs/launchctl-state" "$TMP/h27r-bin/launchctl"
+cp "$ROOT/tests/stubs/sysctl-state" "$TMP/h27r-bin/sysctl"
+cp "$ROOT/tests/stubs/plutil" "$TMP/h27r-bin/plutil"
+cp "$ROOT/tests/stubs/stat-bsd" "$TMP/h27r-bin/stat"
+cp "$ROOT/tests/stubs/sudo-fail" "$TMP/h27r-bin/sudo-fail"
+chmod +x "$TMP/h27r-bin/"*
+HR_STATE=$TMP/h27r/state
+mkdir -p "$HR_STATE" "$TMP/h27r/sysroot/Library/LaunchDaemons"
+HSD_R="$TMP/h27r/sysroot/Library/LaunchDaemons"
+
+# install_case <log> [env=...]: run install.sh in env mode against a sysroot,
+# with the phase A stubs first on PATH. Ollama is not selected, so the install
+# reaches the D7 apply steps without touching the real service.
+install_case() {
+    _log=$1; shift
+    : > "$_log"; : > "$HR_STATE/calls.log"
+    ( export MSS_TEST_SYSROOT=$TMP/h27r/sysroot MSS_STUB_STATE=$HR_STATE \
+          MSS_LAUNCHD_TIMEOUT=1 MSS_SUDO=$TMP/nosudo/sudo \
+          MSS_SYSCTL="$TMP/h27r-bin/sysctl" PATH="$TMP/h27r-bin:$PATH" \
+          OLLAMA_BASE_DIR="$TMP/h27r/base" HOME="$TMP/h27r/home" \
+          MSS_INSTALL_SANDBOX=1
+      mkdir -p "$TMP/h27r/home"
+      while [ "$#" -gt 0 ]; do export "${1?}"; shift; done
+      sh "$ROOT/scripts/install.sh" ) >"$_log" 2>&1
+    echo "rc=$?" >> "$_log"
+}
+
+# E1: a failing privileged apply step must stop install.sh. Before the fix the
+# step was piped into `tee`, so `|| exit 1` tested tee and the install reported
+# success with the job not installed.
+rm -f "$HSD_R/"*.plist
+install_case "$TMP/h27r/e1.log" MSS_BACKENDS=ollama MSS_GPU_PERCENT=80 \
+    MSS_TUNE_MACOS=no MSS_SUDO=$TMP/h27r-bin/sudo-fail
+RCline=${RCline:=}
+_rc=$(tail -n 1 "$TMP/h27r/e1.log"); _rc=${_rc#rc=}
+check "E1 a failing apply step exits non-zero" 1 "$_rc"
+grep -q 'Installation completed' "$TMP/h27r/e1.log" \
+    && fail "E1 a failed GPU step still reported success" || ok "E1 no 'Installation completed' after a failure"
+grep -q 'mss_gpu_apply failed' "$TMP/h27r/e1.log" \
+    && ok "E1 the failure names the step" || fail "E1 log: $(tail -5 "$TMP/h27r/e1.log")"
+
+# E2: a successful ollama install reaches the report line and installs the job.
+# MSS_INSTALL_SANDBOX redirects the handful of absolute writes in the Ollama
+# service block into the phase A sysroot, so install.sh runs end to end here.
+rm -f "$HSD_R/"*.plist; echo 0 > "$HR_STATE/live"
+install_case "$TMP/h27r/e2.log" MSS_BACKENDS=ollama MSS_GPU_PERCENT=80 \
+    MSS_TUNE_MACOS=no
+check "E2 an ollama install exits 0" "rc=0" "$(tail -n 1 "$TMP/h27r/e2.log")"
+[ -f "$HSD_R/com.mac-studio-server.gpumemory.plist" ] \
+    && ok "E2 the GPU job is installed" || fail "E2 no GPU plist: $(cat "$TMP/h27r/e2.log")"
+grep -q 'GPU memory: 80% (104857 MB), applied' "$TMP/h27r/e2.log" \
+    && ok "E2 the D8 line is reported" || fail "E2 log: $(grep -i 'gpu memory' "$TMP/h27r/e2.log")"
+grep -q 'Installation completed' "$TMP/h27r/e2.log" && ok "E2 the install completes" || fail "E2 no completion"
+
+# E3: the plist is rendered outside the daemon dir, then moved in. Creating the
+# temp file inside /Library/LaunchDaemons fails for the unprivileged user that
+# runs install.sh on a real Mac.
+grep -q 'cannot create a temporary plist' "$TMP/h27r/e2.log" \
+    && fail "E3 rendered inside the daemon dir" || ok "E3 no in-dir temp file needed"
+check "E3 the daemon dir holds no leftover temp file" 0 "$(ls "$HSD_R" | grep -c '\.tmp\|^\.' || true)"
+
+# E9: outside a test sysroot a failed chown stops the step and installs nothing;
+# inside one it is best-effort. The sudo stub fails chown only.
+mkdir -p "$TMP/h27o"
+printf '#!/bin/sh\n[ "$1" = chown ] && exit 1\nexec "$@"\n' > "$TMP/h27o/sudo"; chmod +x "$TMP/h27o/sudo"
+printf x > "$TMP/h27o/src"
+( unset MSS_TEST_SYSROOT; MSS_SUDO=$TMP/h27o/sudo; export MSS_SUDO
+  _mss_install_plist "$TMP/h27o/src" "$TMP/h27o/dest" ) 2>/dev/null; RC=$?
+check "E9 a failed chown on a real Mac stops the install" "1 absent" "$RC $([ -e "$TMP/h27o/dest" ] && echo present || echo absent)"
+printf x > "$TMP/h27o/src2"
+( MSS_TEST_SYSROOT=$TMP/sysroot; MSS_SUDO=$TMP/h27o/sudo; export MSS_TEST_SYSROOT MSS_SUDO
+  _mss_install_plist "$TMP/h27o/src2" "$TMP/h27o/dest2" ) 2>/dev/null; RC=$?
+check "E9 inside a test sysroot the chown is best-effort" "0 present" "$RC $([ -e "$TMP/h27o/dest2" ] && echo present || echo absent)"
+
+# E10 (A2): loaded mode reads backends.env, applies it and never writes it. The
+# run is install.sh on a pty with a saved file and no flag, end to end in the
+# sandbox, and it must apply the saved GPU value.
+printf 'MSS_BACKENDS=ollama\nMSS_TUNE_MACOS=no\nMSS_GPU_PERCENT=80\n' > "$TMP/h27r/loaded.env"; chmod 600 "$TMP/h27r/loaded.env"
+SHA_L1=$(mss_shasum256 "$TMP/h27r/loaded.env" | awk '{print $1}')
+rm -f "$HSD_R/"*.plist; echo 0 > "$HR_STATE/live"; : > "$HR_STATE/calls.log"
+( export MSS_TEST_SYSROOT=$TMP/h27r/sysroot MSS_STUB_STATE=$HR_STATE MSS_LAUNCHD_TIMEOUT=1 MSS_SUDO=$TMP/nosudo/sudo \
+      MSS_SYSCTL="$TMP/h27r-bin/sysctl" PATH="$TMP/nosudo:$TMP/h27r-bin:$PATH" MSS_INSTALL_SANDBOX=1 \
+      OLLAMA_BASE_DIR="$TMP/h27r/base" HOME="$TMP/h27r/home" MSS_ENV_FILE="$TMP/h27r/loaded.env" \
+      OLLAMA_USER="$(id -un)" MSS_CONF="$TMP/h27r/none.conf"
+  unset MSS_BACKENDS
+  expect "$ROOT/tests/expect/drive.exp" /dev/null "$TMP/h27r/e10.transcript" /bin/bash "$ROOT/scripts/install.sh" ) \
+    >/dev/null 2>"$TMP/h27r/e10.err"
+check "E10 loaded mode on a pty exits 0" 0 $?
+tr -d '\r' < "$TMP/h27r/e10.transcript" | grep -q 'GPU memory: 80% (104857 MB), applied' \
+    && ok "E10 loaded mode applied the saved GPU value" || fail "E10: $(tr -d '\r' < "$TMP/h27r/e10.transcript" | tail -5)"
+check "E10 loaded mode leaves the file's shasum unchanged" "$SHA_L1" "$(mss_shasum256 "$TMP/h27r/loaded.env" | awk '{print $1}')"
+rm -f "$HSD_R/"*.plist
+
+# E11 (manual step 2 at a44b988): with OLLAMA_BIN unset, the plist gets the
+# Ollama already installed, in the picker's order: /usr/local/bin, then PATH,
+# then Homebrew's Apple silicon prefix. The PATH drops every directory holding
+# a real ollama, so the runner's own install cannot answer for a row.
+OB=$TMP/h27ob
+mkdir -p "$OB/both/usr/local/bin" "$OB/both/opt/homebrew/bin" "$OB/path" "$OB/brew/opt/homebrew/bin" "$OB/none"
+for _d in "$OB/both/usr/local/bin" "$OB/both/opt/homebrew/bin" "$OB/path" "$OB/brew/opt/homebrew/bin"; do
+    cp "$ROOT/tests/stubs/fake-ollama.sh" "$_d/ollama"; chmod +x "$_d/ollama"
+done
+OB_PATH=$(printf '%s\n' "$PATH" | tr ':' '\n' | while IFS= read -r _d; do
+    [ -n "$_d" ] || continue; [ -x "$_d/ollama" ] || printf '%s:' "$_d"; done)
+OB_PATH=${OB_PATH%:}
+obin() { ( PATH="${1:+$1:}${OB_PATH:-$PATH}"; export PATH; mss_default_ollama_bin "$2"; echo "rc=$?" ) | tr '\n' ' '; }
+check "E11 /usr/local/bin/ollama comes first" "$OB/both/usr/local/bin/ollama rc=0 " "$(obin "$OB/path" "$OB/both")"
+check "E11 then the ollama on PATH" "$OB/path/ollama rc=0 " "$(obin "$OB/path" "$OB/brew")"
+check "E11 then /opt/homebrew/bin/ollama, even off PATH" "$OB/brew/opt/homebrew/bin/ollama rc=0 " "$(obin "" "$OB/brew")"
+check "E11 none found keeps /usr/local/bin/ollama and says so" "/usr/local/bin/ollama rc=1 " "$(obin "" "$OB/none")"
+# End to end in env mode: a Homebrew-only Ollama, found on PATH (the reported
+# Mac) and off PATH (a sudo PATH without /opt/homebrew/bin), is what the plist runs.
+mkdir -p "$TMP/h27r/sysroot/opt/homebrew/bin"
+cp "$ROOT/tests/stubs/fake-ollama.sh" "$TMP/h27r/sysroot/opt/homebrew/bin/ollama"; chmod +x "$TMP/h27r/sysroot/opt/homebrew/bin/ollama"
+# The Ollama block renders from $BASE_DIR/config, so this base links the templates.
+mkdir -p "$TMP/h27r/base11"; ln -sf "$ROOT/config" "$TMP/h27r/base11/config"
+for _case in on-path off-path; do
+    rm -f "$HSD_R/"*.plist
+    _pre="$TMP/h27r-bin:"; [ "$_case" = off-path ] || _pre="$TMP/h27r/sysroot/opt/homebrew/bin:$_pre"
+    install_case "$TMP/h27r/e11-$_case.log" MSS_BACKENDS=ollama MSS_TUNE_MACOS=no \
+        OLLAMA_BASE_DIR="$TMP/h27r/base11" PATH="$_pre${OB_PATH:-$PATH}"
+    check "E11 env mode, Homebrew Ollama $_case, exits 0" "rc=0" "$(tail -n 1 "$TMP/h27r/e11-$_case.log")"
+    grep -q "<string>$TMP/h27r/sysroot/opt/homebrew/bin/ollama</string>" "$HSD_R/com.ollama.service.plist" 2>/dev/null \
+        && ok "E11 com.ollama.service runs the Homebrew Ollama ($_case)" \
+        || fail "E11 $_case plist: $(grep -A1 ProgramArguments "$HSD_R/com.ollama.service.plist" 2>&1 | tail -n 1)"
+done
+rm -rf "$TMP/h27r/sysroot/opt"; rm -f "$HSD_R/"*.plist
+
+# E12 (manual step 9): com.colima.daemon runs the start-colima.sh its template
+# names, whichever checkout installed it. Autostart is refused before any change
+# unless that file is this checkout's script: an older one resizes the VM.
+BU=$(id -un); BJS="$TMP/h27r/sysroot/Users/$BU/mac-studio-server/scripts"
+mkdir -p "$BJS" "$TMP/h27r/jobtools"
+cp "$ROOT/tests/stubs/colima" "$ROOT/tests/stubs/docker" "$TMP/h27r/jobtools/"; chmod +x "$TMP/h27r/jobtools/"*
+jscheck() { ( MSS_TEST_SYSROOT=$TMP/h27r/sysroot OLLAMA_USER=$BU; export MSS_TEST_SYSROOT OLLAMA_USER
+    while [ "$#" -gt 0 ]; do export "${1?}"; shift; done
+    mss_docker_job_script_check 2>&1; echo "rc=$?" ) | tr '\n' ' '; }
+rm -f "$BJS/start-colima.sh"
+check "E12 autostart unset never looks at the boot script" "rc=0 " "$(jscheck MSS_DOCKER_AUTOSTART=)"
+check "E12 a missing boot script refuses autostart" \
+    "ERROR: MSS_DOCKER_AUTOSTART=yes: com.colima.daemon runs /Users/$BU/mac-studio-server/scripts/start-colima.sh at every boot, and that is not this checkout's start-colima.sh; run install.sh from /Users/$BU/mac-studio-server, or bring that checkout to this version rc=1 " \
+    "$(jscheck MSS_DOCKER_AUTOSTART=yes)"
+git -C "$ROOT" show 8975c9f:scripts/start-colima.sh > "$BJS/start-colima.sh" 2>/dev/null \
+    || printf '#!/bin/bash\ncolima start --cpu 4 --memory 8 --disk 50\n' > "$BJS/start-colima.sh"
+jscheck MSS_DOCKER_AUTOSTART=yes | grep -q 'rc=1 $' && ok "E12 an older boot script refuses autostart" || fail "E12 older: $(jscheck MSS_DOCKER_AUTOSTART=yes)"
+cp "$ROOT/scripts/start-colima.sh" "$BJS/start-colima.sh"
+check "E12 this checkout's boot script passes" "rc=0 " "$(jscheck MSS_DOCKER_AUTOSTART=yes)"
+# End to end: an older boot script stops install.sh before anything is loaded.
+printf '#!/bin/bash\ncolima start --cpu 4 --memory 8 --disk 50\n' > "$BJS/start-colima.sh"
+rm -f "$HSD_R/"*.plist
+install_case "$TMP/h27r/e12.log" MSS_BACKENDS=ollama MSS_TUNE_MACOS=no MSS_DOCKER_AUTOSTART=yes \
+    MSS_DOCKER_JOB_PATH="$TMP/h27r/jobtools" MSS_STUB_LOG="$TMP/h27r/e12.stub"
+check "E12 install.sh with an older boot script exits 1" "rc=1" "$(tail -n 1 "$TMP/h27r/e12.log")"
+check "E12 nothing was loaded" "" "$(cat "$HR_STATE/calls.log")"
+grep -q 'is not this checkout' "$TMP/h27r/e12.log" && ok "E12 the refusal says why" || fail "E12 log: $(tail -3 "$TMP/h27r/e12.log")"
+cp "$ROOT/scripts/start-colima.sh" "$BJS/start-colima.sh"
+install_case "$TMP/h27r/e12b.log" MSS_BACKENDS=ollama MSS_TUNE_MACOS=no MSS_DOCKER_AUTOSTART=yes \
+    MSS_DOCKER_JOB_PATH="$TMP/h27r/jobtools" MSS_STUB_LOG="$TMP/h27r/e12.stub"
+check "E12 with this checkout's boot script the install completes" "rc=0" "$(tail -n 1 "$TMP/h27r/e12b.log")"
+grep -q 'Docker at boot: on, changed' "$TMP/h27r/e12b.log" && ok "E12 the Colima job is installed" || fail "E12b: $(grep 'Docker at boot' "$TMP/h27r/e12b.log")"
+check "E12 install.sh never ran colima or docker" "" "$(cat "$TMP/h27r/e12.stub" 2>/dev/null)"
+rm -rf "$TMP/h27r/sysroot/Users/$BU/mac-studio-server"; rm -f "$HSD_R/"*.plist
+
+# E8 (D7 step 6): the Docker install runs before the switch removal, the Ollama
+# steps and every launchd or pmset change. A brew that fails must stop install.sh
+# with nothing loaded; the static pin below checks the same order in the source.
+mkdir -p "$TMP/h27r/brewfail" "$TMP/h27r/job-none"
+printf '#!/bin/sh\necho "brew $*" >> "$MSS_STUB_LOG"\nexit 1\n' > "$TMP/h27r/brewfail/brew"; chmod +x "$TMP/h27r/brewfail/brew"
+rm -f "$HSD_R/"*.plist
+install_case "$TMP/h27r/e8.log" MSS_BACKENDS=ollama MSS_TUNE_MACOS=no MSS_DOCKER_INSTALL=yes \
+    MSS_DOCKER_JOB_PATH="$TMP/h27r/job-none" MSS_STUB_LOG="$TMP/h27r/e8.stub" \
+    PATH="$TMP/h27r/brewfail:$TMP/h27r-bin:${V_PATH:-$PATH}"
+check "E8 a failing brew stops install.sh" "rc=1" "$(tail -n 1 "$TMP/h27r/e8.log")"
+check "E8 brew was asked for the missing tools only" "brew install colima docker" "$(cat "$TMP/h27r/e8.stub" 2>/dev/null)"
+check "E8 nothing was loaded or booted out" "" "$(cat "$HR_STATE/calls.log")"
+grep -q 'Loading Ollama service' "$TMP/h27r/e8.log" && fail "E8 the Ollama steps ran before the Docker install" \
+    || ok "E8 the Docker install runs before the Ollama steps"
+_d7() { grep -nF -- "$1" "$ROOT/scripts/install.sh" | head -n 1 | cut -d: -f1; }
+D7ORDER="$(_d7 'if [ "$MSS_FLAG" = --configure-only ]; then') $(_d7 'mss_apply_step mss_docker_install_apply') \
+$(_d7 'uninstall.sh" --backend "$MSS_SWITCH_FROM"') $(_d7 'launchctl load -w') $(_d7 'mss_apply_step mss_gpu_apply') \
+$(_d7 'mss_apply_step mss_power_apply') $(_d7 'mss_apply_step mss_docker_autostart_apply') $(_d7 '    mss_check || exit 1')"
+check "E8 install.sh keeps the D7 order (steps 4, 6, 7, 8, 9, 10, 11, 12)" "sorted" \
+    "$(printf '%s\n' $D7ORDER | awk 'NF { if (n++ && $1 <= p) bad = 1; p = $1 } END { print (n == 8 && !bad) ? "sorted" : "out of order: " n }')"
+
+# E4: `system` with an optional backend selected must not reach mss_validate_uint.
+# install-backends.sh validates a percent; system means no wired limit.
+# MSS_HW_MEMSIZE plus the BSD-stat stub make the render pass runnable here.
+e4_render() { # e4_render <dir> <percent>: render with the BSD-stat stub first on
+# PATH and a fixed RAM size, so the wired-limit branch runs on a Linux runner.
+# The assignment is scoped to the command, so nothing has to be restored.
+    mkdir -p "$TMP/h27r/bin-bsd"; cp "$ROOT/tests/stubs/stat-bsd" "$TMP/h27r/bin-bsd/stat"
+    chmod +x "$TMP/h27r/bin-bsd/stat"
+    PATH="$TMP/h27r/bin-bsd:$PATH" MSS_HW_MEMSIZE=137438953472 \
+        render ollama,llamacpp "$1" MSS_GPU_PERCENT="$2"
+}
+if e4_render "$TMP/h27r/e4" system >/dev/null 2>&1; then
+    ok "E4 system with an optional backend renders"
+else
+    fail "E4 system with an optional backend: $(e4_render "$TMP/h27r/e4b" system 2>&1 | tail -2)"
+fi
+grep -q 'MSS_WIRED_LIMIT_MB' "$TMP/h27r/e4/backends.conf" \
+    && fail "E4 system wrote a wired limit" || ok "E4 system writes no MSS_WIRED_LIMIT_MB"
+# A number still produces the limit, so the case above did not just skip the branch.
+if e4_render "$TMP/h27r/e4n" 80 >/dev/null 2>&1; then
+    grep -q '^MSS_WIRED_LIMIT_MB=104857$' "$TMP/h27r/e4n/backends.conf" \
+        && ok "E4 a number still writes the wired limit" \
+        || fail "E4 80 wrote: $(grep MSS_WIRED_LIMIT_MB "$TMP/h27r/e4n/backends.conf")"
+else
+    fail "E4 render with 80: $(e4_render "$TMP/h27r/e4nb" 80 2>&1 | tail -2)"
+fi
+
+# E5: the guard and the exemption are both still in the file, and `system` never
+# reaches them. A full --check-only pass needs a rendered conf, which is what
+# the rows at #12/#15 already cover; here the point is that system is excluded
+# before the guard, not that the guard is gone.
+grep -q 'MSS_GPU_PERCENT:-}" != system' "$ROOT/scripts/install-backends.sh" \
+    && ok "E5 system is excluded before the wired-limit branch" \
+    || fail "E5 the exclusion is missing"
+grep -q 'com.mac-studio-server.gpumemory is not installed; run scripts/install.sh' "$ROOT/scripts/install-backends.sh" \
+    && ok "E5 the missing-plist guard is still there" || fail "E5 the guard was dropped"
+
+# E6: the picker path resolves after loading backends.env, so a legacy file key
+# migrates with its notice and a conflicting environment value is a conflict.
+if [ "$(id -u)" -ne 0 ]; then
+    # mss_envfile_check_file reads the owner and mode with BSD `stat -f`.
+    mkdir -p "$TMP/h27r/bin-bsd"
+    cp "$ROOT/tests/stubs/stat-bsd" "$TMP/h27r/bin-bsd/stat"; chmod +x "$TMP/h27r/bin-bsd/stat"
+    PKG="$TMP/h27r/pkgen"; mkdir -p "$PKG"
+    printf 'MSS_BACKENDS=ollama\nOLLAMA_GPU_PERCENT=80\n' > "$PKG/legacy.env"; chmod 600 "$PKG/legacy.env"
+    ( unset MSS_GPU_PERCENT OLLAMA_GPU_PERCENT MSS_CHOICES_RESOLVED MSS_ENVFILE_LOADED
+      export HOME="$TMP/h27r/home" MSS_ENV_FILE="$PKG/legacy.env" PATH="$TMP/h27r/bin-bsd:$PATH"
+      . "$ROOT/scripts/lib/mss-common.sh"; . "$ROOT/scripts/lib/mss-acquire.sh"
+      . "$ROOT/scripts/lib/mss-run.sh"; . "$ROOT/scripts/lib/mss-host.sh"
+      . "$ROOT/scripts/lib/mss-picker.sh"
+      mss_envfile_load "$PKG/legacy.env" && mss_choices_resolve ) > "$PKG/legacy.out" 2>&1
+    grep -q 'OLLAMA_GPU_PERCENT is deprecated; using it as MSS_GPU_PERCENT=80. Rename it in backends.env' "$PKG/legacy.out" \
+        && ok "E6 a legacy key in the file migrates with its notice" || fail "E6: $(cat "$PKG/legacy.out")"
+    ( unset MSS_GPU_PERCENT OLLAMA_GPU_PERCENT MSS_DOCKER_AUTOSTART MSS_DOCKER_INSTALL \
+          MSS_POWER_AUTORESTART DOCKER_AUTOSTART MSS_ENVFILE_LOADED MSS_ENVFILE_OVERRIDDEN
+      export MSS_GPU_PERCENT=85 PATH="$TMP/h27r/bin-bsd:$PATH"
+      MSS_CHOICES_RESOLVED=''
+      export MSS_CHOICES_RESOLVED
+      . "$ROOT/scripts/lib/mss-common.sh"; . "$ROOT/scripts/lib/mss-acquire.sh"
+      . "$ROOT/scripts/lib/mss-run.sh"; . "$ROOT/scripts/lib/mss-host.sh"
+      . "$ROOT/scripts/lib/mss-picker.sh"
+      mss_envfile_load "$PKG/legacy.env" && mss_choices_resolve ) > "$PKG/conf.out" 2>&1
+    grep -q 'differ; keep one' "$PKG/conf.out" \
+        && ok "E6 a file legacy key against a new env key is a conflict" || fail "E6 conflict: $(cat "$PKG/conf.out")"
+    # A file holding both keys is a conflict too: the loader reads both, the
+    # resolver compares them.
+    printf 'MSS_BACKENDS=ollama\nOLLAMA_GPU_PERCENT=80\nMSS_GPU_PERCENT=85\n' > "$PKG/both.env"; chmod 600 "$PKG/both.env"
+    ( unset MSS_GPU_PERCENT OLLAMA_GPU_PERCENT MSS_CHOICES_RESOLVED MSS_ENVFILE_LOADED
+      export PATH="$TMP/h27r/bin-bsd:$PATH"
+      . "$ROOT/scripts/lib/mss-common.sh"; . "$ROOT/scripts/lib/mss-acquire.sh"
+      . "$ROOT/scripts/lib/mss-run.sh"; . "$ROOT/scripts/lib/mss-host.sh"
+      mss_envfile_load "$PKG/both.env" && mss_choices_resolve ) > "$PKG/both.out" 2>&1
+    grep -q 'differ; keep one' "$PKG/both.out" \
+        && ok "E6 both keys in one file is a conflict" || fail "E6 both: $(cat "$PKG/both.out")"
+else
+    echo "skip - E6 needs a non-root user (the loader refuses a file it does not own)"
+fi
+
+# E6b: question G saves the answer the user gave. Grepping the comment would
+# prove nothing, so this runs the picker function and then the apply step with
+# whatever the picker left behind. Unsetting `system` instead of saving it would
+# save nothing, print "left as is", and leave an installed job in place.
+rm_gpu_r() { rm -f "$HSD_R/com.mac-studio-server.gpumemory.plist" "$HSD_R/com.ollama.gpumemory.plist" "$HR_STATE"/loaded-com.*gpumemory; }
+gpu_pick_case() { # gpu_pick_case <answer>: the saved key, then the apply line
+    ( export MSS_TEST_SYSROOT=$TMP/h27r/sysroot MSS_STUB_STATE=$HR_STATE \
+          MSS_SYSCTL="$TMP/h27r-bin/sysctl" PATH="$TMP/h27r-bin:$PATH"
+      unset MSS_GPU_PERCENT
+      . "$ROOT/scripts/lib/mss-common.sh"; . "$ROOT/scripts/lib/mss-acquire.sh"
+      . "$ROOT/scripts/lib/mss-run.sh"; . "$ROOT/scripts/lib/mss-host.sh"
+      . "$ROOT/scripts/lib/mss-picker.sh"
+      # Only the terminal is replaced: mss_ask(prompt, default, validator) reads
+      # the answer, so the stub feeds the answer under test through the real
+      # validator and sets MSS_ANSWER exactly as the terminal would.
+      mss_ask() { "$3" "$MSS_PICK_ANSWER" || return 1; MSS_ANSWER=$MSS_PICK_ANSWER; return 0; }
+      MSS_PICK_ANSWER=$1
+      _mss_pick_gpu
+      # The apply step runs in a subshell, so the saved key is passed out as the
+      # first line and the caller applies it against the seeded state.
+      printf '%s\n' "${MSS_GPU_PERCENT:-unset}" )
+}
+gpu_apply_line() { # gpu_apply_line <percent>: the D8 line for that answer
+    ( export MSS_TEST_SYSROOT=$TMP/h27r/sysroot MSS_STUB_STATE=$HR_STATE \
+          MSS_SYSCTL="$TMP/h27r-bin/sysctl" PATH="$TMP/h27r-bin:$PATH" \
+          MSS_SUDO=$TMP/nosudo/sudo MSS_LAUNCHD_TIMEOUT=1
+      mss_gpu_apply "${1:-}" 2>/dev/null )
+}
+rm_gpu_r; echo 104857 > "$HR_STATE/live"
+mss_gpu_render 80 104857 > "$HSD_R/com.mac-studio-server.gpumemory.plist"
+printf 'loaded-com.mac-studio-server.gpumemory\n' > "$HR_STATE/loaded-com.mac-studio-server.gpumemory"
+SAVED=$(gpu_pick_case system)
+check "E6b answering system saves the word system" "system" "$SAVED"
+check "E6b applying system removes the installed job" \
+    "GPU memory: system default from the next boot" "$(gpu_apply_line "$SAVED")"
+check "E6b the job is gone after applying system" 0 "$(ls "$HSD_R" | grep -c gpumemory)"
+# And a number still round-trips, so the row above is not just an empty key.
+rm_gpu_r; echo 0 > "$HR_STATE/live"
+SAVED=$(gpu_pick_case 80)
+check "E6b answering 80 saves 80" "80" "$SAVED"
+gpu_apply_line "$SAVED" >/dev/null
+[ -f "$HSD_R/com.mac-studio-server.gpumemory.plist" ] \
+    && ok "E6b a number installs the job" || fail "E6b: 80 installed nothing"
+rm_gpu_r
+
+# E7: status.sh reads the sysroot, and a legacy job alone is still healthy.
+# MSS_CONF points at a conf selecting ollama only, so the backend health probes
+# (which need a running service) are the only rows the stubs cannot answer.
+rm -f "$HSD_R/"*.plist; echo 0 > "$HR_STATE/live"
+mkdir -p "$TMP/h27r/conf"
+printf 'MSS_BACKENDS=ollama\n' > "$TMP/h27r/conf/ollama.conf"
+status_case() {
+    ( export MSS_TEST_SYSROOT=$TMP/h27r/sysroot MSS_STUB_STATE=$HR_STATE \
+          MSS_SYSCTL="$TMP/h27r-bin/sysctl" PATH="$TMP/h27r-bin:$PATH" \
+          MSS_CONF="$TMP/h27r/conf/ollama.conf"
+      sh "$ROOT/scripts/status.sh" ) 2>&1
+    echo "rc=$?"
+}
+rm_gpu_r
+OUT=$(status_case)
+printf '%s' "$OUT" | grep -q 'system default' && ok "E7 no job prints system default" || fail "E7: $OUT"
+rm_gpu_r
+cat > "$HSD_R/com.ollama.gpumemory.plist" <<'LP'
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+    <key>Label</key><string>com.ollama.gpumemory</string>
+    <key>EnvironmentVariables</key><dict>
+        <key>OLLAMA_GPU_PERCENT</key><string>80</string>
+    </dict>
+</dict></plist>
+LP
+printf 'loaded-com.ollama.gpumemory\n' > "$HR_STATE/loaded-com.ollama.gpumemory"
+OUT=$(status_case)
+printf '%s' "$OUT" | grep -q 'user-editable script as root' \
+    && ok "E7 a legacy job alone prints the migrate note" || fail "E7 note: $OUT"
+# "healthy" here means the gpu memory row itself, not the process exit code: the
+# ollama service probe in the same run cannot pass on a test runner.
+printf '%s' "$OUT" | grep -A1 'gpu memory' | grep -q 'via com.ollama.gpumemory' \
+    && ok "E7 the legacy job is reported healthy, not unhealthy" || fail "E7 gpu row: $OUT"
+# Both labels at once is the one GPU state that must fail the run.
+seed_legacy_r() {
+    cat > "$HSD_R/com.ollama.gpumemory.plist" <<'LPL'
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>Label</key><string>com.ollama.gpumemory</string>
+<key>EnvironmentVariables</key><dict><key>OLLAMA_GPU_PERCENT</key><string>80</string></dict>
+</dict></plist>
+LPL
+    printf 'loaded-com.ollama.gpumemory\n' > "$HR_STATE/loaded-com.ollama.gpumemory"
+}
+rm_gpu_r; seed_legacy_r
+mss_gpu_render 80 104857 > "$HSD_R/com.mac-studio-server.gpumemory.plist"
+printf 'loaded-com.mac-studio-server.gpumemory\n' > "$HR_STATE/loaded-com.mac-studio-server.gpumemory"
+OUT=$(status_case)
+printf '%s' "$OUT" | grep -q 'both GPU boot jobs installed' \
+    && ok "E7 two GPU labels are reported" || fail "E7 both: $OUT"
+rm_gpu_r
+
+rm_gpu_r
+
+
 echo "== phase A: docs (R1, R2, S2, S3) =="
 R1=$(awk '/^# /{s="title"} /^## /{s=$0} NF{c[s]++} END{for (k in c) print k"|"c[k]}' "$ROOT/README.md")
 cap() { printf '%s\n' "$R1" | awk -F'|' -v k="$1" '$1==k{print $2}'; }
@@ -718,15 +2026,37 @@ for gone in 'launchctl unload' 'sudo cp config/' 'Customizing Configuration' 'Pe
 done
 awk '/^## Options/{f=1;next} /^## /{f=0} f' "$ROOT/README.md" | grep -q '0\.0\.0\.0.*OLLAMA_BIND=127\.0\.0\.1' \
     && ok "README Options keeps the Ollama exposure line (R2)" || fail "README exposure line missing"
-for word in OLLAMA_BIND ./scripts/optimize-mac-server.sh OLLAMA_GPU_PERCENT DOCKER_AUTOSTART; do
-    grep -q -- "$word" "$ROOT/docs/options.md" && ok "docs/options.md has $word (R2, F6)" || fail "docs/options.md lacks $word"
+for word in OLLAMA_BIND ./scripts/optimize-mac-server.sh MSS_GPU_PERCENT MSS_DOCKER_INSTALL MSS_DOCKER_AUTOSTART MSS_POWER_AUTORESTART OLLAMA_GPU_PERCENT; do
+    grep -q -- "$word" "$ROOT/docs/options.md" && ok "docs/options.md has $word (R2, F6, #27)" || fail "docs/options.md lacks $word"
 done
-[ "$(wc -l < "$ROOT/docs/options.md")" -le 80 ] && ok "docs/options.md ≤ 80 lines" || fail "docs/options.md too long"
+[ "$(wc -l < "$ROOT/docs/options.md")" -le 100 ] && ok "docs/options.md ≤ 100 lines" || fail "docs/options.md too long"
+# A9: the legacy names appear only where the migration needs them.
+if git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+    A9BAD=$(git -C "$ROOT" grep -lE 'com\.ollama\.gpumemory|OLLAMA_GPU_PERCENT' | grep -vxE \
+        'scripts/lib/mss-host\.sh|scripts/lib/mss-common\.sh|scripts/set-gpu-memory\.sh|scripts/install-backends\.sh|docs/options\.md|docs/backends\.md|CHANGELOG\.md|tests/.*' || true)
+    check "A9 the legacy names appear only in the allowed files" "" "$A9BAD"
+else
+    echo "skip - A9 grep set needs a git checkout"
+fi
 S2=$(awk '/^## \[1\.5\.0\]/{f=1;next} /^## \[/{f=0} f && /^- /' "$ROOT/CHANGELOG.md")
 [ "$(printf '%s\n' "$S2" | grep -c .)" -le 5 ] && ok "CHANGELOG 1.5.0 has ≤ 5 bullets (S2)" || fail "CHANGELOG bullets: $S2"
 [ -z "$(printf '%s\n' "$S2" | awk 'length($0) > 100')" ] && ok "CHANGELOG bullets ≤ 100 characters (S2)" || fail "long CHANGELOG bullet"
 printf '%s\n' "$S2" | grep -Eq '\.sh|/|\(\)|_[a-z]' && fail "CHANGELOG names internals (S2)" || ok "CHANGELOG names no internals (S2)"
 printf '%s\n' "$S2" | grep -qi 'headless.*asked once' && ok "CHANGELOG says the headless tweaks are asked once (F6)" || fail "F6 CHANGELOG line"
+# Release pins (#27, v1.6.0): bootstrap.sh's MSS_TAG is the version README.md
+# states, the tag every one-liner fetches, and a dated CHANGELOG section, with
+# an empty [Unreleased] above it.
+RTAG=$(sed -n 's/^MSS_TAG=//p' "$ROOT/bootstrap.sh"); RVER=${RTAG#v}
+check "README's current version is bootstrap.sh's MSS_TAG" "Current version: $RVER (semver)." \
+    "$(grep -o 'Current version: [0-9.]* (semver)\.' "$ROOT/README.md")"
+for f in README.md docs/backends.md bootstrap.sh; do
+    check "$f fetches bootstrap.sh at MSS_TAG ($RTAG) only" "ok" \
+        "$(grep -o 'mac-studio-server/v[0-9.]*/bootstrap.sh' "$ROOT/$f" | awk -v t="mac-studio-server/$RTAG/bootstrap.sh" \
+            '{ n++; if ($0 != t) bad = 1 } END { print (n && !bad) ? "ok" : "missing or other tag" }')"
+done
+check "CHANGELOG has a dated section for $RVER" 1 "$(grep -c "^## \[$RVER\] - [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\$" "$ROOT/CHANGELOG.md")"
+check "CHANGELOG [Unreleased] comes first and is empty" "## [Unreleased]|## [$RVER]" \
+    "$(grep -m 1 '^## \[' "$ROOT/CHANGELOG.md")|$(grep -v '^[[:space:]]*$' "$ROOT/CHANGELOG.md" | grep -A1 -m 1 '^## \[Unreleased\]$' | tail -n 1 | sed 's/ - .*//')"
 S3=$(awk '/^## One-line install/{f=1} /^## Status/{f=0} f' "$ROOT/docs/backends.md" | wc -l)
 [ "$S3" -le 30 ] && ok "docs/backends.md new section ≤ 30 lines ($S3) (S3)" || fail "docs/backends.md section is $S3 lines"
 grep -q "configure-only.*may leave a verification stamp" "$ROOT/docs/backends.md" && ok "backends.md --configure-only wording (S3)" || fail "S3 wording"
@@ -742,18 +2072,36 @@ else
     mkdir -p "$TMP/nosudo"
     printf '#!/bin/sh\ncase $1 in -v) exit 0 ;; -n) shift ;; esac\nexec "$@"\n' > "$TMP/nosudo/sudo"; chmod +x "$TMP/nosudo/sudo"
     cp "$ROOT/tests/stubs/fake-ollama.sh" "$TMP/nosudo/ollama"; chmod +x "$TMP/nosudo/ollama"
-    PK="$TMP/picker"; mkdir -p "$PK"
-    drive() { # drive <name> <steps...> -- <env...>: run install.sh on a pty
+    PK="$TMP/picker"; mkdir -p "$PK" "$PK/bin" "$PK/jobbin" "$PK/sysroot/Library/LaunchDaemons"
+    # The #27 host questions read the Mac, so every row pins what they see: a
+    # sysroot of its own (no GPU or Colima job), autorestart reading 0, both
+    # Docker tools on the boot job's PATH (so DI is skipped and DA reads
+    # "Currently off"), and stat-bsd so a saved backends.env loads on Linux too.
+    cp "$ROOT/tests/stubs/stat-bsd" "$PK/bin/stat"; chmod +x "$PK/bin/stat"
+    cp "$ROOT/tests/stubs/colima" "$ROOT/tests/stubs/docker" "$PK/jobbin/"; chmod +x "$PK/jobbin/"*
+    drive() { # drive <name> <steps...> -- <env...>: run install.sh on a pty.
+        # DRIVE_PATH, when set, goes first on PATH; DRIVE_BASE_PATH replaces the
+        # inherited PATH after the harness directories.
         _name=$1; shift
         : > "$PK/$_name.steps"
         while [ "$1" != -- ]; do printf '%s\n' "$1" >> "$PK/$_name.steps"; shift; done
         shift
-        env PATH="$TMP/nosudo:$PATH" MSS_CONF="$PK/none.conf" OLLAMA_USER="$(id -un)" \
-            MSS_IFCONFIG="$ROOT/tests/stubs/ifconfig-lan" "$@" \
+        rm -rf "$PK/state-$_name"; mkdir -p "$PK/state-$_name"; : > "$PK/$_name.stublog"
+        env PATH="${DRIVE_PATH:+$DRIVE_PATH:}$PK/bin:$TMP/nosudo:${DRIVE_BASE_PATH:-$PATH}" MSS_CONF="$PK/none.conf" OLLAMA_USER="$(id -un)" \
+            MSS_IFCONFIG="$ROOT/tests/stubs/ifconfig-lan" MSS_TEST_SYSROOT="$PK/sysroot" \
+            MSS_STUB_STATE="$PK/state-$_name" MSS_STUB_LOG="$PK/$_name.stublog" \
+            MSS_PMSET="$ROOT/tests/stubs/pmset-autorestart-0" MSS_SYSCTL="$ROOT/tests/stubs/sysctl-state" \
+            MSS_DOCKER_JOB_PATH="$PK/jobbin" "$@" \
             expect "$ROOT/tests/expect/drive.exp" "$PK/$_name.steps" "$PK/$_name.transcript" \
             /bin/bash "$ROOT/scripts/install.sh" --configure-only >/dev/null 2>"$PK/$_name.err"
+        # A prefix assignment before a function call persists in a POSIX-mode
+        # shell, so the two are cleared here or they would leak into later rows.
+        _drc=$?; unset DRIVE_PATH DRIVE_BASE_PATH; return "$_drc"
     }
     T=$(printf '\t')
+    # The three host prompts every row below sees, answered with their defaults.
+    G_ENTER="or system [system]: ${T}@ENTER"; P_ENTER="power failure? [y/N]: ${T}@ENTER"
+    DA_ENTER="Currently off. [y/N]: ${T}@ENTER"
     DS4B="$TMP/fix/ds4/ds4-server"; DS4M="$TMP/fix/ds4/model.gguf"; DS4S=$(cat "$TMP/fix/ds4/model.sha")
     LLB="$TMP/fix/llamacpp/llamacpp-server"; LLM="$TMP/fix/llamacpp/model.gguf"
 
@@ -771,7 +2119,8 @@ else
     drive keyfile "Choose [1]: ${T}4" "later [1]: ${T}3" "path or https URL: ${T}$LLM" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" \
         "LAN access to llamacpp? [y/N]: ${T}y" "listen on [192.0.2.10]: ${T}@ENTER" \
         "use an allowlist instead): ${T}sk-test123" "use an allowlist instead): ${T}@ENTER" \
-        "(space-separated): ${T}192.0.2.99" "auto-updates)? ${T}@ENTER" "Save? [Y/n]: ${T}n" -- \
+        "(space-separated): ${T}192.0.2.99" "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" "$DA_ENTER" \
+        "Save? [Y/n]: ${T}n" -- \
         MSS_ENV_FILE="$PK/keyfile.env" LLAMACPP_BIN="$LLB"
     check "declining the summary exits 1" 1 $?
     grep -q 'not the key itself' "$PK/keyfile.transcript" && ok "key prompt rejects a key typed as a path (A12)" || fail "A12 key prompt: $(tail -5 "$PK/keyfile.transcript")"
@@ -788,8 +2137,8 @@ else
     [ ! -e "$PK/intr.env" ] && ok "Ctrl-C writes nothing (A13)" || fail "A13 wrote a file"
 
     drive envdef "Choose [5]: ${T}@ENTER" "later [4]: ${T}3" "path or https URL: ${T}$DS4M" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" \
-        "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" "Save? [Y/n]: ${T}@ENTER" -- \
-        MSS_ENV_FILE="$PK/envdef.env" MSS_BACKENDS=ds4 DS4_PORT=8001 DS4_BIN="$DS4B"
+        "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" "$DA_ENTER" \
+        "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/envdef.env" MSS_BACKENDS=ds4 DS4_PORT=8001 DS4_BIN="$DS4B"
     check "--configure-only with MSS_BACKENDS set shows the menu with env defaults (A3b)" 0 $?
     grep -q '^MSS_BACKENDS=ds4$' "$PK/envdef.env" 2>/dev/null && grep -q '^DS4_PORT=8001$' "$PK/envdef.env" \
         && ok "A3b saved MSS_BACKENDS=ds4 and DS4_PORT=8001" || fail "A3b saved: $(cat "$PK/envdef.env" 2>&1)"
@@ -799,16 +2148,16 @@ else
 
     drive saved "Choose [5]: ${T}@ENTER" "(.gguf) path [$DS4M]: ${T}@ENTER" \
         "c computes it now) [$DS4S]: ${T}@ENTER" "LAN access to ds4? [y/N]: ${T}@ENTER" \
-        "auto-updates)? ${T}@ENTER" "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/envdef.env"
+        "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" "$DA_ENTER" "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/envdef.env"
     check "--configure-only reuses every saved answer as its default" 0 $?
     grep -q 'Hashing' "$PK/saved.transcript" && fail "a saved sha256 was re-hashed by the picker" || ok "a saved sha256 is not re-hashed by the picker"
     grep -q 'binary path' "$PK/saved.transcript" && fail "a saved binary was asked for again (I7)" || ok "a saved binary is used without asking (I7)"
 
     # F5: a llama-server found on PATH and the default port: neither is asked.
     mkdir -p "$TMP/found"; cp "$ROOT/tests/stubs/fake-server.sh" "$TMP/found/llama-server"; chmod +x "$TMP/found/llama-server"
-    drive found "Choose [1]: ${T}4" "later [1]: ${T}4" "LAN access to llamacpp? [y/N]: ${T}@ENTER" \
-        "auto-updates)? ${T}@ENTER" "Save? [Y/n]: ${T}@ENTER" -- \
-        MSS_ENV_FILE="$PK/found.env" PATH="$TMP/found:$TMP/nosudo:$PATH"
+    DRIVE_PATH="$TMP/found" drive found "Choose [1]: ${T}4" "later [1]: ${T}4" "LAN access to llamacpp? [y/N]: ${T}@ENTER" \
+        "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" "$DA_ENTER" "Save? [Y/n]: ${T}@ENTER" -- \
+        MSS_ENV_FILE="$PK/found.env"
     check "F5 found llama-server, later" 0 $?
     grep -q 'binary path\|Port' "$PK/found.transcript" && fail "F5 asked for the binary or the port" || ok "F5 no binary or port prompt"
     grep -q "^LLAMACPP_BIN=$TMP/found/llama-server\$" "$PK/found.env" && grep -q '^LLAMACPP_PORT=8080$' "$PK/found.env" \
@@ -818,8 +2167,8 @@ else
 
     # M4: ds4 with nothing found: the build offer (declined), the manual command, then the menu.
     drive ds4menu "Choose [1]: ${T}5" "in ~/ds4? [y/N]: ${T}@ENTER" "binary path: ${T}$DS4B" "later [4]: ${T}@ENTER" \
-        "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" "Save? [Y/n]: ${T}@ENTER" -- \
-        MSS_ENV_FILE="$PK/ds4menu.env" HOME="$PK/home"
+        "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" "$DA_ENTER" \
+        "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/ds4menu.env" HOME="$PK/home"
     check "M4 ds4 with the build declined and a model later" 0 $?
     grep -q 'no small one exists).*later \[4\]: ' "$PK/ds4menu.transcript" && ok "M4 ds4 menu says no small model and defaults to later" \
         || fail "M4 menu: $(grep 'ds4 (' "$PK/ds4menu.transcript")"
@@ -828,11 +2177,202 @@ else
     [ ! -e "$PK/home/ds4" ] && ok "declining the build creates nothing" || fail "declined build created ~/ds4"
 
     # I2: with Ollama, the headless tweaks are asked once and saved; default no.
-    drive tweaks "Choose [1]: ${T}1" "auto-updates)? ${T}@ENTER" "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/tweaks.env"
+    drive tweaks "Choose [1]: ${T}1" "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" "$DA_ENTER" \
+        "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/tweaks.env"
     check "I2 ollama only" 0 $?
     grep -q '^MSS_TUNE_MACOS=no$' "$PK/tweaks.env" && ok "I2 saved MSS_TUNE_MACOS=no" || fail "I2 saved: $(cat "$PK/tweaks.env")"
     grep -q "^OLLAMA_BIN=$TMP/nosudo/ollama\$" "$PK/tweaks.env" && ok "an ollama on PATH is saved as OLLAMA_BIN (P2)" || fail "P2 OLLAMA_BIN"
     check "I2 asked once" 1 "$(grep -c 'headless macOS tweaks' "$PK/tweaks.transcript")"
+
+    # ── A8: the #27 host questions on a pty ───────────────────────────────────
+    # Each row pins what the questions read: its own sysroot, a pmset stub, and
+    # a boot-job PATH holding the Docker tools the row asks for. Rows with a tool
+    # missing also drop every PATH directory that has colima or docker, so a tool
+    # installed on the runner cannot turn "missing" into "elsewhere".
+    NODOCKER_PATH=$(printf '%s\n' "$PATH" | tr ':' '\n' | while IFS= read -r _d; do
+        [ -n "$_d" ] || continue; [ -x "$_d/colima" ] || [ -x "$_d/docker" ] || printf '%s:' "$_d"; done)
+    NODOCKER_PATH=${NODOCKER_PATH%:}
+    mkdir -p "$PK/job-none" "$PK/job-docker" "$PK/job-colima" "$PK/brewbin" "$PK/elsewhere" "$PK/statebin"
+    cp "$ROOT/tests/stubs/docker" "$PK/job-docker/"; cp "$ROOT/tests/stubs/colima" "$PK/job-colima/"
+    cp "$ROOT/tests/stubs/brew" "$PK/brewbin/"; cp "$ROOT/tests/stubs/colima" "$PK/elsewhere/"
+    cp "$ROOT/tests/stubs/launchctl-state" "$PK/statebin/launchctl"
+    cp "$ROOT/tests/stubs/sysctl-state" "$PK/statebin/sysctl"; cp "$ROOT/tests/stubs/plutil" "$PK/statebin/plutil"
+    chmod +x "$PK/job-docker/"* "$PK/job-colima/"* "$PK/brewbin/"* "$PK/elsewhere/"* "$PK/statebin/"*
+    envfile() { printf "$2" > "$PK/$1"; chmod 600 "$PK/$1"; }  # envfile <name> <printf body>
+    tr_of() { tr -d '\r' < "$PK/$1.transcript"; }
+    saved() { grep "^$2=" "$PK/$1" 2>/dev/null | cut -d= -f2-; }
+    SUMMARY_SEEN="$PK/summary.seen"; : > "$SUMMARY_SEEN"
+    summary_of() { tr_of "$1" | grep -E '^  (gpu memory|power restore|docker install|docker at boot): ' | tee -a "$SUMMARY_SEEN"; }
+    TOOLS_STEP="Colima and the Docker CLI are installed"
+
+    # (a) a legacy file: G offers 80, Enter saves MSS_GPU_PERCENT=80 and no legacy line.
+    envfile a8a.env 'MSS_BACKENDS=ollama\nOLLAMA_GPU_PERCENT=80\n'
+    drive a8a "Choose [1]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" "or system [80]: ${T}@ENTER" "$P_ENTER" "$DA_ENTER" \
+        "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/a8a.env"
+    check "A8a a legacy file completes" 0 $?
+    check "A8a saves MSS_GPU_PERCENT=80" 80 "$(saved a8a.env MSS_GPU_PERCENT)"
+    grep -q OLLAMA_GPU_PERCENT "$PK/a8a.env" && fail "A8a the save kept the legacy key" || ok "A8a the save drops the legacy key"
+    tr_of a8a | grep -q 'OLLAMA_GPU_PERCENT is deprecated; using it as MSS_GPU_PERCENT=80. Rename it in backends.env' \
+        && ok "A8a the notice names backends.env" || fail "A8a notice: $(tr_of a8a | grep -i deprecated)"
+    check "A8a summary" "  gpu memory: 80% of RAM (applied now and at every boot)
+  power restore: off (unchanged)
+  docker install: no
+  docker at boot: off (unchanged)" "$(summary_of a8a)"
+
+    # (b) 0 and 101 are re-asked, then system is accepted; abc too.
+    drive a8b1 "Choose [1]: ${T}1" "auto-updates)? ${T}@ENTER" "or system [system]: ${T}0" "or system [system]: ${T}101" \
+        "or system [system]: ${T}system" "$P_ENTER" "$DA_ENTER" "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/a8b1.env"
+    check "A8b 0 and 101 are re-asked, system accepted" "0 3 system" \
+        "$? $(tr_of a8b1 | grep -c 'or system \[system\]: ') $(saved a8b1.env MSS_GPU_PERCENT)"
+    drive a8b2 "Choose [1]: ${T}1" "auto-updates)? ${T}@ENTER" "or system [system]: ${T}abc" "or system [system]: ${T}@ENTER" \
+        "$P_ENTER" "$DA_ENTER" "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/a8b2.env"
+    check "A8b abc is re-asked, Enter takes system" "0 2 system" \
+        "$? $(tr_of a8b2 | grep -c 'or system \[system\]: ') $(saved a8b2.env MSS_GPU_PERCENT)"
+
+    # (c) both tools on the job PATH (every row above): DI is not shown, DA is, off by default.
+    tr_of tweaks | grep -q "^$TOOLS_STEP" && ok "A8c DI prints the installed line" || fail "A8c no installed line"
+    tr_of tweaks | grep -q 'with Homebrew?' && fail "A8c DI was asked" || ok "A8c DI is not asked"
+    tr_of tweaks | grep -q 'Start Colima (Docker) at every boot? Currently off. \[y/N\]: ' \
+        && ok "A8c DA reads Currently off with default N" || fail "A8c DA: $(tr_of tweaks | grep 'every boot')"
+
+    # (d, f) no tools and no power setting: DI defaults to N, n skips DA, P is skipped.
+    DRIVE_BASE_PATH=$NODOCKER_PATH drive a8d "Choose [1]: ${T}1" "auto-updates)? ${T}@ENTER" "$G_ENTER" \
+        "Install Colima and the Docker CLI with Homebrew? [y/N]: ${T}@ENTER" "Save? [Y/n]: ${T}@ENTER" -- \
+        MSS_ENV_FILE="$PK/a8d.env" MSS_DOCKER_JOB_PATH="$PK/job-none" MSS_PMSET="$ROOT/tests/stubs/pmset-none"
+    check "A8d no tools, DI n completes" 0 $?
+    tr_of a8d | grep -q 'every boot?' && fail "A8d DA was asked after DI = n" || ok "A8d DA is not asked after DI = n"
+    check "A8d saves DI=no and no DA or power line" "no||" \
+        "$(saved a8d.env MSS_DOCKER_INSTALL)|$(saved a8d.env MSS_DOCKER_AUTOSTART)|$(saved a8d.env MSS_POWER_AUTORESTART)"
+    tr_of a8d | grep -q '^This Mac has no restart-after-power-failure setting; skipped' \
+        && ok "A8f P prints the skip line" || fail "A8f no skip line"
+    tr_of a8d | grep -q 'power failure?' && fail "A8f P was asked" || ok "A8f P is not asked"
+    check "A8d summary (no power line on a Mac without the setting)" "  gpu memory: system default (from the next boot)
+  docker install: no
+  docker at boot: left as is" "$(summary_of a8d)"
+
+    # Stale keys: a saved file holding MSS_DOCKER_AUTOSTART=yes and
+    # MSS_POWER_AUTORESTART=yes, on a Mac where DA and P are both skipped. The
+    # picker must drop both: saved again, step 2 would refuse the file on every
+    # later run and --configure could never clear it. The run's own step 2 is
+    # what exits 0 here.
+    envfile a8st.env 'MSS_BACKENDS=ollama\nMSS_POWER_AUTORESTART=yes\nMSS_DOCKER_AUTOSTART=yes\n'
+    DRIVE_BASE_PATH=$NODOCKER_PATH drive a8st "Choose [1]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" "$G_ENTER" \
+        "Install Colima and the Docker CLI with Homebrew? [y/N]: ${T}@ENTER" "Save? [Y/n]: ${T}@ENTER" -- \
+        MSS_ENV_FILE="$PK/a8st.env" MSS_DOCKER_JOB_PATH="$PK/job-none" MSS_PMSET="$ROOT/tests/stubs/pmset-none"
+    check "A8 stale DA and P keys: the run passes its own validation" 0 $?
+    check "A8 stale keys are dropped when DA and P are skipped" "no||" \
+        "$(saved a8st.env MSS_DOCKER_INSTALL)|$(saved a8st.env MSS_DOCKER_AUTOSTART)|$(saved a8st.env MSS_POWER_AUTORESTART)"
+    tr_of a8st | grep -Eq 'every boot\?|power failure\?' && fail "A8 stale keys: DA or P was asked" || ok "A8 stale keys: neither DA nor P was asked"
+    # The saved file now loads and validates: a second --configure-only run reaches the save again.
+    DRIVE_BASE_PATH=$NODOCKER_PATH drive a8st2 "Choose [1]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" "$G_ENTER" \
+        "Install Colima and the Docker CLI with Homebrew? [y/N]: ${T}@ENTER" "Save? [Y/n]: ${T}@ENTER" -- \
+        MSS_ENV_FILE="$PK/a8st.env" MSS_DOCKER_JOB_PATH="$PK/job-none" MSS_PMSET="$ROOT/tests/stubs/pmset-none"
+    check "A8 stale keys: the saved file is accepted on the next run" 0 $?
+
+    # DS4-only after an Ollama configuration whose binary was then removed: the
+    # save drops OLLAMA_BIN, and the run's own validation passes.
+    envfile a8ds4.env "MSS_BACKENDS=ollama\nOLLAMA_BIN=$PK/gone/ollama\n"
+    drive a8ds4 "Choose [1]: ${T}5" "later [4]: ${T}3" "path or https URL: ${T}$DS4M" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" \
+        "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" "$DA_ENTER" \
+        "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/a8ds4.env" DS4_BIN="$DS4B"
+    check "DS4-only after Ollama, with the Ollama binary gone, completes" 0 $?
+    check "DS4-only saves MSS_BACKENDS=ds4 and no OLLAMA_BIN" "ds4|" \
+        "$(saved a8ds4.env MSS_BACKENDS)|$(saved a8ds4.env OLLAMA_BIN)"
+    tr_of a8ds4 | grep -q 'OLLAMA_BIN: not an executable file' && fail "DS4-only validated OLLAMA_BIN" || ok "DS4-only never validates OLLAMA_BIN"
+
+    # (e, h) DI = y shows DA; --configure-only never runs brew for Docker.
+    DRIVE_BASE_PATH=$NODOCKER_PATH DRIVE_PATH="$PK/brewbin" drive a8e "Choose [1]: ${T}1" "auto-updates)? ${T}@ENTER" \
+        "$G_ENTER" "power failure? [y/N]: ${T}y" "Install Colima and the Docker CLI with Homebrew? [y/N]: ${T}y" \
+        "Currently off. [y/N]: ${T}y" "Save? [Y/n]: ${T}@ENTER" -- \
+        MSS_ENV_FILE="$PK/a8e.env" MSS_DOCKER_JOB_PATH="$PK/job-none"
+    check "A8e DI = y shows DA and saves both" "0 yes yes yes" \
+        "$? $(saved a8e.env MSS_DOCKER_INSTALL) $(saved a8e.env MSS_DOCKER_AUTOSTART) $(saved a8e.env MSS_POWER_AUTORESTART)"
+    check "A8h --configure-only never calls brew or colima" "" "$(grep -E '^(brew|colima)' "$PK/a8e.stublog")"
+    check "A8e summary" "  gpu memory: system default (from the next boot)
+  power restore: on (changed)
+  docker install: Colima and the Docker CLI with Homebrew
+  docker at boot: on (starts now if stopped)" "$(summary_of a8e)"
+
+    # One tool missing: DI names only that tool.
+    DRIVE_BASE_PATH=$NODOCKER_PATH DRIVE_PATH="$PK/brewbin" drive a8col "Choose [1]: ${T}1" "auto-updates)? ${T}@ENTER" \
+        "$G_ENTER" "$P_ENTER" "Install Colima with Homebrew? [y/N]: ${T}y" "$DA_ENTER" "Save? [Y/n]: ${T}@ENTER" -- \
+        MSS_ENV_FILE="$PK/a8col.env" MSS_DOCKER_JOB_PATH="$PK/job-docker"
+    check "A8 docker present, colima missing: DI names Colima" 0 $?
+    summary_of a8col | grep -qx '  docker install: Colima with Homebrew' && ok "A8 summary: Colima with Homebrew" || fail "A8 colima summary: $(summary_of a8col)"
+    DRIVE_BASE_PATH=$NODOCKER_PATH DRIVE_PATH="$PK/brewbin" drive a8dock "Choose [1]: ${T}1" "auto-updates)? ${T}@ENTER" \
+        "$G_ENTER" "$P_ENTER" "Install the Docker CLI with Homebrew? [y/N]: ${T}y" "$DA_ENTER" "Save? [Y/n]: ${T}@ENTER" -- \
+        MSS_ENV_FILE="$PK/a8dock.env" MSS_DOCKER_JOB_PATH="$PK/job-colima"
+    check "A8 colima present, docker missing: DI names the Docker CLI" 0 $?
+    summary_of a8dock | grep -qx '  docker install: the Docker CLI with Homebrew' && ok "A8 summary: the Docker CLI with Homebrew" || fail "A8 docker summary: $(summary_of a8dock)"
+
+    # A tool outside the job's PATH: neither Docker question, both keys dropped (D1).
+    DRIVE_BASE_PATH=$NODOCKER_PATH DRIVE_PATH="$PK/elsewhere" drive a8out "Choose [1]: ${T}1" "auto-updates)? ${T}@ENTER" \
+        "$G_ENTER" "$P_ENTER" "Save? [Y/n]: ${T}@ENTER" -- \
+        MSS_ENV_FILE="$PK/a8out.env" MSS_DOCKER_JOB_PATH="$PK/job-none" MSS_DOCKER_AUTOSTART=yes
+    check "A8 a tool outside the job PATH asks neither Docker question" 0 $?
+    tr_of a8out | grep -q "^colima is at $PK/elsewhere/colima, outside the boot job's PATH; move or link it into /opt/homebrew/bin or /usr/local/bin" \
+        && ok "A8 the skip line names the tool and path" || fail "A8 skip line: $(tr_of a8out | grep -i colima)"
+    check "A8 neither Docker key is saved" "|" "$(saved a8out.env MSS_DOCKER_INSTALL)|$(saved a8out.env MSS_DOCKER_AUTOSTART)"
+
+    # (g) a conflict between the environment and the file exits before the first prompt.
+    envfile a8g.env 'MSS_BACKENDS=ollama\nOLLAMA_GPU_PERCENT=80\n'
+    SHA_G=$(mss_shasum256 "$PK/a8g.env" | awk '{print $1}')
+    drive a8g -- MSS_ENV_FILE="$PK/a8g.env" MSS_GPU_PERCENT=85
+    check "A8g a legacy conflict exits 1" 1 $?
+    tr_of a8g | grep -q 'MSS_GPU_PERCENT=85 (environment) and OLLAMA_GPU_PERCENT=80 (backends.env) differ; keep one' \
+        && ok "A8g the message names both sources" || fail "A8g: $(tr_of a8g)"
+    tr_of a8g | grep -q 'Choose' && fail "A8g a prompt was shown" || ok "A8g no prompt was shown"
+    check "A8g the file is unchanged" "$SHA_G" "$(mss_shasum256 "$PK/a8g.env" | awk '{print $1}')"
+
+    # (i) no iogpu key: the default is system even when 80 is set, and 80 is refused.
+    drive a8i "Choose [1]: ${T}1" "auto-updates)? ${T}@ENTER" "or system [system]: ${T}80" "or system [system]: ${T}@ENTER" \
+        "$P_ENTER" "$DA_ENTER" "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/a8i.env" MSS_GPU_PERCENT=80 MSS_SYSCTL_MODE=missing
+    check "A8i no iogpu key: 80 refused, system saved" "0 system" "$? $(saved a8i.env MSS_GPU_PERCENT)"
+    tr_of a8i | grep -q 'this Mac has no iogpu.wired_limit_mb; answer system' && ok "A8i the refusal names system" || fail "A8i refusal"
+
+    # (j) the unchanged variants: an identical, loaded GPU job and Colima job
+    # under the sysroot, autorestart already 1, and Docker already installed.
+    S2=$PK/sysroot-s2; S2S=$PK/state-s2
+    rm -rf "$S2" "$S2S"; mkdir -p "$S2/Library/LaunchDaemons" "$S2S"
+    mss_gpu_render 80 104857 > "$S2/Library/LaunchDaemons/com.mac-studio-server.gpumemory.plist"
+    sed "s|<OLLAMA_USER>|$(id -un)|g" "$ROOT/config/com.colima.daemon.plist" > "$S2/Library/LaunchDaemons/com.colima.daemon.plist"
+    : > "$S2S/loaded-com.mac-studio-server.gpumemory"; : > "$S2S/loaded-com.colima.daemon"; echo 104857 > "$S2S/live"
+    DRIVE_PATH="$PK/statebin" drive a8j "Choose [1]: ${T}1" "auto-updates)? ${T}@ENTER" "or system [80]: ${T}@ENTER" \
+        "power failure? [Y/n]: ${T}@ENTER" "Currently on. [Y/n]: ${T}@ENTER" "Save? [Y/n]: ${T}@ENTER" -- \
+        MSS_ENV_FILE="$PK/a8j.env" MSS_TEST_SYSROOT="$S2" MSS_STUB_STATE="$S2S" \
+        MSS_PMSET="$ROOT/tests/stubs/pmset-autorestart-1" MSS_DOCKER_INSTALL=yes
+    check "A8j the unchanged row completes" 0 $?
+    check "A8j summary" "  gpu memory: 80% of RAM (unchanged)
+  power restore: on (unchanged)
+  docker install: already installed
+  docker at boot: on (unchanged)" "$(summary_of a8j)"
+    grep -Eq 'bootstrap|bootout|kickstart' "$S2S/calls.log" 2>/dev/null \
+        && fail "A8j --configure-only touched launchd" || ok "A8j --configure-only made no launchd change"
+    # The removal variants: a Colima job present and answered n, power 1 answered n, G system.
+    S3=$PK/sysroot-s3; rm -rf "$S3"; mkdir -p "$S3/Library/LaunchDaemons"
+    cp "$S2/Library/LaunchDaemons/com.colima.daemon.plist" "$S3/Library/LaunchDaemons/"
+    drive a8j2 "Choose [1]: ${T}1" "auto-updates)? ${T}@ENTER" "or system [system]: ${T}system" \
+        "power failure? [Y/n]: ${T}n" "Currently off. [Y/n]: ${T}n" "Save? [Y/n]: ${T}@ENTER" -- \
+        MSS_ENV_FILE="$PK/a8j2.env" MSS_TEST_SYSROOT="$S3" MSS_PMSET="$ROOT/tests/stubs/pmset-autorestart-1"
+    check "A8j the removal row completes" 0 $?
+    check "A8j removal summary" "  gpu memory: system default (from the next boot)
+  power restore: off (changed)
+  docker install: no
+  docker at boot: off (boot job removed; a running Colima keeps running)" "$(summary_of a8j2)"
+    # Every D3 variant is matched exactly by at least one row. G always sets a
+    # value, so the picker cannot reach "gpu memory: left as is"; that line is
+    # checked through the shared summary function instead.
+    ( MSS_TEST_SYSROOT=$PK/sysroot; export MSS_TEST_SYSROOT; mss_gpu_summary_line '' ) >> "$SUMMARY_SEEN" 2>&1
+    for v in "gpu memory: 80% of RAM (unchanged)" "gpu memory: 80% of RAM (applied now and at every boot)" \
+        "gpu memory: system default (from the next boot)" "gpu memory: left as is" \
+        "power restore: on (unchanged)" "power restore: on (changed)" "power restore: off (unchanged)" "power restore: off (changed)" \
+        "docker install: Colima and the Docker CLI with Homebrew" "docker install: Colima with Homebrew" \
+        "docker install: the Docker CLI with Homebrew" "docker install: already installed" "docker install: no" \
+        "docker at boot: on (unchanged)" "docker at boot: on (starts now if stopped)" \
+        "docker at boot: off (boot job removed; a running Colima keeps running)" "docker at boot: off (unchanged)" \
+        "docker at boot: left as is"; do
+        grep -qxF "  $v" "$SUMMARY_SEEN" && ok "A8j variant seen: $v" || fail "A8j variant never produced: $v"
+    done
 
     # S4: prompt lines stay within 100 characters.
     LONG=$(cat "$PK"/found.transcript "$PK"/ds4menu.transcript "$PK"/tweaks.transcript | tr -d '\r' \
@@ -994,6 +2534,10 @@ IS="$HOME/mac-studio-server/scripts/install.sh"
 sudo install -m 0755 "$ROOT/tests/stubs/fake-ollama.sh" /usr/local/bin/ollama
 PB="$TMP/pb"; mkdir -p "$PB"
 T=$(printf '\t')
+# The #27 host prompts this runner will show (G, then P, DI or DA as pmset and
+# the Docker tools decide), each answered with its default. Every bdrive row
+# that reaches the picker lists "$HS" right after the tweaks answer.
+HS=$(sh "$ROOT/tests/expect/host-steps.sh")
 for b in llamacpp ds4; do
     cp "$ROOT/tests/stubs/fake-server.sh" "$PB/$b-server"; chmod +x "$PB/$b-server"
     printf 'phase-b-model-%s' "$b" > "$PB/$b.gguf"
@@ -1035,6 +2579,33 @@ grep -q 'Which backends' "$PB/a2.log" && fail "A2 prompted without a terminal" |
 grep -Eq 'NOT_A_KEY|unknown key' "$PB/a2.log" && fail "A2 read the poisoned backends.env" || ok "A2 did not read backends.env"
 loaded com.ollama.service && ok "A2 com.ollama.service loaded" || fail "A2 com.ollama.service not loaded"
 wait_listen 11434 && curl -s http://127.0.0.1:11434/api/version | grep -q stub && ok "A2 stub ollama answers /api/version" || fail "A2 stub ollama unreachable"
+
+# O1 (#27 manual step 2): Ollama only at /opt/homebrew/bin, as Homebrew installs
+# it on Apple silicon, OLLAMA_BIN unset, env mode. The plist must run that
+# binary, launchd must start it, and status.sh must exit 0.
+if [ -e /opt/homebrew/bin/ollama ]; then
+    echo "skip - O1 needs a runner without /opt/homebrew/bin/ollama"
+else
+    sudo mv /usr/local/bin/ollama "$PB/ollama.usrlocal"
+    sudo mkdir -p /opt/homebrew/bin
+    sudo install -m 0755 "$ROOT/tests/stubs/fake-ollama.sh" /opt/homebrew/bin/ollama
+    MSS_BACKENDS=ollama MSS_TUNE_MACOS=no "$IS" </dev/null >"$PB/o1.log" 2>&1
+    check "O1 env mode with a Homebrew-only Ollama exits 0" 0 $?
+    grep -q '<string>/opt/homebrew/bin/ollama</string>' /Library/LaunchDaemons/com.ollama.service.plist \
+        && ok "O1 com.ollama.service runs /opt/homebrew/bin/ollama" \
+        || fail "O1 plist: $(grep -A1 ProgramArguments /Library/LaunchDaemons/com.ollama.service.plist | tail -n 1)"
+    loaded com.ollama.service && ok "O1 com.ollama.service is loaded" || fail "O1 not loaded"
+    wait_listen 11434 && curl -s http://127.0.0.1:11434/api/version | grep -q stub \
+        && ok "O1 the Homebrew Ollama answers /api/version" || fail "O1 no /api/version"
+    sh "$ROOT/scripts/status.sh" >"$PB/o1.status" 2>&1
+    check "O1 status.sh exits 0" 0 $?
+    # Back to the /usr/local/bin stub the rest of phase B expects, re-rendered.
+    sudo rm -f /opt/homebrew/bin/ollama
+    sudo mv "$PB/ollama.usrlocal" /usr/local/bin/ollama
+    MSS_BACKENDS=ollama MSS_TUNE_MACOS=no "$IS" </dev/null >"$PB/o1b.log" 2>&1
+    grep -q '<string>/usr/local/bin/ollama</string>' /Library/LaunchDaemons/com.ollama.service.plist \
+        && ok "O1 /usr/local/bin/ollama wins again once it is back" || fail "O1 restore: $(tail -3 "$PB/o1b.log")"
+fi
 
 # A3: MSS_BACKENDS set, no flag, on a pty: no menu, conf as rendered.
 bdrive a3 "" -- MSS_BACKENDS=ds4 DS4_BIN="$DS4B" DS4_MODEL="$DS4M" DS4_MODEL_SHA256="$DS4S" DS4_PORT=18000
@@ -1082,7 +2653,7 @@ LOGS="$HOME/mac-studio-server/logs"
 rm -f "$EFB"
 bdrive a5ll "" "Choose [1]: ${T}4" "brew install llama.cpp)? [y/N]: ${T}n" "binary path: ${T}$LLB" "later [1]: ${T}3" \
     "path or https URL: ${T}$LLM" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" "LAN access to llamacpp? [y/N]: ${T}@ENTER" \
-    "auto-updates)? ${T}n" "Install with these settings? [Y/n]: ${T}@ENTER" -- LLAMACPP_PORT=18080 PATH="$PATH_NOLL"
+    "auto-updates)? ${T}n" "$HS" "Install with these settings? [Y/n]: ${T}@ENTER" -- LLAMACPP_PORT=18080 PATH="$PATH_NOLL"
 check "A5 first-run picker install (llama.cpp only)" 0 $?
 check "A5 backends.env mode and owner" "600 $(id -un)" "$(stat -f '%Lp %Su' "$EFB" 2>/dev/null)"
 loaded com.mac-studio-server.llamacpp && loaded com.mac-studio-server.guard && ! loaded com.mac-studio-server.ds4 \
@@ -1094,9 +2665,10 @@ grep -q '^MSS_TUNE_MACOS=no$' "$EFB" && ok "A1 saved MSS_TUNE_MACOS=no" || fail 
 
 # A6 / A5: re-run with the saved file: no prompts (the password is not asked with NOPASSWD
 # sudo), same conf, no hash.
-cp "$CONFB" "$PB/conf.a5"
+cp "$CONFB" "$PB/conf.a5"; SHA_A6=$(mss_shasum256 "$EFB" | awk '{print $1}')
 bdrive a6 "" --
 check "A6 re-run with saved backends.env" 0 $?
+check "A2 loaded mode leaves backends.env's shasum unchanged" "$SHA_A6" "$(mss_shasum256 "$EFB" | awk '{print $1}')"
 has a6 'Choose' && fail "A6 prompted" || ok "A6 zero prompts"
 cmp -s "$CONFB" "$PB/conf.a5" && ok "A6 backends.conf byte-identical" || fail "A6 conf changed"
 has a6 'hashing ' && fail "A6 re-hashed the model" || ok "A6 model not re-hashed"
@@ -1114,7 +2686,7 @@ wait_listen 18081 && ok "A7 llama.cpp moved to 18081" || fail "A7 not listening 
 BEFORE=$(daemons)
 bdrive a10c "--configure-only" "Choose [4]: ${T}5" "in ~/ds4? [y/N]: ${T}n" "binary path: ${T}$DS4B" "later [4]: ${T}3" \
     "path or https URL: ${T}$DS4M" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" "LAN access to ds4? [y/N]: ${T}@ENTER" \
-    "auto-updates)? ${T}@ENTER" "Save? [Y/n]: ${T}@ENTER" -- DS4_PORT=18000
+    "auto-updates)? ${T}@ENTER" "$HS" "Save? [Y/n]: ${T}@ENTER" -- DS4_PORT=18000
 check "A10c --configure-only with another backend installed" 0 $?
 has a10c 'Remove it first' && fail "A10c asked the switch question" || ok "A10c no switch question"
 has a10c 'install.sh --configure will offer to replace it' && ok "A10c message names install.sh --configure" || fail "A10c message missing"
@@ -1126,7 +2698,7 @@ check "A10c /Library/LaunchDaemons unchanged" "$BEFORE" "$(daemons)"
 # A9: --configure switch to ds4, answer n.
 BEFORE=$(daemons); cp "$CONFB" "$PB/conf.a9"
 bdrive a9 "--configure" "Choose [4]: ${T}5" "(.gguf) path [$DS4M]: ${T}@ENTER" "c computes it now) [$DS4S]: ${T}@ENTER" \
-    "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" \
+    "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" "$HS" \
     "Install with these settings? [Y/n]: ${T}@ENTER" "--backend llamacpp? [y/N]: ${T}n" --
 check "A9 declining the switch exits 1" 1 $?
 has a9 'binary path' && fail "A9 asked for a saved binary (I7)" || ok "A9 a saved binary is not asked (I7)"
@@ -1136,7 +2708,7 @@ cmp -s "$CONFB" "$PB/conf.a9" && ok "A9 backends.conf unchanged" || fail "A9 con
 
 # A10 / A9 (sha): switch with a wrong ds4 sha256, answer y: stops at the check with exit 1.
 bdrive a10 "--configure" "Choose [4]: ${T}5" "(.gguf) path [$DS4M]: ${T}@ENTER" "c computes it now) [$DS4S]: ${T}$ZERO" \
-    "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" \
+    "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" "$HS" \
     "Install with these settings? [Y/n]: ${T}@ENTER" "--backend llamacpp? [y/N]: ${T}y" --
 check "A10 wrong sha stops the switch with exit 1" 1 $?
 has a10 'sha256 mismatch' && ok "A10 failed at the check" || fail "A10 did not fail at the check"
@@ -1149,7 +2721,7 @@ nc -l 127.0.0.1 18000 >/dev/null 2>&1 &
 NCPID=$!
 sleep 1
 bdrive a10b "--configure" "Choose [4]: ${T}5" "(.gguf) path [$DS4M]: ${T}@ENTER" "c computes it now) [$ZERO]: ${T}$DS4S" \
-    "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" \
+    "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" "$HS" \
     "Install with these settings? [Y/n]: ${T}@ENTER" "--backend llamacpp? [y/N]: ${T}y" --
 check "A10b foreign listener stops the switch with exit 1" 1 $?
 has a10b "port 18000 is in use (pid $NCPID); set DS4_PORT in backends.env and re-run" && ok "A10b names the pid and the variable (I6)" \
@@ -1160,7 +2732,7 @@ kill "$NCPID" 2>/dev/null; wait "$NCPID" 2>/dev/null
 
 # A8: switch llama.cpp -> ds4, answer y.
 bdrive a8 "--configure" "Choose [4]: ${T}5" "(.gguf) path [$DS4M]: ${T}@ENTER" "c computes it now) [$DS4S]: ${T}@ENTER" \
-    "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" \
+    "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" "$HS" \
     "Install with these settings? [Y/n]: ${T}@ENTER" "--backend llamacpp? [y/N]: ${T}y" --
 check "A8 switch llama.cpp -> ds4" 0 $?
 loaded com.mac-studio-server.ds4 && loaded com.mac-studio-server.guard && ! loaded com.mac-studio-server.llamacpp \
@@ -1172,7 +2744,7 @@ wait_listen 18000 && ok "A8 ds4 listening" || fail "A8 ds4 not listening"
 # A5 / F3: ollama + ds4 (same optional backend: no switch), headless tweaks answered y.
 touch "$PB/f3.marker"; sleep 1
 bdrive a5o3 "--configure" "Choose [5]: ${T}3" "(.gguf) path [$DS4M]: ${T}@ENTER" "c computes it now) [$DS4S]: ${T}@ENTER" \
-    "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}y" \
+    "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}y" "$HS" \
     "Install with these settings? [Y/n]: ${T}@ENTER" "(starter) 2) later [1]: ${T}2" --
 check "A5 ollama + ds4" 0 $?
 loaded com.ollama.service && loaded com.mac-studio-server.ds4 && ok "A5 ollama + ds4 labels" || fail "A5 option 3 labels: $(daemons)"
@@ -1185,7 +2757,7 @@ snap() { pmset -g custom 2>/dev/null; mdutil -s / 2>/dev/null; tmutil destinatio
     defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticCheckEnabled 2>/dev/null; }
 snap > "$PB/f2.before"; touch "$PB/f2.marker"; sleep 1
 bdrive a5o2 "--configure" "Choose [3]: ${T}2" "(.gguf) path [$LLM]: ${T}@ENTER" "c computes it now) [$LLS]: ${T}@ENTER" \
-    "LAN access to llamacpp? [y/N]: ${T}@ENTER" "auto-updates)? ${T}n" \
+    "LAN access to llamacpp? [y/N]: ${T}@ENTER" "auto-updates)? ${T}n" "$HS" \
     "Install with these settings? [Y/n]: ${T}@ENTER" "--backend ds4? [y/N]: ${T}y" "(starter) 2) later [1]: ${T}2" --
 check "A5 ollama + llama.cpp" 0 $?
 loaded com.ollama.service && loaded com.mac-studio-server.llamacpp && ! loaded com.mac-studio-server.ds4 \
@@ -1195,7 +2767,7 @@ cmp -s "$PB/f2.before" "$PB/f2.after" && ok "F2 pmset, mdutil, tmutil and update
 [ "$LOGS/optimization.log" -nt "$PB/f2.marker" ] && fail "F2 the optimizer ran" || ok "F2 optimization.log not written"
 
 # A5: ollama only (removes llama.cpp; no check to run).
-bdrive a5o1 "--configure" "Choose [2]: ${T}1" "auto-updates)? ${T}n" "Install with these settings? [Y/n]: ${T}@ENTER" \
+bdrive a5o1 "--configure" "Choose [2]: ${T}1" "auto-updates)? ${T}n" "$HS" "Install with these settings? [Y/n]: ${T}@ENTER" \
     "--backend llamacpp? [y/N]: ${T}y" "(starter) 2) later [1]: ${T}2" --
 check "A5 ollama only" 0 $?
 loaded com.ollama.service && ! loaded com.mac-studio-server.llamacpp && ! loaded com.mac-studio-server.guard \
@@ -1203,7 +2775,7 @@ loaded com.ollama.service && ! loaded com.mac-studio-server.llamacpp && ! loaded
 
 # A5: MSS_BACKENDS set in the environment, --configure choosing ds4 only.
 bdrive a5env "--configure" "Choose [4]: ${T}5" "(.gguf) path [$DS4M]: ${T}@ENTER" "c computes it now) [$DS4S]: ${T}@ENTER" \
-    "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}n" \
+    "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}n" "$HS" \
     "Install with these settings? [Y/n]: ${T}@ENTER" -- MSS_BACKENDS=llamacpp
 check "A5 --configure overrides MSS_BACKENDS from the environment" 0 $?
 loaded com.mac-studio-server.ds4 && ! loaded com.mac-studio-server.llamacpp && ok "A5 env run installed ds4" || fail "A5 env run labels: $(daemons)"
@@ -1231,7 +2803,7 @@ echo "== phase B: 1.5.0 model later, model.sh, stamp and prompts (#15) =="
 # M1: llama.cpp with a model later: the conf says waiting and no backend or guard job exists.
 EFM="$PB/m.env"
 bdrive m1 "--configure" "Choose [5]: ${T}4" "brew install llama.cpp)? [y/N]: ${T}n" "binary path: ${T}$LLB" "later [1]: ${T}4" \
-    "LAN access to llamacpp? [y/N]: ${T}@ENTER" "auto-updates)? ${T}n" \
+    "LAN access to llamacpp? [y/N]: ${T}@ENTER" "auto-updates)? ${T}n" "$HS" \
     "Install with these settings? [Y/n]: ${T}@ENTER" "--backend ds4? [y/N]: ${T}y" -- \
     MSS_ENV_FILE="$EFM" LLAMACPP_PORT=18082 PATH="$PATH_NOLL"
 check "M1 install with a model later" 0 $?
@@ -1309,7 +2881,7 @@ nc -l 127.0.0.1 8080 >/dev/null 2>&1 &
 NCPID=$!
 sleep 1; BEFORE=$(daemons)
 bdrive f7 "--configure" "Choose [1]: ${T}4" "later [1]: ${T}3" "path or https URL: ${T}$LLM" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" \
-    "LAN access to llamacpp? [y/N]: ${T}@ENTER" "auto-updates)? ${T}n" "Install with these settings? [Y/n]: ${T}@ENTER" -- \
+    "LAN access to llamacpp? [y/N]: ${T}@ENTER" "auto-updates)? ${T}n" "$HS" "Install with these settings? [Y/n]: ${T}@ENTER" -- \
     MSS_ENV_FILE="$PB/f7.env" LLAMACPP_BIN="$LLB"
 check "F7 a busy default port exits 1" 1 $?
 has f7 "port 8080 is in use (pid $NCPID); set LLAMACPP_PORT in backends.env and re-run" && ok "F7 names the pid, LLAMACPP_PORT and backends.env" \
@@ -1478,6 +3050,181 @@ precedes "$RB/b3-defer.log" 'com.mac-studio-server.ds4 stopped after' 'bootstrap
 ! loaded com.mac-studio-server.ds4 && ! loaded com.mac-studio-server.guard && ok "B3 deferred: ds4 and guard are not loaded" \
     || fail "B3 deferred: ds4 or guard is loaded"
 sudo rm -f "$DELAY" /tmp/mss-stub-pf.rules
+
+echo "== phase B: #27 B1 GPU boot job, B2 Colima boot job (real launchd) =="
+# These rows run against the real launchd and the real kernel key. A row that
+# the runner cannot answer is skipped by name, never passed silently.
+B27=$TMP/b27; mkdir -p "$B27"
+b27_install() { # b27_install <log> <env=...>...: install.sh in env mode as root
+    _bl=$1; shift
+    sudo env MSS_BACKENDS=ollama OLLAMA_USER="$(id -un)" MSS_TUNE_MACOS=no "$@" \
+        sh "$ROOT/scripts/install.sh" </dev/null >"$_bl" 2>&1
+}
+LIVE27=$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo '')
+if [ -z "$LIVE27" ]; then
+    echo "skip - B1 needs iogpu.wired_limit_mb (not readable on this runner)"
+elif ! sudo sysctl iogpu.wired_limit_mb="$LIVE27" >/dev/null 2>&1; then
+    echo "skip - B1 needs iogpu.wired_limit_mb to be writable (rewriting $LIVE27 failed on this runner)"
+else
+    MB27=$(mss_wired_limit_mb 80)
+    # (a) the legacy job as a v1.5.0 machine has it: loaded, recording 80. Its
+    # program only reads the key, so seeding it changes nothing.
+    cat > "$B27/legacy.plist" <<'LEGACY'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ollama.gpumemory</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/sbin/sysctl</string>
+        <string>-n</string>
+        <string>iogpu.wired_limit_mb</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>OLLAMA_GPU_PERCENT</key>
+        <string>80</string>
+    </dict>
+</dict>
+</plist>
+LEGACY
+    sudo install -m 644 -o root -g wheel "$B27/legacy.plist" /Library/LaunchDaemons/com.ollama.gpumemory.plist
+    sudo launchctl bootstrap system /Library/LaunchDaemons/com.ollama.gpumemory.plist 2>/dev/null
+    loaded com.ollama.gpumemory && ok "B1 the legacy job is seeded and loaded" || fail "B1 could not seed the legacy job"
+    b27_install "$B27/gpu1.log" MSS_GPU_PERCENT=80 && ok "B1 install with MSS_GPU_PERCENT=80 exits 0" \
+        || fail "B1 install: $(tail -3 "$B27/gpu1.log")"
+    loaded com.mac-studio-server.gpumemory && ok "B1 the new job is loaded" || fail "B1 new job not loaded"
+    ! loaded com.ollama.gpumemory && ok "B1 the legacy job is booted out" || fail "B1 legacy job still loaded"
+    [ ! -e /Library/LaunchDaemons/com.ollama.gpumemory.plist ] && ok "B1 the legacy plist is gone" || fail "B1 legacy plist kept"
+    check "B1 the live limit equals MB" "$MB27" "$(sysctl -n iogpu.wired_limit_mb 2>/dev/null)"
+    launchctl print system/com.mac-studio-server.gpumemory 2>/dev/null \
+        | grep -q 'last exit code = 0' && ok "B1 the job exited 0" || fail "B1 job exit code"
+    # (b) a second run leaves the plist untouched and reports unchanged.
+    INODE1=$(stat -f '%i %m' /Library/LaunchDaemons/com.mac-studio-server.gpumemory.plist)
+    b27_install "$B27/gpu2.log" MSS_GPU_PERCENT=80 && ok "B1 a second install exits 0" \
+        || fail "B1 second install: $(tail -3 "$B27/gpu2.log")"
+    check "B1 the plist is not rewritten" "$INODE1" \
+        "$(stat -f '%i %m' /Library/LaunchDaemons/com.mac-studio-server.gpumemory.plist)"
+    grep -q "GPU memory: 80% ($MB27 MB), unchanged" "$B27/gpu2.log" \
+        && ok "B1 the second run says unchanged" || fail "B1 second run: $(grep 'GPU memory' "$B27/gpu2.log")"
+    # (c) system removes both jobs; seed the legacy one again so "both" is real.
+    sudo install -m 644 -o root -g wheel "$B27/legacy.plist" /Library/LaunchDaemons/com.ollama.gpumemory.plist
+    sudo launchctl bootstrap system /Library/LaunchDaemons/com.ollama.gpumemory.plist 2>/dev/null
+    b27_install "$B27/gpu3.log" MSS_GPU_PERCENT=system && ok "B1 install with system exits 0" \
+        || fail "B1 system install: $(tail -3 "$B27/gpu3.log")"
+    [ ! -e /Library/LaunchDaemons/com.mac-studio-server.gpumemory.plist ] \
+        && ok "B1 system removed the new plist" || fail "B1 new plist kept"
+    [ ! -e /Library/LaunchDaemons/com.ollama.gpumemory.plist ] \
+        && ok "B1 system removed the legacy plist" || fail "B1 legacy plist kept"
+    ! loaded com.mac-studio-server.gpumemory && ! loaded com.ollama.gpumemory \
+        && ok "B1 system left neither label loaded" || fail "B1 a GPU label is still loaded"
+    # (d) the runner's own live value comes back.
+    sudo sysctl iogpu.wired_limit_mb="$LIVE27" >/dev/null 2>&1
+    check "B1 the original live value is restored" "$LIVE27" "$(sysctl -n iogpu.wired_limit_mb 2>/dev/null)"
+fi
+
+# B2: the Colima boot job. A runner with a real colima would start a VM, so it
+# is skipped. Otherwise stub colima and docker go on the boot job's PATH (the
+# validation needs both, D1). The docker stub answers `info` unless
+# /tmp/mss-b2-docker-down exists, and the colima stub prints
+# /tmp/mss-b2-colima-list for `list`; both log every call.
+if [ -e /opt/homebrew/bin/colima ] || [ -e /usr/local/bin/colima ]; then
+    echo "skip - B2 needs a runner without colima in /opt/homebrew/bin or /usr/local/bin"
+else
+    B2LOG=/tmp/mss-b2-tools.log; sudo rm -f "$B2LOG" /tmp/mss-b2-docker-down /tmp/mss-b2-colima-list
+    cat > "$B27/colima" <<STUB
+#!/bin/sh
+echo "colima \$*" >> $B2LOG
+[ "\${1:-}" = list ] && [ -f /tmp/mss-b2-colima-list ] && cat /tmp/mss-b2-colima-list
+exit 0
+STUB
+    cat > "$B27/docker" <<STUB
+#!/bin/sh
+echo "docker \$*" >> $B2LOG
+[ "\${1:-}" = info ] && [ -e /tmp/mss-b2-docker-down ] && exit 1
+exit 0
+STUB
+    B2STUBS=""
+    sudo mkdir -p /usr/local/bin
+    for t in colima docker; do
+        [ -e "/opt/homebrew/bin/$t" ] || [ -e "/usr/local/bin/$t" ] && continue
+        sudo install -m 755 "$B27/$t" "/usr/local/bin/$t" && B2STUBS="$B2STUBS /usr/local/bin/$t"
+    done
+    b2_runs() { # the job's run count, waiting up to 20 s for the first run
+        _r=0
+        for _i in $(seq 1 40); do
+            _r=$(launchctl print system/com.colima.daemon 2>/dev/null | awk '$1 == "runs" { print $3; exit }')
+            [ "${_r:-0}" -ge 1 ] && break
+            sleep 0.5
+        done
+        echo "${_r:-0}"
+    }
+    b27_install "$B27/da1.log" MSS_DOCKER_AUTOSTART=yes && ok "B2 autostart=yes installs the job" \
+        || fail "B2 autostart install: $(tail -3 "$B27/da1.log")"
+    loaded com.colima.daemon && ok "B2 the job is loaded" || fail "B2 job not loaded"
+    check "B2 the job ran once" 1 "$(b2_runs)"
+    DA_STAT=$(stat -f '%i %m' /Library/LaunchDaemons/com.colima.daemon.plist 2>/dev/null)
+    b27_install "$B27/da2.log" MSS_DOCKER_AUTOSTART=yes && ok "B2 a second autostart run exits 0" \
+        || fail "B2 second run: $(tail -3 "$B27/da2.log")"
+    check "B2 a re-run keeps runs = 1" 1 "$(b2_runs)"
+    check "B2 the plist is not rewritten" "$DA_STAT" "$(stat -f '%i %m' /Library/LaunchDaemons/com.colima.daemon.plist 2>/dev/null)"
+    grep -q 'Docker at boot: on, unchanged' "$B27/da2.log" \
+        && ok "B2 the second run says unchanged" || fail "B2 second run: $(grep 'Docker at boot' "$B27/da2.log")"
+    b27_install "$B27/da3.log" && ok "B2 autostart unset exits 0" || fail "B2 unset run: $(tail -3 "$B27/da3.log")"
+    grep -q 'Docker at boot: left as is' "$B27/da3.log" \
+        && ok "B2 unset says left as is" || fail "B2 unset: $(grep 'Docker at boot' "$B27/da3.log")"
+    check "B2 unset keeps runs = 1" 1 "$(b2_runs)"
+    check "B2 unset leaves the plist" "$DA_STAT" "$(stat -f '%i %m' /Library/LaunchDaemons/com.colima.daemon.plist 2>/dev/null)"
+    # So far the job ran start-colima.sh once, which stopped at `docker info`;
+    # install.sh ran neither tool.
+    check "B2 colima was never called" "" "$(grep '^colima' "$B2LOG" 2>/dev/null)"
+    check "B2 docker was called only by the job's check" "docker info" "$(sort -u "$B2LOG" 2>/dev/null)"
+
+    # B2 boot run (manual step 9 at a44b988): Docker down and an existing VM, as
+    # after a reboot. launchd runs the real job, which must start Colima with no
+    # sizing flags whether the list shows the VM or comes back empty.
+    if [ -z "$B2STUBS" ] || [ "$(printf '%s\n' $B2STUBS | wc -l | tr -d ' ')" != 2 ]; then
+        echo "skip - B2 boot run needs both stub tools (a real docker or colima is on this runner)"
+    else
+        B2CH=0
+        if [ ! -e "$HOME/.colima" ]; then
+            mkdir -p "$HOME/.colima/default"; printf 'cpu: 6\nmemory: 12\ndisk: 80\n' > "$HOME/.colima/default/colima.yaml"; B2CH=1
+        fi
+        B2YAML=$(mss_shasum256 "$HOME/.colima/default/colima.yaml" 2>/dev/null | awk '{print $1}')
+        for listing in listed empty; do
+            if [ "$listing" = listed ]; then printf '{"name":"default","status":"Stopped","cpus":6}\n' > /tmp/mss-b2-colima-list
+            else : > /tmp/mss-b2-colima-list; fi
+            : > /tmp/mss-b2-docker-down; : > "$B2LOG"
+            sudo launchctl kickstart -k system/com.colima.daemon
+            for _i in $(seq 1 40); do grep -q '^colima start' "$B2LOG" 2>/dev/null && break; sleep 0.5; done
+            check "B2 boot run with the VM $listing starts Colima with no sizing flags" "colima start" \
+                "$(grep '^colima start' "$B2LOG" | head -n 1)"
+            grep -q '^colima list --json' "$B2LOG" && ok "B2 boot run ($listing) looked the VM up first" || fail "B2 boot run ($listing): $(cat "$B2LOG")"
+            # Docker comes up, so the job's wait loop ends.
+            rm -f /tmp/mss-b2-docker-down
+            for _i in $(seq 1 20); do
+                launchctl print system/com.colima.daemon 2>/dev/null | grep -q 'state = running' || break; sleep 0.5
+            done
+        done
+        check "B2 boot runs left colima.yaml untouched" "$B2YAML" \
+            "$(mss_shasum256 "$HOME/.colima/default/colima.yaml" 2>/dev/null | awk '{print $1}')"
+        rm -f /tmp/mss-b2-colima-list
+        [ "$B2CH" = 0 ] || rm -rf "$HOME/.colima"
+    fi
+
+    b27_install "$B27/da4.log" MSS_DOCKER_AUTOSTART=no && ok "B2 autostart=no exits 0" \
+        || fail "B2 no run: $(tail -3 "$B27/da4.log")"
+    [ ! -e /Library/LaunchDaemons/com.colima.daemon.plist ] && ok "B2 no removed the plist" || fail "B2 no kept the plist"
+    ! loaded com.colima.daemon && ok "B2 no removed the label" || fail "B2 label still loaded"
+    sudo launchctl bootout system/com.colima.daemon 2>/dev/null
+    sudo rm -f /Library/LaunchDaemons/com.colima.daemon.plist "$B2LOG" /tmp/mss-b2-docker-down /tmp/mss-b2-colima-list
+    # shellcheck disable=SC2086  # our own list of stub paths
+    [ -z "$B2STUBS" ] || sudo rm -f $B2STUBS
+fi
 
 sudo sh "$ROOT/scripts/uninstall.sh" --all >/dev/null 2>&1
 

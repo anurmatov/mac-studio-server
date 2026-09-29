@@ -1,0 +1,30 @@
+#!/bin/sh
+# pmset stub with state. autorestart reads 1 until something writes it, after
+# which it reads what was written — that is how the real `pmset -a` and `pmset
+# -g` pair up, and the "changed" rows below assert the read-back. A stub whose
+# read never moves can only ever prove "unchanged". The row that must FAIL its
+# read-back is tests/stubs/pmset-sticky.
+_s=${MSS_STUB_STATE:-.}
+# Every call is logged when a state directory is given, so a row can count
+# the writes (constraint 4: `pmset -a` only when set and different).
+[ -z "${MSS_STUB_STATE:-}" ] || echo "pmset $*" >> "$MSS_STUB_STATE/pmset.log"
+case ${1:-} in
+    -g)
+        _v=1
+        [ -f "$_s/pmset-autorestart" ] && _v=$(cat "$_s/pmset-autorestart")
+        echo ' Battery Power:'
+        printf '\tautorestart         %s\n' "$_v"
+        exit 0 ;;
+    -a)
+        shift
+        while [ "$#" -gt 0 ]; do
+            if [ "$1" = autorestart ] && [ -n "${2:-}" ]; then
+                echo "$2" > "$_s/pmset-autorestart"
+                shift 2
+                continue
+            fi
+            shift
+        done
+        exit 0 ;;
+esac
+exit 0

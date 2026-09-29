@@ -194,6 +194,22 @@ mss_acquire_ollama_brew() {
     export OLLAMA_BIN
 }
 
+# mss_acquire_docker_brew: install only the Docker tools missing from the boot
+# job's PATH (#27 D5). Never upgrade, reinstall or uninstall — a re-run is
+# brew's to resume.
+mss_acquire_docker_brew() {
+    local brew tools _t
+    brew=$(mss_brew) || return 1
+    tools=""
+    for _t in colima docker; do
+        _mss_job_tool "$_t" >/dev/null 2>&1 || tools="$tools $_t"
+    done
+    [ -n "$tools" ] || return 0
+    # shellcheck disable=SC2086  # the tool list is our own two literals
+    HOMEBREW_NO_ASK=1 "$brew" install $tools </dev/null >&2 || return 1
+    return 0
+}
+
 mss_acquire_llamacpp_brew() {
     local brew
     brew=$(mss_brew) || return 1

@@ -9,6 +9,8 @@ set -u
 
 REPO_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 . "$REPO_DIR/scripts/lib/mss-common.sh"
+. "$REPO_DIR/scripts/lib/mss-host.sh"
+mss_host_root_guard
 
 usage() { echo "usage: uninstall.sh --backend {ollama|llamacpp|ds4} | --all [--purge-logs]" >&2; exit 2; }
 
@@ -72,6 +74,11 @@ case $TARGET in
         fi
         ;;
     all)
+        # D10: both GPU labels go with --all, never with --backend. The live
+        # wired limit stays until the next reboot.
+        mss_gpu_jobs_remove \
+            && echo "removed both GPU boot jobs (the live wired limit lasts until reboot)" \
+            || mss_error "could not remove both GPU boot jobs; check launchctl print system/$MSS_GPU_LABEL"
         remove_plist com.ollama.service
         remove_plist com.mac-studio-server.llamacpp
         remove_plist com.mac-studio-server.ds4

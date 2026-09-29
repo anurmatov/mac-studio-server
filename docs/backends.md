@@ -52,7 +52,8 @@ rejected before any system change.
 See `config/backends.env.example` for the full annotated list: `MSS_BACKENDS`,
 `OLLAMA_BIND`, `<BACKEND>_BIN/_MODEL/_MODEL_SHA256/_HOST/_PORT/_ALLOW_FROM`,
 `LLAMACPP_API_KEY_FILE/_CTX/_PARALLEL`, `DS4_CTX/_BATCHED_SESSIONS/_WORKDIR`,
-`<BACKEND>_EXTRA_ARGS`, and the guard/log knobs
+`<BACKEND>_EXTRA_ARGS`, the host choices (`MSS_GPU_PERCENT`, `MSS_DOCKER_INSTALL`,
+`MSS_DOCKER_AUTOSTART`, `MSS_POWER_AUTORESTART`), and the guard/log knobs
 (`MSS_GUARD_FREE_PCT`, `MSS_GUARD_SWAP_HEADROOM_MB`, `MSS_GUARD_STREAK`,
 `MSS_LOG_MAX_MB`).
 
@@ -73,8 +74,8 @@ export DS4_MODEL_SHA256=<sha256>
 `sudo`, which validates every variable and hashes the model before anything
 else changes. On a match it keeps a root-owned verification stamp, so the
 install that follows does not hash again, and a re-install with an unchanged
-model skips the hash entirely. `OLLAMA_GPU_PERCENT` installs `com.ollama.gpumemory` whatever
-the selection, and an optional backend waits for that wired limit at start.
+model skips the hash entirely. `MSS_GPU_PERCENT` installs `com.mac-studio-server.gpumemory`
+whatever the selection, and an optional backend waits for that wired limit at start.
 
 ## Interactive install and backends.env (1.4.0)
 
@@ -119,7 +120,7 @@ A plain `install.sh` with a saved file never switches.
 ## One-line install, model.sh and acquisition variables (1.5.0)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/anurmatov/mac-studio-server/v1.5.0/bootstrap.sh | sh
+curl -fsSL https://raw.githubusercontent.com/anurmatov/mac-studio-server/v1.6.0/bootstrap.sh | sh
 ./scripts/model.sh                                        # menu: starter, more, own file/URL
 ./scripts/model.sh --catalog qwen3-4b                     # or --path FILE --sha256 HEX
 ./scripts/model.sh --url https://… --sha256 HEX [--dest FILE]
@@ -136,7 +137,7 @@ Models come from `config/models.catalog` (pinned revisions and sha256), download
 | variable | where | effect |
 |---|---|---|
 | `MSS_DEFER_MODEL=yes` | `backends.env` | install llama.cpp or ds4 without a model; no backend job until `model.sh` |
-| `OLLAMA_BIN` | `backends.env` | Ollama binary in the plist (default `/usr/local/bin/ollama`) |
+| `OLLAMA_BIN` | `backends.env` | Ollama binary in the plist (unset: `/usr/local/bin/ollama`, `PATH`, then `/opt/homebrew/bin/ollama`); saved and checked only when Ollama is selected |
 | `MSS_TUNE_MACOS=yes/no` | `backends.env` | headless tweaks; unset runs them with Ollama, as in 1.4.0 |
 | `DS4_BUILD_DIR` | environment only | build ds4-server at the pinned commit there (not with `DS4_BIN`) |
 | `LLAMACPP_BREW_INSTALL=yes` | environment only | `brew install llama.cpp` when `LLAMACPP_BIN` is unset |
@@ -164,6 +165,9 @@ sudo ./scripts/uninstall.sh --all [--purge-logs]          # idempotent
   backend's variables and re-run the installer. Switching optional backends
   requires `scripts/uninstall.sh --backend <old>` first — nothing is removed
   silently.
+- **`OLLAMA_GPU_PERCENT` and `DOCKER_AUTOSTART` (1.5.0 names):** deprecated but
+  still read; the installer migrates them and prints a notice. See
+  `docs/options.md`.
 
 ## Tested reference (ds4)
 

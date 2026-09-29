@@ -8,6 +8,8 @@ set -u
 
 REPO_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 . "$REPO_DIR/scripts/lib/mss-common.sh"
+. "$REPO_DIR/scripts/lib/mss-host.sh"
+mss_host_root_guard
 
 MSS_CONF=${MSS_CONF:-/usr/local/etc/mac-studio-server/backends.conf}
 MSS_PFCTL=${MSS_PFCTL:-/sbin/pfctl}
@@ -117,6 +119,44 @@ if [ -n "$_opt" ]; then
     fi
 else
     [ -r "$MSS_CONF" ] || [ "$_sel" = ollama ] || { echo "no backends.conf found and no optional backend installed"; exit 1; }
+fi
+
+# ── host choices (#27 D9): read-only lines; power and Docker never change the
+# exit code ────────────────────────────────────────────────────────────────────
+echo "host:"
+_r=$(mss_gpu_job_read); _kind=${_r%%|*}; _rec=${_r#*|}
+case $_kind in
+    both)
+        unhealthy "gpu memory" "both GPU boot jobs installed; run scripts/install.sh with MSS_GPU_PERCENT" ;;
+    new)
+        # The recorded percent goes into arithmetic below, so anything but
+        # 1-100 without a leading zero is treated as unreadable.
+        if [ "$_rec" = unreadable ] || ! mss_match "$_rec" '^[1-9][0-9]{0,2}$' || [ "$_rec" -gt 100 ]; then
+            unhealthy "gpu memory" "$MSS_GPU_LABEL is unreadable"
+        else
+            _mb=$(mss_wired_limit_mb "$_rec" 2>/dev/null)
+            _live=$(_mss_sysctl -n iogpu.wired_limit_mb 2>/dev/null)
+            if [ -n "$_mb" ] && [ "$_live" = "$_mb" ]; then
+                healthy "gpu memory" "$_rec% ($_mb MB), live $_live MB ($MSS_GPU_LABEL)"
+            else
+                unhealthy "gpu memory" "$_rec% wants $_mb MB, live ${_live:-unreadable} MB ($MSS_GPU_LABEL)"
+            fi
+        fi ;;
+    legacy)
+        healthy "gpu memory" "${_rec:-80}% via $MSS_GPU_LABEL_LEGACY, live $(_mss_sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo unreadable) MB"
+        echo "    $(mss_gpu_legacy_note)" ;;
+    none)
+        healthy "gpu memory" "system default (no boot job)" ;;
+esac
+
+_pcur=$(mss_power_current) && _pw="$_pcur" || _pw="unsupported"
+echo "  $(printf '%-10s %s' 'power' "restore autorestart=$_pw")"
+
+if [ -f "$(mss_daemon_dir)/$MSS_DOCKER_LABEL.plist" ]; then
+    _d=off; _mss_gpu_loaded "$MSS_DOCKER_LABEL" && _d=on
+    echo "  $(printf '%-10s %s' 'docker' "at boot $_d ($MSS_DOCKER_LABEL)")"
+else
+    echo "  $(printf '%-10s %s' 'docker' "at boot off ($MSS_DOCKER_LABEL not installed)")"
 fi
 
 [ "$fail" -eq 0 ] || exit 1
