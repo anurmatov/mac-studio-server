@@ -15,6 +15,10 @@
 # date, not an epoch — so a format using them is refused rather than answered
 # with a value that means something else. B1 needs `%i %m` and runs on macOS
 # only, where the real stat answers it.
+#
+# On macOS the real stat already is BSD stat, and it has no -c: the stub steps
+# aside there, so a row that puts it on PATH runs the same on both systems.
+[ "$(uname)" != Darwin ] || exec /usr/bin/stat "$@"
 _fmt=''
 _args=''
 _bsd=0

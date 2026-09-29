@@ -4,6 +4,8 @@
 #   calls.log        every argv, one line per call
 #   loaded-<service> present while that service is loaded
 #   runs-<service>   RunAtLoad counter
+# `print` of a loaded service reports `state = running`, the runs counter and a
+# last exit code, which is all status.sh and the apply helpers read.
 # bootstrap/kickstart/bootout of a service whose *label* ends in .gpumemory
 # simulate RunAtLoad by copying the plist's iogpu.wired_limit_mb=<n> into the
 # sysctl state — except when MSS_SYSCTL_MODE=stuck, which models a kernel that
@@ -40,6 +42,7 @@ case ${1:-} in
     print)
         [ -f "$_s/loaded-$(_svc_label "$2")" ] || exit 1
         _l=$(_svc_label "$2")
+        echo "    state = running"
         echo "    runs = $(cat "$_s/runs-$_l" 2>/dev/null || echo 0)"
         # MSS_SYSCTL_MODE=stuck models a job that ran and was refused by the
         # kernel, so the reported exit code has to say so — the A10e row asserts

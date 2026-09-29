@@ -5,6 +5,9 @@
 # read never moves can only ever prove "unchanged". The row that must FAIL its
 # read-back is tests/stubs/pmset-sticky.
 _s=${MSS_STUB_STATE:-.}
+# Every call is logged when a state directory is given, so a row can count
+# the writes (constraint 4: `pmset -a` only when set and different).
+[ -z "${MSS_STUB_STATE:-}" ] || echo "pmset $*" >> "$MSS_STUB_STATE/pmset.log"
 case ${1:-} in
     -g)
         _v=1

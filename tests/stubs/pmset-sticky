@@ -1,5 +1,7 @@
 #!/bin/sh
-# pmset stub: a write succeeds but the readback never changes (reads 0).
+# pmset stub: a write succeeds but the readback never changes (reads 0). Calls
+# are logged when a state directory is given.
+[ -z "${MSS_STUB_STATE:-}" ] || echo "pmset $*" >> "$MSS_STUB_STATE/pmset.log"
 case ${1:-} in
     -g) echo ' Battery Power:'; echo '	autorestart         0'; exit 0 ;;
     -a) exit 0 ;;
