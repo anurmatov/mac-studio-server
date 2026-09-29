@@ -323,12 +323,16 @@ _mss_gpu_remove_label() {
 }
 
 # _mss_install_plist <rendered-tmp> <dest>: root:wheel 0644, moved into place.
-# Ownership is best-effort and mode is authoritative: `chown root:wheel` has no
-# target group on a Linux runner, and a non-root phase A pass cannot hand a file
-# to root at all, so a hard failure here would make the step untestable rather
-# than unsafe. The mode is what launchd reads, and it is enforced unconditionally.
+# On a real Mac a failed chown stops the step: a user-owned plist must never
+# land in /Library/LaunchDaemons. Only inside a test sysroot (refused as root)
+# is ownership best-effort, because a non-root phase A pass cannot hand a file
+# to root and Linux has no wheel group.
 _mss_install_plist() {
-    _mss_root chown root:wheel "$1" 2>/dev/null || _mss_root chown root "$1" 2>/dev/null || true
+    if [ -n "${MSS_TEST_SYSROOT:-}" ]; then
+        _mss_root chown root:wheel "$1" 2>/dev/null || _mss_root chown root "$1" 2>/dev/null || true
+    else
+        _mss_root chown root:wheel "$1" || { mss_error "cannot make $1 root:wheel; nothing was installed"; return 1; }
+    fi
     _mss_root chmod 644 "$1" && _mss_root mv -f "$1" "$2"
 }
 

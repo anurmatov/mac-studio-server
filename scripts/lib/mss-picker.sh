@@ -565,7 +565,7 @@ _mss_pick_gpu() {
     def=${MSS_GPU_PERCENT:-}
     r=$(mss_gpu_job_read); kind=${r%%|*}; rec=${r#*|}
     [ -n "$def" ] || case $kind in
-        new|legacy|both) [ "$rec" = unreadable ] && def=system || def=$rec ;;
+        new|legacy|both) case $rec in [1-9]|[1-9][0-9]|100) def=$rec ;; *) def=system ;; esac ;;
         *) def=system ;;
     esac
     # A Mac without the limit can only answer system, so that is the default.
@@ -584,6 +584,9 @@ _mss_pick_power() {
     local cur
     if ! cur=$(mss_power_current); then
         echo "This Mac has no restart-after-power-failure setting; skipped" >&2
+        # A value loaded from backends.env would be saved again and refused by
+        # step 2 on every later run, so a skipped P saves nothing.
+        unset MSS_POWER_AUTORESTART
         return 0
     fi
     local def=N
@@ -633,6 +636,9 @@ _mss_pick_docker_autostart() {
     # DI returned 1 because a Docker tool sits outside the boot job's PATH.
     [ "${1:-}" = skipped ] && return 0
     if _mss_docker_missing && [ "${MSS_DOCKER_INSTALL:-}" != yes ]; then
+        # D3: a skipped DA leaves autostart as it is. A loaded yes would be saved
+        # again and refused by step 2 on every later run.
+        unset MSS_DOCKER_AUTOSTART
         return 0
     fi
     local def=N

@@ -129,7 +129,9 @@ case $_kind in
     both)
         unhealthy "gpu memory" "both GPU boot jobs installed; run scripts/install.sh with MSS_GPU_PERCENT" ;;
     new)
-        if [ "$_rec" = unreadable ]; then
+        # The recorded percent goes into arithmetic below, so anything but
+        # 1-100 without a leading zero is treated as unreadable.
+        if [ "$_rec" = unreadable ] || ! mss_match "$_rec" '^[1-9][0-9]{0,2}$' || [ "$_rec" -gt 100 ]; then
             unhealthy "gpu memory" "$MSS_GPU_LABEL is unreadable"
         else
             _mb=$(mss_wired_limit_mb "$_rec" 2>/dev/null)
