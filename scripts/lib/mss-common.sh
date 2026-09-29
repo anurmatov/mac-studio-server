@@ -338,6 +338,21 @@ mss_validate_extra_args() {
 # ── Ollama plist render (P3) ───────────────────────────────────────────────────
 # mss_render_ollama_plist <template> <user> <bind> <bin>. With the default bin
 # /usr/local/bin/ollama the output is byte-identical to the v1.2.0 golden file.
+# mss_default_ollama_bin [root-prefix]: the Ollama binary to render when
+# OLLAMA_BIN is unset, in the picker's order: /usr/local/bin/ollama (1.3.0's
+# path), then the ollama on PATH, then Homebrew's Apple silicon prefix, which a
+# sudo PATH can lack. With none found it prints /usr/local/bin/ollama and
+# returns 1. The prefix is install.sh's test sandbox; it is empty on a Mac.
+mss_default_ollama_bin() {
+    _obp=${1:-}
+    if [ -x "$_obp/usr/local/bin/ollama" ]; then echo "$_obp/usr/local/bin/ollama"; return 0; fi
+    _obf=$(command -v ollama 2>/dev/null) || _obf=""
+    case $_obf in /*) if [ -x "$_obf" ]; then echo "$_obf"; return 0; fi ;; esac
+    if [ -x "$_obp/opt/homebrew/bin/ollama" ]; then echo "$_obp/opt/homebrew/bin/ollama"; return 0; fi
+    echo /usr/local/bin/ollama
+    return 1
+}
+
 mss_render_ollama_plist() {
     sed -e "s|<OLLAMA_USER>|$2|g" -e "s|<OLLAMA_BIND>|$3|g" -e "s|<OLLAMA_BIN>|$4|g" "$1"
 }

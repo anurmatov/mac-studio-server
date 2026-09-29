@@ -137,7 +137,7 @@ Models come from `config/models.catalog` (pinned revisions and sha256), download
 | variable | where | effect |
 |---|---|---|
 | `MSS_DEFER_MODEL=yes` | `backends.env` | install llama.cpp or ds4 without a model; no backend job until `model.sh` |
-| `OLLAMA_BIN` | `backends.env` | Ollama binary in the plist (default `/usr/local/bin/ollama`) |
+| `OLLAMA_BIN` | `backends.env` | Ollama binary in the plist (unset: `/usr/local/bin/ollama`, `PATH`, then `/opt/homebrew/bin/ollama`) |
 | `MSS_TUNE_MACOS=yes/no` | `backends.env` | headless tweaks; unset runs them with Ollama, as in 1.4.0 |
 | `DS4_BUILD_DIR` | environment only | build ds4-server at the pinned commit there (not with `DS4_BIN`) |
 | `LLAMACPP_BREW_INSTALL=yes` | environment only | `brew install llama.cpp` when `LLAMACPP_BIN` is unset |

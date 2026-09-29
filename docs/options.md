@@ -11,8 +11,8 @@ Ollama listens on `0.0.0.0:11434` with no password. To keep it on this Mac:
 echo 'OLLAMA_BIND=127.0.0.1' >> backends.env && ./scripts/install.sh
 ```
 
-`OLLAMA_BIND` takes one IPv4 address of this Mac. `OLLAMA_BIN` sets the Ollama binary when it
-is not `/usr/local/bin/ollama` (the installer sets it for a Homebrew Ollama).
+`OLLAMA_BIND` takes one IPv4 address of this Mac. Unset, `OLLAMA_BIN` is the Ollama already
+installed: `/usr/local/bin/ollama`, then the one on `PATH`, then `/opt/homebrew/bin/ollama`.
 
 ## Headless macOS tweaks
 

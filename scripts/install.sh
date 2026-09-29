@@ -135,10 +135,20 @@ mss_apply_step() {
 mss_validate_selection "$BACKENDS" || exit 1
 mss_validate_ipv4 "$BIND" || { mss_error "OLLAMA_BIND: '$BIND' must be a single IPv4 address"; exit 1; }
 case ${MSS_TUNE_MACOS:-} in ''|yes|no) ;; *) mss_error "MSS_TUNE_MACOS must be yes or no"; exit 1 ;; esac
-OLLAMA_EXE=${OLLAMA_BIN:-/usr/local/bin/ollama}
 if [ -n "${OLLAMA_BIN:-}" ]; then
+    OLLAMA_EXE=$OLLAMA_BIN
     mss_validate_path_chars OLLAMA_BIN "$OLLAMA_BIN" || exit 1
     [ -f "$OLLAMA_BIN" ] && [ -x "$OLLAMA_BIN" ] || { mss_error "OLLAMA_BIN: not an executable file: $OLLAMA_BIN"; exit 1; }
+elif OLLAMA_EXE=$(mss_default_ollama_bin "$MSS_SYSROOT_PREFIX"); then
+    # The Ollama already installed, not a fixed path: Homebrew on Apple silicon
+    # puts it in /opt/homebrew/bin, and a plist naming /usr/local/bin/ollama
+    # there cannot start (launchd EX_CONFIG). The path lives in the rendered
+    # plist; env and loaded modes never write backends.env.
+    mss_validate_path_chars "Ollama binary" "$OLLAMA_EXE" || exit 1
+elif [ "$MSS_MODE" != picker ] && mss_backend_selected ollama; then
+    # Nothing found: 1.3.0's default path is kept, and said out loud. (The
+    # picker has already told the user how to install Ollama later.)
+    echo "WARNING: no Ollama binary found; com.ollama.service will run $OLLAMA_EXE (brew install ollama, or set OLLAMA_BIN)" >&2
 fi
 [ -z "${MSS_PROGRESS_SECONDS:-}" ] || mss_validate_uint MSS_PROGRESS_SECONDS "$MSS_PROGRESS_SECONDS" 1 60 || exit 1
 # D7: acquisition asked for by environment variables (the picker asks instead).
@@ -193,7 +203,7 @@ else
 fi
 
 # Install launch daemon
-log_action "Installing Ollama launch daemon..."
+log_action "Installing Ollama launch daemon ($OLLAMA_EXE)..."
 # Replace user, bind address and binary in the plist file
 mss_render_ollama_plist "$BASE_DIR/config/com.ollama.service.plist" "$USER" "$BIND" "$OLLAMA_EXE" > "/tmp/com.ollama.service.plist"
 sudo cp "/tmp/com.ollama.service.plist" "$MSS_SYSROOT_PREFIX/Library/LaunchDaemons/"
