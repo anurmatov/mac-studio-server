@@ -315,14 +315,16 @@ echo "colima $*" >> "$MSS_H27_LOG"
 XS
 cat > "$TMP/h27c/docker" <<'XS'
 #!/bin/sh
-# docker stub: `info` fails while the daemon is down, so start-colima proceeds.
-[ "${1:-}" = info ] && exit 1
+# docker stub: `info` fails until `colima start` has run, so start-colima
+# proceeds to its start line and then leaves its wait loop at once.
+[ "${1:-}" = info ] && ! grep -q '^colima start' "$MSS_H27_LOG" 2>/dev/null && exit 1
 exit 0
 XS
 chmod +x "$TMP/h27c/colima" "$TMP/h27c/docker"
-start_case() { # start_case <list-file|-> <list-rc>: the colima start argv
+start_case() { # start_case <list-file|-> <list-rc> [home]: the colima start argv
     : > "$TMP/h27c/log"
     ( export MSS_H27_LOG="$TMP/h27c/log" OLLAMA_BASE_DIR="$TMP/h27c"
+      [ -z "${3:-}" ] || export HOME="$3"
       [ "$1" = - ] && unset MSS_H27_LIST || export MSS_H27_LIST="$1"
       export MSS_H27_LIST_RC=$2
       PATH="$TMP/h27c:$PATH"
@@ -340,6 +342,21 @@ check "empty list creates with today's flags" \
 check "other names only create with today's flags" \
     "colima start --cpu 4 --memory 8 --disk 50 --vm-type=vz --mount-type=virtiofs" "$(start_case "$TMP/h27c/other.json" 0)"
 check "a failing list starts with no flags (never resize)" "colima start" "$(start_case "$TMP/h27c/compact.json" 1)"
+# Manual step 9 at a44b988: a 6/12/80 VM came back 4/8/50 after a reboot. A VM
+# that Colima's own files show is never resized, even when the list misses it.
+mkdir -p "$TMP/h27c/home-yaml/.colima/default" "$TMP/h27c/home-lima/.colima/_lima/colima" "$TMP/h27c/home-none"
+printf 'cpu: 6\nmemory: 12\ndisk: 80\n' > "$TMP/h27c/home-yaml/.colima/default/colima.yaml"
+check "an empty list over an existing colima.yaml starts with no flags" "colima start" \
+    "$(start_case "$TMP/h27c/empty.json" 0 "$TMP/h27c/home-yaml")"
+check "other names over an existing Lima instance start with no flags" "colima start" \
+    "$(start_case "$TMP/h27c/other.json" 0 "$TMP/h27c/home-lima")"
+check "an empty list with nothing on disk still creates with today's flags" \
+    "colima start --cpu 4 --memory 8 --disk 50 --vm-type=vz --mount-type=virtiofs" \
+    "$(start_case "$TMP/h27c/empty.json" 0 "$TMP/h27c/home-none")"
+check "COLIMA_HOME is where the VM is looked for" "colima start" \
+    "$(export COLIMA_HOME="$TMP/h27c/home-yaml/.colima"; start_case "$TMP/h27c/empty.json" 0 "$TMP/h27c/home-none")"
+check "the existing VM's colima.yaml is untouched" "$(printf 'cpu: 6\nmemory: 12\ndisk: 80')" \
+    "$(cat "$TMP/h27c/home-yaml/.colima/default/colima.yaml")"
 
 echo "== phase A: #27 D6 power apply =="
 HS_STUBBED="$TMP/h27d"
@@ -1749,6 +1766,41 @@ for _case in on-path off-path; do
 done
 rm -rf "$TMP/h27r/sysroot/opt"; rm -f "$HSD_R/"*.plist
 
+# E12 (manual step 9): com.colima.daemon runs the start-colima.sh its template
+# names, whichever checkout installed it. Autostart is refused before any change
+# unless that file is this checkout's script: an older one resizes the VM.
+BU=$(id -un); BJS="$TMP/h27r/sysroot/Users/$BU/mac-studio-server/scripts"
+mkdir -p "$BJS" "$TMP/h27r/jobtools"
+cp "$ROOT/tests/stubs/colima" "$ROOT/tests/stubs/docker" "$TMP/h27r/jobtools/"; chmod +x "$TMP/h27r/jobtools/"*
+jscheck() { ( MSS_TEST_SYSROOT=$TMP/h27r/sysroot OLLAMA_USER=$BU; export MSS_TEST_SYSROOT OLLAMA_USER
+    while [ "$#" -gt 0 ]; do export "${1?}"; shift; done
+    mss_docker_job_script_check 2>&1; echo "rc=$?" ) | tr '\n' ' '; }
+rm -f "$BJS/start-colima.sh"
+check "E12 autostart unset never looks at the boot script" "rc=0 " "$(jscheck MSS_DOCKER_AUTOSTART=)"
+check "E12 a missing boot script refuses autostart" \
+    "ERROR: MSS_DOCKER_AUTOSTART=yes: com.colima.daemon runs /Users/$BU/mac-studio-server/scripts/start-colima.sh at every boot, and that is not this checkout's start-colima.sh; run install.sh from /Users/$BU/mac-studio-server, or bring that checkout to this version rc=1 " \
+    "$(jscheck MSS_DOCKER_AUTOSTART=yes)"
+git -C "$ROOT" show 8975c9f:scripts/start-colima.sh > "$BJS/start-colima.sh" 2>/dev/null \
+    || printf '#!/bin/bash\ncolima start --cpu 4 --memory 8 --disk 50\n' > "$BJS/start-colima.sh"
+jscheck MSS_DOCKER_AUTOSTART=yes | grep -q 'rc=1 $' && ok "E12 an older boot script refuses autostart" || fail "E12 older: $(jscheck MSS_DOCKER_AUTOSTART=yes)"
+cp "$ROOT/scripts/start-colima.sh" "$BJS/start-colima.sh"
+check "E12 this checkout's boot script passes" "rc=0 " "$(jscheck MSS_DOCKER_AUTOSTART=yes)"
+# End to end: an older boot script stops install.sh before anything is loaded.
+printf '#!/bin/bash\ncolima start --cpu 4 --memory 8 --disk 50\n' > "$BJS/start-colima.sh"
+rm -f "$HSD_R/"*.plist
+install_case "$TMP/h27r/e12.log" MSS_BACKENDS=ollama MSS_TUNE_MACOS=no MSS_DOCKER_AUTOSTART=yes \
+    MSS_DOCKER_JOB_PATH="$TMP/h27r/jobtools" MSS_STUB_LOG="$TMP/h27r/e12.stub"
+check "E12 install.sh with an older boot script exits 1" "rc=1" "$(tail -n 1 "$TMP/h27r/e12.log")"
+check "E12 nothing was loaded" "" "$(cat "$HR_STATE/calls.log")"
+grep -q 'is not this checkout' "$TMP/h27r/e12.log" && ok "E12 the refusal says why" || fail "E12 log: $(tail -3 "$TMP/h27r/e12.log")"
+cp "$ROOT/scripts/start-colima.sh" "$BJS/start-colima.sh"
+install_case "$TMP/h27r/e12b.log" MSS_BACKENDS=ollama MSS_TUNE_MACOS=no MSS_DOCKER_AUTOSTART=yes \
+    MSS_DOCKER_JOB_PATH="$TMP/h27r/jobtools" MSS_STUB_LOG="$TMP/h27r/e12.stub"
+check "E12 with this checkout's boot script the install completes" "rc=0" "$(tail -n 1 "$TMP/h27r/e12b.log")"
+grep -q 'Docker at boot: on, changed' "$TMP/h27r/e12b.log" && ok "E12 the Colima job is installed" || fail "E12b: $(grep 'Docker at boot' "$TMP/h27r/e12b.log")"
+check "E12 install.sh never ran colima or docker" "" "$(cat "$TMP/h27r/e12.stub" 2>/dev/null)"
+rm -rf "$TMP/h27r/sysroot/Users/$BU/mac-studio-server"; rm -f "$HSD_R/"*.plist
+
 # E8 (D7 step 6): the Docker install runs before the switch removal, the Ollama
 # steps and every launchd or pmset change. A brew that fails must stop install.sh
 # with nothing loaded; the static pin below checks the same order in the source.
@@ -3045,17 +3097,29 @@ fi
 
 # B2: the Colima boot job. A runner with a real colima would start a VM, so it
 # is skipped. Otherwise stub colima and docker go on the boot job's PATH (the
-# validation needs both, D1): `docker info` answers, so start-colima.sh exits at
-# its first check, and the colima stub logs any call so none can go unseen.
+# validation needs both, D1). The docker stub answers `info` unless
+# /tmp/mss-b2-docker-down exists, and the colima stub prints
+# /tmp/mss-b2-colima-list for `list`; both log every call.
 if [ -e /opt/homebrew/bin/colima ] || [ -e /usr/local/bin/colima ]; then
     echo "skip - B2 needs a runner without colima in /opt/homebrew/bin or /usr/local/bin"
 else
-    B2LOG=/tmp/mss-b2-tools.log; sudo rm -f "$B2LOG"
+    B2LOG=/tmp/mss-b2-tools.log; sudo rm -f "$B2LOG" /tmp/mss-b2-docker-down /tmp/mss-b2-colima-list
+    cat > "$B27/colima" <<STUB
+#!/bin/sh
+echo "colima \$*" >> $B2LOG
+[ "\${1:-}" = list ] && [ -f /tmp/mss-b2-colima-list ] && cat /tmp/mss-b2-colima-list
+exit 0
+STUB
+    cat > "$B27/docker" <<STUB
+#!/bin/sh
+echo "docker \$*" >> $B2LOG
+[ "\${1:-}" = info ] && [ -e /tmp/mss-b2-docker-down ] && exit 1
+exit 0
+STUB
     B2STUBS=""
     sudo mkdir -p /usr/local/bin
     for t in colima docker; do
         [ -e "/opt/homebrew/bin/$t" ] || [ -e "/usr/local/bin/$t" ] && continue
-        printf '#!/bin/sh\necho "%s $*" >> %s\nexit 0\n' "$t" "$B2LOG" > "$B27/$t"
         sudo install -m 755 "$B27/$t" "/usr/local/bin/$t" && B2STUBS="$B2STUBS /usr/local/bin/$t"
     done
     b2_runs() { # the job's run count, waiting up to 20 s for the first run
@@ -3083,15 +3147,49 @@ else
         && ok "B2 unset says left as is" || fail "B2 unset: $(grep 'Docker at boot' "$B27/da3.log")"
     check "B2 unset keeps runs = 1" 1 "$(b2_runs)"
     check "B2 unset leaves the plist" "$DA_STAT" "$(stat -f '%i %m' /Library/LaunchDaemons/com.colima.daemon.plist 2>/dev/null)"
+    # So far the job ran start-colima.sh once, which stopped at `docker info`;
+    # install.sh ran neither tool.
+    check "B2 colima was never called" "" "$(grep '^colima' "$B2LOG" 2>/dev/null)"
+    check "B2 docker was called only by the job's check" "docker info" "$(sort -u "$B2LOG" 2>/dev/null)"
+
+    # B2 boot run (manual step 9 at a44b988): Docker down and an existing VM, as
+    # after a reboot. launchd runs the real job, which must start Colima with no
+    # sizing flags whether the list shows the VM or comes back empty.
+    if [ -z "$B2STUBS" ] || [ "$(printf '%s\n' $B2STUBS | wc -l | tr -d ' ')" != 2 ]; then
+        echo "skip - B2 boot run needs both stub tools (a real docker or colima is on this runner)"
+    else
+        B2CH=0
+        if [ ! -e "$HOME/.colima" ]; then
+            mkdir -p "$HOME/.colima/default"; printf 'cpu: 6\nmemory: 12\ndisk: 80\n' > "$HOME/.colima/default/colima.yaml"; B2CH=1
+        fi
+        B2YAML=$(mss_shasum256 "$HOME/.colima/default/colima.yaml" 2>/dev/null | awk '{print $1}')
+        for listing in listed empty; do
+            if [ "$listing" = listed ]; then printf '{"name":"default","status":"Stopped","cpus":6}\n' > /tmp/mss-b2-colima-list
+            else : > /tmp/mss-b2-colima-list; fi
+            : > /tmp/mss-b2-docker-down; : > "$B2LOG"
+            sudo launchctl kickstart -k system/com.colima.daemon
+            for _i in $(seq 1 40); do grep -q '^colima start' "$B2LOG" 2>/dev/null && break; sleep 0.5; done
+            check "B2 boot run with the VM $listing starts Colima with no sizing flags" "colima start" \
+                "$(grep '^colima start' "$B2LOG" | head -n 1)"
+            grep -q '^colima list --json' "$B2LOG" && ok "B2 boot run ($listing) looked the VM up first" || fail "B2 boot run ($listing): $(cat "$B2LOG")"
+            # Docker comes up, so the job's wait loop ends.
+            rm -f /tmp/mss-b2-docker-down
+            for _i in $(seq 1 20); do
+                launchctl print system/com.colima.daemon 2>/dev/null | grep -q 'state = running' || break; sleep 0.5
+            done
+        done
+        check "B2 boot runs left colima.yaml untouched" "$B2YAML" \
+            "$(mss_shasum256 "$HOME/.colima/default/colima.yaml" 2>/dev/null | awk '{print $1}')"
+        rm -f /tmp/mss-b2-colima-list
+        [ "$B2CH" = 0 ] || rm -rf "$HOME/.colima"
+    fi
+
     b27_install "$B27/da4.log" MSS_DOCKER_AUTOSTART=no && ok "B2 autostart=no exits 0" \
         || fail "B2 no run: $(tail -3 "$B27/da4.log")"
     [ ! -e /Library/LaunchDaemons/com.colima.daemon.plist ] && ok "B2 no removed the plist" || fail "B2 no kept the plist"
     ! loaded com.colima.daemon && ok "B2 no removed the label" || fail "B2 label still loaded"
-    # The job ran start-colima.sh, which stopped at `docker info`; install.sh ran neither tool.
-    check "B2 colima was never called" "" "$(grep '^colima' "$B2LOG" 2>/dev/null)"
-    check "B2 docker was called only by the job's check" "docker info" "$(sort -u "$B2LOG" 2>/dev/null)"
     sudo launchctl bootout system/com.colima.daemon 2>/dev/null
-    sudo rm -f /Library/LaunchDaemons/com.colima.daemon.plist "$B2LOG"
+    sudo rm -f /Library/LaunchDaemons/com.colima.daemon.plist "$B2LOG" /tmp/mss-b2-docker-down /tmp/mss-b2-colima-list
     # shellcheck disable=SC2086  # our own list of stub paths
     [ -z "$B2STUBS" ] || sudo rm -f $B2STUBS
 fi
