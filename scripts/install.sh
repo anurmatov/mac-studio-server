@@ -168,6 +168,10 @@ if mss_backend_selected llamacpp || mss_backend_selected ds4; then
     mss_check --check-only || exit 1
 fi
 
+# The Colima boot job runs a fixed start-colima.sh path; refuse autostart before
+# any change unless that file is this checkout's (an older one resizes the VM).
+mss_docker_job_script_check || exit 1
+
 # log_action and mss_apply_step append to $LOG_FILE, so its directory must exist first.
 mkdir -p "$BASE_DIR/logs"
 

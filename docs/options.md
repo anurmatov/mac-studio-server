@@ -49,8 +49,9 @@ colima status                                    # log: logs/docker.log
 ```
 
 The installer never starts, stops or resizes a Colima VM; autostart re-runs
-`scripts/start-colima.sh`, which leaves an existing VM's size alone. `no` removes the boot
-job and never stops a running Colima.
+`~/mac-studio-server/scripts/start-colima.sh`, which leaves an existing VM's size alone, so
+autostart is refused unless that file matches the checkout you install from. `no` removes
+the boot job and never stops a running Colima.
 
 ## Restart after a power failure
 

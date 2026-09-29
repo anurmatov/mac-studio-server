@@ -11,7 +11,7 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 - The GPU limit is set by the system tool directly, so it survives removing an optional backend
-- Autostarted Colima starts an existing VM without resizing it, and reloads only when its job changed
+- Autostarted Colima starts an existing VM without resizing it, even when the VM list comes back empty, and reloads only when its job changed
 - Changing the GPU limit by hand takes the value as an argument and never defaults silently
 - A non-interactive install finds a Homebrew Ollama on Apple silicon instead of assuming the Intel path
 

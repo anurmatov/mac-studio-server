@@ -463,6 +463,20 @@ mss_docker_install_apply() {
 _mss_docker_user() { printf '%s\n' "${OLLAMA_USER:-${USER:-$(whoami)}}"; }
 _mss_docker_render() { sed "s|<OLLAMA_USER>|$(_mss_docker_user)|g" "$REPO_DIR/config/com.colima.daemon.plist"; }
 
+# mss_docker_job_script_check: com.colima.daemon runs the start-colima.sh its
+# template names (/Users/<user>/mac-studio-server/scripts), whichever checkout
+# installed it. A different file there, such as an older checkout, starts the
+# VM by its own rules at every boot and can resize it, so MSS_DOCKER_AUTOSTART=yes
+# needs that file to be this checkout's script. Runs before any change.
+mss_docker_job_script_check() {
+    [ "${MSS_DOCKER_AUTOSTART:-}" = yes ] || return 0
+    _js=$(_mss_docker_render | sed -n 's|.*<string>\(/[^<]*/start-colima\.sh\)</string>.*|\1|p' | head -n 1)
+    [ -n "$_js" ] || { mss_error "cannot find start-colima.sh in the $MSS_DOCKER_LABEL template"; return 1; }
+    cmp -s "${MSS_TEST_SYSROOT:-}$_js" "$REPO_DIR/scripts/start-colima.sh" && return 0
+    mss_error "MSS_DOCKER_AUTOSTART=yes: $MSS_DOCKER_LABEL runs $_js at every boot, and that is not this checkout's start-colima.sh; run install.sh from ${_js%/scripts/start-colima.sh}, or bring that checkout to this version"
+    return 1
+}
+
 # _mss_docker_plan: the read-only autostart classification shared with the
 # summary. Prints: unchanged starts removed off-unchanged left.
 _mss_docker_plan() {
