@@ -1041,6 +1041,13 @@ EFH2="$TMP/h27/out.env"
 ( export MSS_BACKENDS=ds4 MSS_GPU_PERCENT=80; unset OLLAMA_GPU_PERCENT; mss_envfile_write "$EFH2" ) >/dev/null 2>&1
 grep -q '^MSS_GPU_PERCENT=80$' "$EFH2" && ! grep -q OLLAMA_GPU_PERCENT "$EFH2" \
     && ok "mss_envfile_write writes the new key and never the legacy" || fail "write: $(cat "$EFH2" 2>/dev/null)"
+# OLLAMA_BIN belongs to Ollama: a save without Ollama selected drops it, so a
+# binary removed on purpose cannot fail the next run's validation.
+for _sel in ds4 llamacpp ollama,ds4 ollama; do
+    ( export MSS_BACKENDS=$_sel OLLAMA_BIN=/opt/homebrew/bin/ollama; mss_envfile_write "$TMP/h27/bin-$_sel.env" ) >/dev/null 2>&1
+done
+check "the writer drops OLLAMA_BIN for ds4 and llamacpp, keeps it with ollama" "0 0 1 1" \
+    "$(for _sel in ds4 llamacpp ollama,ds4 ollama; do grep -c '^OLLAMA_BIN=/opt/homebrew/bin/ollama$' "$TMP/h27/bin-$_sel.env"; done | tr '\n' ' ' | sed 's/ $//')"
 # A file OLLAMA_GPU_PERCENT beside an environment MSS_GPU_PERCENT: the loader
 # exports both names, so the resolver can compare them (the conflict row below).
 OUT=$( (unset MSS_GPU_PERCENT OLLAMA_GPU_PERCENT MSS_ENVFILE_LOADED MSS_CHOICES_RESOLVED; \
@@ -2247,6 +2254,17 @@ else
         "Install Colima and the Docker CLI with Homebrew? [y/N]: ${T}@ENTER" "Save? [Y/n]: ${T}@ENTER" -- \
         MSS_ENV_FILE="$PK/a8st.env" MSS_DOCKER_JOB_PATH="$PK/job-none" MSS_PMSET="$ROOT/tests/stubs/pmset-none"
     check "A8 stale keys: the saved file is accepted on the next run" 0 $?
+
+    # DS4-only after an Ollama configuration whose binary was then removed: the
+    # save drops OLLAMA_BIN, and the run's own validation passes.
+    envfile a8ds4.env "MSS_BACKENDS=ollama\nOLLAMA_BIN=$PK/gone/ollama\n"
+    drive a8ds4 "Choose [1]: ${T}5" "later [4]: ${T}3" "path or https URL: ${T}$DS4M" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" \
+        "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" "$DA_ENTER" \
+        "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/a8ds4.env" DS4_BIN="$DS4B"
+    check "DS4-only after Ollama, with the Ollama binary gone, completes" 0 $?
+    check "DS4-only saves MSS_BACKENDS=ds4 and no OLLAMA_BIN" "ds4|" \
+        "$(saved a8ds4.env MSS_BACKENDS)|$(saved a8ds4.env OLLAMA_BIN)"
+    tr_of a8ds4 | grep -q 'OLLAMA_BIN: not an executable file' && fail "DS4-only validated OLLAMA_BIN" || ok "DS4-only never validates OLLAMA_BIN"
 
     # (e, h) DI = y shows DA; --configure-only never runs brew for Docker.
     DRIVE_BASE_PATH=$NODOCKER_PATH DRIVE_PATH="$PK/brewbin" drive a8e "Choose [1]: ${T}1" "auto-updates)? ${T}@ENTER" \
