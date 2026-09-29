@@ -528,7 +528,9 @@ MSS_ENVFILE_EOF
 
 # mss_envfile_write FILE: write every exported non-empty key, in the example's
 # order, atomically with mode 0600. Refuses to run as root or to replace a
-# symlink. Comments are not preserved.
+# symlink. Comments are not preserved. OLLAMA_BIN is written only when Ollama is
+# selected: a DS4-only or llama.cpp-only file must not carry a binary that was
+# removed on purpose.
 mss_envfile_write() {
     _ef=$1
     [ "$(id -u)" -ne 0 ] || { mss_error "refusing to write $_ef as root"; return 1; }
@@ -544,6 +546,7 @@ mss_envfile_write() {
         echo "# KEY=value lines, parsed and never sourced: no quotes, no \$, no export."
         for _ek in $(mss_envfile_keys); do
             _ev=$(printenv "$_ek")
+            [ "$_ek" != OLLAMA_BIN ] || mss_backend_selected ollama || continue
             [ -z "$_ev" ] || printf '%s=%s\n' "$_ek" "$_ev"
         done
     } > "$_etmp"; then
