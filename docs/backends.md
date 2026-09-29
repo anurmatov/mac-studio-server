@@ -120,7 +120,7 @@ A plain `install.sh` with a saved file never switches.
 ## One-line install, model.sh and acquisition variables (1.5.0)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/anurmatov/mac-studio-server/v1.5.0/bootstrap.sh | sh
+curl -fsSL https://raw.githubusercontent.com/anurmatov/mac-studio-server/v1.6.0/bootstrap.sh | sh
 ./scripts/model.sh                                        # menu: starter, more, own file/URL
 ./scripts/model.sh --catalog qwen3-4b                     # or --path FILE --sha256 HEX
 ./scripts/model.sh --url https://… --sha256 HEX [--dest FILE]

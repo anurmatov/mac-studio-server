@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-09-29
+
 ### Added
 - GPU memory percent, Docker install, Docker at boot and restart after a power failure are now asked, saved and reported by the installer
 - A GPU boot job that no longer runs a user-editable script as root at every boot

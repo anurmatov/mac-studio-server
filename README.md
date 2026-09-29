@@ -6,7 +6,7 @@ plus an optional llama.cpp or DwarfStar (ds4) server, a memory guard, and firewa
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/anurmatov/mac-studio-server/v1.5.0/bootstrap.sh | sh
+curl -fsSL https://raw.githubusercontent.com/anurmatov/mac-studio-server/v1.6.0/bootstrap.sh | sh
 ```
 
 Or clone it yourself: `git clone https://github.com/anurmatov/mac-studio-server.git && cd mac-studio-server && ./scripts/install.sh`.
@@ -61,11 +61,12 @@ Ollama listens on all interfaces (0.0.0.0) by default and has no password; set O
 
 ## Updates
 
+- **1.6.0** GPU memory, Docker and restart-after-power-failure choices in the installer.
 - **1.5.0** One-line install, guided downloads and builds, and `model.sh`.
 - **1.4.0** Interactive backend picker and saved answers.
 - **1.3.0** Optional llama.cpp and DwarfStar backends beside Ollama.
 
-Current version: 1.5.0 (semver). History: [CHANGELOG.md](CHANGELOG.md).
+Current version: 1.6.0 (semver). History: [CHANGELOG.md](CHANGELOG.md).
 
 ## Contributing
 

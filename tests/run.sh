@@ -2043,6 +2043,20 @@ S2=$(awk '/^## \[1\.5\.0\]/{f=1;next} /^## \[/{f=0} f && /^- /' "$ROOT/CHANGELOG
 [ -z "$(printf '%s\n' "$S2" | awk 'length($0) > 100')" ] && ok "CHANGELOG bullets ≤ 100 characters (S2)" || fail "long CHANGELOG bullet"
 printf '%s\n' "$S2" | grep -Eq '\.sh|/|\(\)|_[a-z]' && fail "CHANGELOG names internals (S2)" || ok "CHANGELOG names no internals (S2)"
 printf '%s\n' "$S2" | grep -qi 'headless.*asked once' && ok "CHANGELOG says the headless tweaks are asked once (F6)" || fail "F6 CHANGELOG line"
+# Release pins (#27, v1.6.0): bootstrap.sh's MSS_TAG is the version README.md
+# states, the tag every one-liner fetches, and a dated CHANGELOG section, with
+# an empty [Unreleased] above it.
+RTAG=$(sed -n 's/^MSS_TAG=//p' "$ROOT/bootstrap.sh"); RVER=${RTAG#v}
+check "README's current version is bootstrap.sh's MSS_TAG" "Current version: $RVER (semver)." \
+    "$(grep -o 'Current version: [0-9.]* (semver)\.' "$ROOT/README.md")"
+for f in README.md docs/backends.md bootstrap.sh; do
+    check "$f fetches bootstrap.sh at MSS_TAG ($RTAG) only" "ok" \
+        "$(grep -o 'mac-studio-server/v[0-9.]*/bootstrap.sh' "$ROOT/$f" | awk -v t="mac-studio-server/$RTAG/bootstrap.sh" \
+            '{ n++; if ($0 != t) bad = 1 } END { print (n && !bad) ? "ok" : "missing or other tag" }')"
+done
+check "CHANGELOG has a dated section for $RVER" 1 "$(grep -c "^## \[$RVER\] - [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\$" "$ROOT/CHANGELOG.md")"
+check "CHANGELOG [Unreleased] comes first and is empty" "## [Unreleased]|## [$RVER]" \
+    "$(grep -m 1 '^## \[' "$ROOT/CHANGELOG.md")|$(grep -v '^[[:space:]]*$' "$ROOT/CHANGELOG.md" | grep -A1 -m 1 '^## \[Unreleased\]$' | tail -n 1 | sed 's/ - .*//')"
 S3=$(awk '/^## One-line install/{f=1} /^## Status/{f=0} f' "$ROOT/docs/backends.md" | wc -l)
 [ "$S3" -le 30 ] && ok "docs/backends.md new section ≤ 30 lines ($S3) (S3)" || fail "docs/backends.md section is $S3 lines"
 grep -q "configure-only.*may leave a verification stamp" "$ROOT/docs/backends.md" && ok "backends.md --configure-only wording (S3)" || fail "S3 wording"
