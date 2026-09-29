@@ -157,14 +157,21 @@ fi
 if mss_backend_selected llamacpp || mss_backend_selected ds4; then
     mss_check --check-only || exit 1
 fi
-# A confirmed switch removes the old backend only now, after the check passed.
+
+# log_action and mss_apply_step append to $LOG_FILE, so its directory must exist first.
+mkdir -p "$BASE_DIR/logs"
+
+# D7 step 6: install the missing Docker tools (only MSS_DOCKER_INSTALL=yes
+# installs; nothing here runs colima or docker). It runs before the switch
+# removal, the Ollama steps and any launchd or pmset change, so a Homebrew
+# failure leaves the machine as it was.
+mss_apply_step mss_docker_install_apply
+
+# D7 step 7: a confirmed switch removes the old backend only now, after the check passed.
 if [ -n "$MSS_SWITCH_FROM" ]; then
     echo "Removing $MSS_SWITCH_FROM ..." >&2
     sudo /bin/sh "$REPO_DIR/scripts/uninstall.sh" --backend "$MSS_SWITCH_FROM" || exit 1
 fi
-
-# log_action appends to $LOG_FILE, so its directory must exist first.
-mkdir -p "$BASE_DIR/logs"
 
 if mss_backend_selected ollama; then
 # Create necessary directories
@@ -225,11 +232,6 @@ else
         "$BASE_DIR/scripts/optimize-mac-server.sh"
     fi
 fi
-
-# D7 step 6: install the missing Docker tools (only MSS_DOCKER_INSTALL=yes
-# installs; nothing here runs colima or docker). It runs before any launchd or
-# pmset change, so a Homebrew failure leaves the boot jobs untouched (#27 r2).
-mss_apply_step mss_docker_install_apply
 
 # D7 step 9: the GPU boot job (D4 apply table).
 mss_apply_step mss_gpu_apply "$GPU_PERCENT"

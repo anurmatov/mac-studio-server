@@ -23,6 +23,13 @@ log_action() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
+# MSS_SYSCTL is tests/run.sh's stand-in for /usr/sbin/sysctl, honoured only
+# inside a test sysroot and never as root: this script runs as root at boot.
+_sysctl=/usr/sbin/sysctl
+if [ -n "${MSS_TEST_SYSROOT:-}" ] && [ -n "${MSS_SYSCTL:-}" ] && [ "$(id -u)" -ne 0 ]; then
+    _sysctl=$MSS_SYSCTL
+fi
+
 _pct=${1:-}
 _env=${MSS_GPU_PERCENT:-${OLLAMA_GPU_PERCENT:-}}
 if [ -n "$_env" ] && [ -n "${OLLAMA_GPU_PERCENT:-}" ] && [ -n "${MSS_GPU_PERCENT:-}" ] \
@@ -52,8 +59,7 @@ case $_pct in
     *)
         case $_pct in 0|0[0-9]*) echo "set-gpu-memory.sh: '$_pct' must be 1-100 with no leading zero" >&2; exit 2 ;; esac
         [ "$_pct" -le 100 ] || { echo "set-gpu-memory.sh: '$_pct' is above 100" >&2; exit 2; }
-        # ${MSS_SYSCTL:-...} so tests/run.sh can stand in for /usr/sbin/sysctl.
-        _total=$(${MSS_SYSCTL:-/usr/sbin/sysctl} -n hw.memsize 2>/dev/null) \
+        _total=$("$_sysctl" -n hw.memsize 2>/dev/null) \
             || { echo "set-gpu-memory.sh: cannot read hw.memsize" >&2; exit 1; }
         # same integer order as mss_wired_limit_mb / install-backends.sh
         _limit=$(( _total / 1024 / 1024 * _pct / 100 ))
@@ -61,5 +67,5 @@ case $_pct in
 esac
 
 log_action "Setting iogpu.wired_limit_mb=${_limit} (MSS_GPU_PERCENT=${_pct})..."
-${MSS_SYSCTL:-/usr/sbin/sysctl} iogpu.wired_limit_mb="$_limit" || { log_action "ERROR: sysctl failed"; exit 1; }
+"$_sysctl" iogpu.wired_limit_mb="$_limit" || { log_action "ERROR: sysctl failed"; exit 1; }
 log_action "GPU memory limit applied"

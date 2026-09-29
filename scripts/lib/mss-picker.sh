@@ -548,7 +548,7 @@ _mss_pick_gpu_valid() {
     case $1 in
         system) return 0 ;;
         [1-9]|[1-9][0-9]|100) ;;
-        *) return 1 ;;
+        *) mss_error "answer a percent 1-100 (no leading zero) or system"; return 1 ;;
     esac
     _mss_sysctl -n iogpu.wired_limit_mb >/dev/null 2>&1 || {
         echo "this Mac has no iogpu.wired_limit_mb; answer system" >&2; return 1; }
@@ -568,6 +568,8 @@ _mss_pick_gpu() {
         new|legacy|both) [ "$rec" = unreadable ] && def=system || def=$rec ;;
         *) def=system ;;
     esac
+    # A Mac without the limit can only answer system, so that is the default.
+    _mss_sysctl -n iogpu.wired_limit_mb >/dev/null 2>&1 || def=system
     mss_ask "GPU memory for models (Ollama, llama.cpp, ds4): percent of RAM 1-100, or system" \
         "$def" _mss_pick_gpu_valid
     # `system` is saved as the answer it is. Unsetting the key would save
@@ -600,8 +602,9 @@ _mss_pick_docker_install() {
     # The helper returns 0 when such a tool exists and 1 when every Docker choice
     # is appliable, so the skip is the 0 branch. Negating it dropped both
     # questions on every ordinary Mac (#27 r3, blocker).
-    if _mss_docker_outside_job_path >/dev/null; then
-        echo "Docker is installed outside the boot job's PATH; Docker questions skipped" >&2
+    local out
+    if out=$(_mss_docker_outside_job_path); then
+        echo "${out%% *} is at ${out#* }, outside the boot job's PATH; move or link it into /opt/homebrew/bin or /usr/local/bin" >&2
         unset MSS_DOCKER_INSTALL MSS_DOCKER_AUTOSTART
         return 1
     fi
@@ -703,9 +706,9 @@ mss_picker_run() {
 
     # D1: resolve the legacy choice keys before the first question, but only
     # after the saved file is loaded. Resolving first would mark the run
-    # resolved, drop the legacy key, and the later resolve in install.sh would
-    # hit its early return — the file's OLLAMA_GPU_PERCENT would then vanish
-    # with no notice, no conflict, and nothing saved (#27 r2).
+    # resolved, and the later resolve in install.sh would hit its early return:
+    # the file's legacy GPU key would then vanish with no notice, no conflict,
+    # and nothing saved (#27 r2).
     mss_choices_resolve || exit 1
 
     # 1. menu

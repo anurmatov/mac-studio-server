@@ -6,11 +6,16 @@
 # POSIX sh. Sources after mss-common.sh; mss_choices_validate additionally
 # needs mss-acquire.sh sourced (Homebrew detection). Callers set REPO_DIR.
 #
-# Test hooks (D4c): launchctl, sysctl, plutil, pmset and sudo are called by
-# name so phase A can put stubs first on PATH; MSS_SYSCTL and MSS_PMSET name
-# the binaries directly; plists are read and written under
-# ${MSS_TEST_SYSROOT:-}/Library/LaunchDaemons; MSS_DOCKER_JOB_PATH is the boot
-# job's PATH, which is what "installed" means for colima and the Docker CLI.
+# Test hooks (D4c):
+#   launchctl and plutil   called by name, so phase A puts stubs first on PATH
+#   sysctl and pmset       /usr/sbin/sysctl and /usr/bin/pmset by absolute path;
+#                          MSS_SYSCTL / MSS_PMSET replace them only inside a test
+#                          sysroot (mss_wired_limit_mb in mss-common.sh still
+#                          reads hw.memsize through `sysctl` by name)
+#   privileged calls       ${MSS_SUDO:-sudo} (_mss_root)
+#   plists                 ${MSS_TEST_SYSROOT:-}/Library/LaunchDaemons
+#   MSS_DOCKER_JOB_PATH    the boot job's PATH, which is what "installed" means
+#                          for colima and the Docker CLI
 
 # The boot job com.colima.daemon runs with this PATH; a tool found only
 # elsewhere would install fine and fail at boot, so both `yes` values refuse it.
@@ -146,15 +151,14 @@ mss_choices_check_format() {
 _mss_job_tool() { ( PATH="$MSS_DOCKER_JOB_PATH"; export PATH; command -v "$1" 2>/dev/null ); }
 _mss_docker_missing() { [ -n "$(_mss_job_tool colima)" ] && [ -n "$(_mss_job_tool docker)" ] && return 1; return 0; }
 
-# _mss_docker_outside_job_path [tool...]: a tool the caller can run but the boot
-# job cannot. Empty output means every Docker choice on this Mac is appliable.
+# _mss_docker_outside_job_path: "<tool> <path>" for a tool the caller can run but
+# the boot job cannot, and rc 0; rc 1 when every Docker choice is appliable.
 # The picker and the validator both need this: a tool outside the job PATH makes
 # a saved MSS_DOCKER_INSTALL=yes or MSS_DOCKER_AUTOSTART=yes something step 2
 # refuses on every later run, so the picker must not ask about Docker at all
 # (#27 r2 finding 1).
 _mss_docker_outside_job_path() {
-    _ot_list=${*:-colima docker}
-    for _ot in $_ot_list; do
+    for _ot in colima docker; do
         [ -n "$(_mss_job_tool "$_ot")" ] && continue
         _ot_here=$(command -v "$_ot" 2>/dev/null) || continue
         [ -z "$_ot_here" ] || { printf '%s %s\n' "$_ot" "$_ot_here"; return 0; }
@@ -270,6 +274,12 @@ mss_gpu_job_precheck() {
     esac
 }
 
+# mss_gpu_legacy_note: the D9 status line for a machine that still has only the
+# legacy job. Kept here with the other legacy messages (A9).
+mss_gpu_legacy_note() {
+    echo "$MSS_GPU_LABEL_LEGACY runs a user-editable script as root at boot; re-run install.sh with MSS_GPU_PERCENT to migrate"
+}
+
 # mss_gpu_jobs_remove (D10 and the `system` row): boot out and delete both GPU
 # labels. Removing an absent plist makes no launchctl call and is not an error.
 mss_gpu_jobs_remove() {
@@ -344,23 +354,6 @@ _mss_install_plist_dir() { [ -d "$1" ] && rmdir "$1" 2>/dev/null; return 0; }
 _mss_gpu_last_exit_code() {
     launchctl print "system/$1" 2>/dev/null \
         | sed -n 's/^[[:space:]]*last exit code = \(.*\)$/\1/p' | head -n 1
-}
-
-# _mss_gpu_run_once <mb>: run the boot job's own command now, so mss_gpu_apply
-# can verify a value it just installed instead of waiting for a reboot. It goes
-# through the same sudo path as every other privileged call (D4c), and a failure
-# is not fatal here — the verify loop below is what reports it, with the job's
-# last exit code attached. Only the bootstrap row calls it: a kickstart row
-# already asks launchd to run the job, and `system` must never write at all.
-_mss_gpu_run_once() {
-    _mss_sysctl_write "$1"
-}
-
-# _mss_sysctl_write <mb>: the single place this file changes the wired limit, so
-# a test that logs sysctl argv can prove whether apply wrote or not.
-_mss_sysctl_write() {
-    _mss_bin_hook MSS_SYSCTL /usr/sbin/sysctl
-    _mss_root "$_mss_bin" iogpu.wired_limit_mb="$1" >/dev/null 2>&1
 }
 
 # mss_gpu_verify: poll the live limit until it equals MB (D4). On a timeout the

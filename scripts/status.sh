@@ -141,8 +141,8 @@ case $_kind in
             fi
         fi ;;
     legacy)
-        healthy "gpu memory" "${_rec:-80}% via $MSS_GPU_LABEL_LEGACY (live ${_live:-$(_mss_sysctl -n iogpu.wired_limit_mb 2>/dev/null)}) MB"
-        echo "    $MSS_GPU_LABEL_LEGACY runs a user-editable script as root at boot; re-run install.sh with MSS_GPU_PERCENT to migrate" ;;
+        healthy "gpu memory" "${_rec:-80}% via $MSS_GPU_LABEL_LEGACY, live $(_mss_sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo unreadable) MB"
+        echo "    $(mss_gpu_legacy_note)" ;;
     none)
         healthy "gpu memory" "system default (no boot job)" ;;
 esac

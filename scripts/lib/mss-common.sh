@@ -495,11 +495,11 @@ mss_envfile_load() {
         _ekey=${_eline%%=*}
         _evalue=${_eline#*=}
         [ -n "$_evalue" ] || continue
-        # A key the environment already carries stays the environment's, except
-        # the legacy GPU key: the resolver must still see it, or a file holding
-        # OLLAMA_GPU_PERCENT is dropped before the D1 conflict row can compare
-        # the two (#27 r2, blocker 4). The resolver, not the loader, decides.
-        if [ -n "$(printenv "$_ekey")" ] && [ "$_ekey" != OLLAMA_GPU_PERCENT ]; then
+        # A key the environment already carries stays the environment's. That
+        # includes the legacy GPU key; a file OLLAMA_GPU_PERCENT beside an
+        # environment MSS_GPU_PERCENT is still exported, because the environment
+        # does not carry that name, and mss_choices_resolve compares the two.
+        if [ -n "$(printenv "$_ekey")" ]; then
             MSS_ENVFILE_OVERRIDDEN="$MSS_ENVFILE_OVERRIDDEN $_ekey"
             continue
         fi
