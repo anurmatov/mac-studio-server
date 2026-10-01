@@ -4300,26 +4300,29 @@ sleep 1
 K28=$(sed -n 's/^held [0-9]* \([0-9]*\) .*/\1/p' "$MBD/mb28.hold")
 R28=$(pgrep -P "$H28" perl | grep -vx "$K28" | head -n 1)
 [ -n "$R28" ] && ok "MB28 the runner is blocked before LOCK_SH" || fail "MB28 no blocked runner"
-# H1 first, then SIGSTOP: the runner leads its own process group, and killing
-# H1 while it is stopped orphans a group with a stopped member, which POSIX
-# answers with SIGHUP + SIGCONT (perl dies of the SIGHUP). The blocker still
-# holds LOCK_EX in between, so the runner cannot move.
-sudo kill -9 "$H28"; sudo kill -STOP "$R28"; sleep 2
-sudo kill -0 "$R28" && ok "MB28 the runner survives H1, stopped" || fail "MB28 the runner died with H1"
+# The runner is not stopped. With it stopped while waiting in flock, keeper A on
+# macOS could not drain until SIGCONT, as if it held LOCK_SH (run 36895933444).
+# Stopping it before killing H1 also orphans its process group with a stopped
+# member, and POSIX answers that with SIGHUP (run 36891726382). So it waits on
+# the blocker, and killing H1 ends session A while it waits.
+sudo kill -9 "$H28"; sleep 2
+sudo kill -0 "$R28" && ok "MB28 the runner outlives H1, still blocked" || fail "MB28 the runner died with H1"
+grep -q '^REFUSE' "$MBD/mb28.hold" && fail "MB28 the runner moved while the blocker held LOCK_EX" \
+    || ok "MB28 the runner waits while the blocker holds LOCK_EX"
 grep -q "^session=$SA " /var/run/com.mac-studio-server.lock.owner && ok "MB28 keeper A holds on while the blocker holds LOCK_EX" \
     || fail "MB28 owner: $(cat /var/run/com.mac-studio-server.lock.owner)"
 sudo kill "$(sed -n 's/^held //p' "$MBD/mb28.ex")" 2>/dev/null; wait "$MB28X" 2>/dev/null
+_i=0; while sudo kill -0 "$R28" 2>/dev/null && [ "$_i" -lt 50 ]; do sleep 0.1; _i=$((_i + 1)); done
+grep -q "^REFUSE: lifecycle session $SA ended; /bin/sh -c touch /tmp/mss-late not run" "$MBD/mb28.hold" \
+    && ok "MB28 the runner refuses with session A's token" || fail "MB28 runner: $(cat "$MBD/mb28.hold")"
 _i=0; while grep -q "^session=$SA " /var/run/com.mac-studio-server.lock.owner && [ "$_i" -lt 50 ]; do sleep 0.1; _i=$((_i + 1)); done
 grep -q '^released after draining' /var/run/com.mac-studio-server.lock.owner && ok "MB28 keeper A releases after the blocker" \
     || fail "MB28 owner after release: $(cat /var/run/com.mac-studio-server.lock.owner)"
 bsh activate ds4 >"$MBD/mb28.log" 2>&1
 check "MB28 the successor (session B) completes" 0 $?
 mbsnap > "$MBD/mb28.succ"
-sudo kill -CONT "$R28"; sleep 2
-grep -q "^REFUSE: lifecycle session $SA ended; /bin/sh -c touch /tmp/mss-late not run" "$MBD/mb28.hold" \
-    && ok "MB28 the runner refuses with session A's token" || fail "MB28 runner: $(cat "$MBD/mb28.hold")"
 [ ! -e /tmp/mss-late ] && ok "MB28 /tmp/mss-late never exists" || fail "MB28 the late runner ran"
-mbsnap > "$MBD/mb28.final"; cmp -s "$MBD/mb28.succ" "$MBD/mb28.final" && ok "MB28 files equal the successor's result" || fail "MB28 files changed"
+sleep 1; mbsnap > "$MBD/mb28.final"; cmp -s "$MBD/mb28.succ" "$MBD/mb28.final" && ok "MB28 files equal the successor's result" || fail "MB28 files changed"
 
 # MB24: a hand-edited installed plist is refused and left as it is.
 bsh activate mlx >/dev/null 2>&1
