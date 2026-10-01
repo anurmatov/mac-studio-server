@@ -4072,7 +4072,7 @@ H20=$(sed -n 's/^held \([0-9]*\) .*/\1/p' "$MBD/mb20.hold"); S20=$(pgrep -P "$H2
 sudo kill -9 "$H20"; wait "$MB20H" 2>/dev/null
 env MSS_LOCK_TIMEOUT=1 MSS_ENV_FILE="$MBE" "$ROOT/scripts/backend.sh" stop mlx >"$MBD/mb20.log" 2>&1
 check "MB20 backend.sh stop mlx takes the lock within 1 s" 0 $?
-[ -n "$S20" ] && kill -0 "$S20" 2>/dev/null && ok "MB20 the orphaned sleep is alive" || fail "MB20 no orphaned sleep"
+[ -n "$S20" ] && ps -p "$S20" >/dev/null 2>&1 && ok "MB20 the orphaned sleep is alive" || fail "MB20 no orphaned sleep"
 [ -z "$S20" ] || sudo kill "$S20" 2>/dev/null
 bsh start mlx >/dev/null 2>&1; wait_listen 18234 >/dev/null
 

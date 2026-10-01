@@ -370,11 +370,15 @@ hash_file() {
 # run now (D5.10), or nothing. Paging a model in beside a resident one can
 # freeze the host, so a full read waits until no model server runs. The
 # running active backend's own re-hash keeps 1.6.0's behaviour (R-9).
+# Managed jobs are a root pass's view; any pass also looks for model-server
+# processes by name.
 full_read_blocker() {
-    if [ "$1" = "$I_ACTIVE" ] && [ -n "$(mss_label_pid "$(label "$1")")" ]; then return 0; fi
-    for _fr_b in llamacpp ds4 mlx; do
-        [ -z "$(mss_label_pid "$(label "$_fr_b")")" ] || { echo "$_fr_b"; return 0; }
-    done
+    if [ "$IS_ROOT" = 1 ]; then
+        if [ "$1" = "$I_ACTIVE" ] && [ -n "$(mss_label_pid "$(label "$1")")" ]; then return 0; fi
+        for _fr_b in llamacpp ds4 mlx; do
+            [ -z "$(mss_label_pid "$(label "$_fr_b")")" ] || { echo "$_fr_b"; return 0; }
+        done
+    fi
     _fr_s=$(mss_model_servers | head -n 1)
     [ -z "$_fr_s" ] || echo "${_fr_s% *}"
 }
