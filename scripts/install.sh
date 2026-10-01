@@ -1,10 +1,10 @@
 #!/bin/bash
 
-# MSS_BACKENDS selects the backends (default: ollama, the v1.2.0 flow). An
-# optional backend (llamacpp or ds4) is fully validated, model hash included,
-# before anything below changes the system, then installed as root by
-# scripts/install-backends.sh. `sudo` resets the environment, so every variable
-# is passed explicitly.
+# MSS_BACKENDS selects the backends (default: ollama, the v1.2.0 flow). The
+# optional backends (llamacpp, ds4, mlx; one active, the others on standby) are
+# fully validated, model hash included, before anything below changes the
+# system, then installed as root by scripts/install-backends.sh. `sudo` resets
+# the environment, so every variable is passed explicitly.
 REPO_DIR=$(cd "$(dirname "$0")/.." && pwd)
 . "$REPO_DIR/scripts/lib/mss-common.sh" || exit 1
 . "$REPO_DIR/scripts/lib/mss-acquire.sh" || exit 1
@@ -36,6 +36,7 @@ for mss_arg in "$@"; do
     esac
 done
 MSS_ENV_FILE=${MSS_ENV_FILE:-$REPO_DIR/backends.env}
+case $MSS_ENV_FILE in /*) ;; *) MSS_ENV_FILE=$(pwd)/$MSS_ENV_FILE ;; esac
 MSS_PICKER_REPLACE=""
 MSS_SWITCH_FROM=""
 mss_on_terminal() { [ -t 0 ] && [ -t 2 ]; }
@@ -66,6 +67,15 @@ elif [ "$MSS_MODE" = picker ]; then
     MSS_INSTALLED_OPT=$(mss_conf_get MSS_GUARD_BACKEND 2>/dev/null)
     mss_picker_run "$MSS_ENV_FILE" "$MSS_INSTALLED_SEL" "$MSS_INSTALLED_OPT" \
         "$([ "$MSS_FLAG" = --configure-only ] && echo 1 || echo 0)"
+fi
+
+# Picker and loaded modes keep backends.env: the final root pass saves the
+# installed MSS_BACKENDS and MSS_ACTIVE_BACKEND into it under its lock (#1 D9).
+if [ "$MSS_MODE" = picker ] || [ "$MSS_MODE" = loaded ]; then
+    # shellcheck disable=SC2034  # both are read by run_install_backends (mss-run.sh)
+    MSS_SAVE_ENVFILE=$MSS_ENV_FILE
+    # shellcheck disable=SC2034
+    MSS_SAVE_USER=$(id -un)
 fi
 
 # D7 step 2: resolve the legacy choice keys, then validate every choice before
@@ -133,6 +143,8 @@ mss_apply_step() {
 
 # Validate before any system change.
 mss_validate_selection "$BACKENDS" || exit 1
+mss_active_backend "$BACKENDS" "${MSS_ACTIVE_BACKEND:-}" >/dev/null || exit 1
+mss_has_optional() { [ -n "$(mss_optional_backends "$BACKENDS")" ]; }
 mss_validate_ipv4 "$BIND" || { mss_error "OLLAMA_BIND: '$BIND' must be a single IPv4 address"; exit 1; }
 case ${MSS_TUNE_MACOS:-} in ''|yes|no) ;; *) mss_error "MSS_TUNE_MACOS must be yes or no"; exit 1 ;; esac
 # The Ollama binary matters only when Ollama is selected. A key left from an
@@ -169,7 +181,7 @@ if [ "$MSS_FLAG" = --configure-only ]; then
     echo "Saved $MSS_ENV_FILE and checked it; nothing was installed." >&2
     exit 0
 fi
-if mss_backend_selected llamacpp || mss_backend_selected ds4; then
+if mss_has_optional; then
     mss_check --check-only || exit 1
 fi
 
@@ -186,11 +198,12 @@ mkdir -p "$BASE_DIR/logs"
 # failure leaves the machine as it was.
 mss_apply_step mss_docker_install_apply
 
-# D7 step 7: a confirmed switch removes the old backend only now, after the check passed.
-if [ -n "$MSS_SWITCH_FROM" ]; then
-    echo "Removing $MSS_SWITCH_FROM ..." >&2
-    sudo /bin/sh "$REPO_DIR/scripts/uninstall.sh" --backend "$MSS_SWITCH_FROM" || exit 1
-fi
+# D7 step 7: backends the picker was told to remove go only now, after the
+# check passed (their model files and backends.env are kept).
+for mss_sw in $(printf '%s' "$MSS_SWITCH_FROM" | tr ',' ' '); do
+    echo "Removing $mss_sw ..." >&2
+    sudo /bin/sh "$REPO_DIR/scripts/uninstall.sh" --backend "$mss_sw" || exit 1
+done
 
 if mss_backend_selected ollama; then
 # Create necessary directories
@@ -213,13 +226,19 @@ fi
 
 # Install launch daemon
 log_action "Installing Ollama launch daemon ($OLLAMA_EXE)..."
-# Replace user, bind address and binary in the plist file
+# Replace user, bind address and binary in the plist file. A loaded service
+# whose plist would not change keeps running (#1 D9).
+OLLAMA_PLIST="$MSS_SYSROOT_PREFIX/Library/LaunchDaemons/com.ollama.service.plist"
 mss_render_ollama_plist "$BASE_DIR/config/com.ollama.service.plist" "$USER" "$BIND" "$OLLAMA_EXE" > "/tmp/com.ollama.service.plist"
-sudo cp "/tmp/com.ollama.service.plist" "$MSS_SYSROOT_PREFIX/Library/LaunchDaemons/"
+OLLAMA_UNCHANGED=0
+if cmp -s "/tmp/com.ollama.service.plist" "$OLLAMA_PLIST" && launchctl print system/com.ollama.service >/dev/null 2>&1; then
+    OLLAMA_UNCHANGED=1
+else
+    sudo cp "/tmp/com.ollama.service.plist" "$MSS_SYSROOT_PREFIX/Library/LaunchDaemons/"
+    sudo chown root:wheel "$OLLAMA_PLIST"
+    sudo chmod 644 "$OLLAMA_PLIST"
+fi
 rm "/tmp/com.ollama.service.plist"
-
-sudo chown root:wheel "$MSS_SYSROOT_PREFIX/Library/LaunchDaemons/com.ollama.service.plist"
-sudo chmod 644 "$MSS_SYSROOT_PREFIX/Library/LaunchDaemons/com.ollama.service.plist"
 
 # Ensure Ollama directory exists with proper permissions
 log_action "Setting up Ollama directory..."
@@ -227,9 +246,13 @@ mkdir -p "$MSS_SYSROOT_PREFIX/Users/$USER/.ollama"
 chown "$USER:staff" "$MSS_SYSROOT_PREFIX/Users/$USER/.ollama"
 
 # Load the launch daemon
-log_action "Loading Ollama service..."
-sudo launchctl unload "$MSS_SYSROOT_PREFIX/Library/LaunchDaemons/com.ollama.service.plist" 2>/dev/null || true
-sudo launchctl load -w "$MSS_SYSROOT_PREFIX/Library/LaunchDaemons/com.ollama.service.plist"
+if [ "$OLLAMA_UNCHANGED" = 1 ]; then
+    log_action "Ollama service unchanged; not restarted (sudo launchctl kickstart -k system/com.ollama.service restarts it)"
+else
+    log_action "Loading Ollama service..."
+    sudo launchctl unload "$OLLAMA_PLIST" 2>/dev/null || true
+    sudo launchctl load -w "$OLLAMA_PLIST"
+fi
 
 mss_is_loopback_host "$BIND" || \
     log_action "WARNING: Ollama is LAN-bound on $BIND (OLLAMA_BIND=127.0.0.1 makes it loopback-only)"
@@ -261,9 +284,9 @@ mss_apply_step mss_power_apply
 # D7 step 11: the Colima boot job (D5 apply table; never stops a running Colima).
 mss_apply_step mss_docker_autostart_apply
 
-# Optional backend (llamacpp or ds4), validated above.
-if mss_backend_selected llamacpp || mss_backend_selected ds4; then
-    log_action "Installing optional backend (MSS_BACKENDS=$BACKENDS)..."
+# Optional backends (llamacpp, ds4, mlx), validated above.
+if mss_has_optional; then
+    log_action "Installing optional backends (MSS_BACKENDS=$BACKENDS)..."
     mss_check || exit 1
 fi
 

@@ -3,15 +3,28 @@
 #
 # bash 3.2. `sudo` resets the environment, so every variable is passed
 # explicitly. Callers set BACKENDS, USER, BIND and GPU_PERCENT, and
-# MSS_PICKER_REPLACE for a switch.
+# MSS_PICKER_REPLACE for a switch, and MSS_SAVE_ENVFILE / MSS_SAVE_USER when
+# the install should save MSS_BACKENDS and MSS_ACTIVE_BACKEND.
 
 run_install_backends() {
-    # MSS_REPLACE_BACKEND reaches only the --check-only pass of a switch.
-    local mss_replace=""
-    [ "${1:-}" != --check-only ] || mss_replace=${MSS_PICKER_REPLACE:-}
+    # MSS_REPLACE_BACKEND (a comma list) reaches only the --check-only pass of
+    # a switch; the save variables reach only the install pass, which writes
+    # backends.env under the lifecycle lock (#1 D5 phase 6).
+    local mss_replace="" mss_save_file="" mss_save_user=""
+    if [ "${1:-}" = --check-only ]; then
+        mss_replace=${MSS_PICKER_REPLACE:-}
+    else
+        mss_save_file=${MSS_SAVE_ENVFILE:-}
+        mss_save_user=${MSS_SAVE_USER:-}
+    fi
     sudo env \
         MSS_REPLACE_BACKEND="$mss_replace" \
+        MSS_SAVE_ENVFILE="$mss_save_file" \
+        MSS_SAVE_USER="$mss_save_user" \
+        MSS_LOCK_TIMEOUT="${MSS_LOCK_TIMEOUT:-}" \
+        MSS_LAUNCHD_TIMEOUT="${MSS_LAUNCHD_TIMEOUT:-}" \
         MSS_BACKENDS="$BACKENDS" \
+        MSS_ACTIVE_BACKEND="${MSS_ACTIVE_BACKEND:-}" \
         MSS_DEFER_MODEL="${MSS_DEFER_MODEL:-}" \
         MSS_PROGRESS_SECONDS="${MSS_PROGRESS_SECONDS:-}" \
         OLLAMA_USER="$USER" \
@@ -37,6 +50,11 @@ run_install_backends() {
         DS4_BATCHED_SESSIONS="${DS4_BATCHED_SESSIONS:-}" \
         DS4_WORKDIR="${DS4_WORKDIR:-}" \
         DS4_EXTRA_ARGS="${DS4_EXTRA_ARGS:-}" \
+        MLX_BIN="${MLX_BIN:-}" \
+        MLX_MODEL_DIR="${MLX_MODEL_DIR:-}" \
+        MLX_PORT="${MLX_PORT:-}" \
+        MLX_CTX="${MLX_CTX:-}" \
+        MLX_EXTRA_ARGS="${MLX_EXTRA_ARGS:-}" \
         MSS_GUARD_FREE_PCT="${MSS_GUARD_FREE_PCT:-}" \
         MSS_GUARD_SWAP_HEADROOM_MB="${MSS_GUARD_SWAP_HEADROOM_MB:-}" \
         MSS_GUARD_STREAK="${MSS_GUARD_STREAK:-}" \
