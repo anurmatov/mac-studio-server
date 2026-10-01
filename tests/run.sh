@@ -2654,10 +2654,30 @@ ma8 missing-bin "MLX_BIN is required" MLX_BIN=
 ma8 not-executable "MLX_BIN: not executable" MLX_BIN="$T1/mlx-noexec"
 ma8 version "MLX_BIN: mlx-serve 26.9.7 is installed; this release supports 26.9.6 only" MSS_STUB_MLX_VERSION=26.9.7
 ma8 non-zero "MLX_BIN: $PTMP/fix/mlx/mlx-serve --version exited 3" MSS_STUB_MLX_RC=3
-: > "$T1/hang"; T0=$(date +%s)
+# The hung probe: the whole refusal, and the probe alone, end within 11 s
+# (milliseconds, so a second boundary cannot hide an overrun).
+ms_now() { /usr/bin/perl -MTime::HiRes=time -e 'printf "%d\n", time * 1000'; }
+: > "$T1/hang"; T0=$(ms_now)
 ma8 hang "MLX_BIN: $PTMP/fix/mlx/mlx-serve --version timed out after 10s" MSS_STUB_MLX_HANG="$T1/hang"
-check "MA8 the hung probe is stopped within 11 s" yes "$([ $(( $(date +%s) - T0 )) -le 11 ] && echo yes || echo "no ($(( $(date +%s) - T0 ))s)")"
+EL=$(( $(ms_now) - T0 ))
+check "MA8 the hung probe is stopped within 11 s" yes "$([ "$EL" -le 11000 ] && echo yes || echo "no (${EL} ms)")"
+T0=$(ms_now)
+OUT=$(MSS_STUB_MLX_HANG="$T1/hang" mss_mlx_version_ok "$TMP/fix/mlx/mlx-serve" "" MLX_BIN 2>&1); RC=$?
+EL=$(( $(ms_now) - T0 ))
+check "MA8 the probe alone: refused, timed out, within 11 s" "1 timed-out yes" \
+    "$RC $(printf '%s' "$OUT" | grep -q 'timed out after 10s' && echo timed-out) $([ "$EL" -le 11000 ] && echo yes || echo "no (${EL} ms)")"
 rm -f "$T1/hang"
+# mss_run_bounded itself: the bound is wall time, the status and output pass
+# through, and a child the command leaves behind does not hold the output.
+T0=$(ms_now); OUT=$(mss_run_bounded 2 sh -c 'while :; do sleep 1; done'); RC=$?; EL=$(( $(ms_now) - T0 ))
+check "MA8 mss_run_bounded 2 on a hang returns 124 within 3 s" "124 yes" "$RC $([ "$EL" -le 3000 ] && echo yes || echo "no (${EL} ms)")"
+T0=$(ms_now); OUT=$(mss_run_bounded 2 sh -c 'trap "" TERM; while :; do sleep 1; done'); RC=$?; EL=$(( $(ms_now) - T0 ))
+check "MA8 mss_run_bounded 2 kills a command that ignores TERM within 3 s" "124 yes" "$RC $([ "$EL" -le 3000 ] && echo yes || echo "no (${EL} ms)")"
+T0=$(ms_now); OUT=$(mss_run_bounded 5 sh -c 'echo out; echo err >&2; exit 7'); RC=$?; EL=$(( $(ms_now) - T0 ))
+check "MA8 mss_run_bounded passes the status and output through, at once" "7 out err yes" \
+    "$RC $(printf '%s' "$OUT" | tr '\n' ' ') $([ "$EL" -le 2000 ] && echo yes || echo "no (${EL} ms)")"
+T0=$(ms_now); OUT=$(mss_run_bounded 5 sh -c 'sleep 4 & echo out'); RC=$?; EL=$(( $(ms_now) - T0 ))
+check "MA8 a child left behind does not hold the output" "0 out yes" "$RC $OUT $([ "$EL" -le 2000 ] && echo yes || echo "no (${EL} ms)")"
 ma8 missing-dir "MLX_MODEL_DIR: '$T1/nope' does not exist" MLX_MODEL_DIR="$T1/nope"
 ma8 a-file "MLX_MODEL_DIR: not a directory" MLX_MODEL_DIR="$T1/m8-file"
 ma8 no-config "MLX_MODEL_DIR: $PTMP/i1/m8-nocfg has no top-level config.json" MLX_MODEL_DIR="$T1/m8-nocfg"

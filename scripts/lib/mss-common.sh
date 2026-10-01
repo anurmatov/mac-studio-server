@@ -638,27 +638,47 @@ mss_envfile_write() {
 MSS_MLX_SERVE_VERSION=26.9.6
 
 # mss_run_bounded <seconds> <cmd...>: run cmd, stopping it after <seconds>
-# (macOS has no timeout(1)). Polls every 0.2 s; on the deadline it sends TERM,
-# then KILL, and returns 124. Otherwise it returns the command's status. Inside
-# a lifecycle lock the child is also watched (mss_watchdog).
+# (macOS has no timeout(1)). The deadline is a background `sleep <seconds>`, so
+# the bound is wall time: counting 0.2 s polls let fork overhead on a slow Mac
+# stretch 10 s to 14 s. The loop checks both every 0.2 s; at the deadline it
+# sends TERM, waits up to 0.5 s, sends KILL and returns 124. Otherwise it
+# returns the command's status. The command's output (stdout and stderr) goes
+# to a temporary file and is printed when it ends, so a child it leaves behind
+# cannot hold the caller's command substitution open. Inside a lifecycle lock
+# the child is also watched (mss_watchdog).
 mss_run_bounded() {
     _rb_secs=$1; shift
-    "$@" &
+    _rb_out=$(mktemp "${TMPDIR:-/tmp}/mss-bounded.XXXXXX") || return 1
+    "$@" >"$_rb_out" 2>&1 </dev/null &
     _rb_pid=$!
+    sleep "$_rb_secs" >/dev/null 2>&1 &
+    _rb_timer=$!
     [ -z "${MSS_LOCK_SESSION:-}" ] || mss_watchdog "$_rb_pid"
-    _rb_n=0
+    _rb_rc=""
     while kill -0 "$_rb_pid" 2>/dev/null; do
-        if [ "$_rb_n" -ge $((_rb_secs * 5)) ]; then
+        if ! kill -0 "$_rb_timer" 2>/dev/null; then
             kill -TERM "$_rb_pid" 2>/dev/null
-            sleep 0.5
+            _rb_n=0
+            while kill -0 "$_rb_pid" 2>/dev/null && [ "$_rb_n" -lt 5 ]; do
+                sleep 0.1
+                _rb_n=$((_rb_n + 1))
+            done
             kill -KILL "$_rb_pid" 2>/dev/null
             wait "$_rb_pid" 2>/dev/null
-            return 124
+            _rb_rc=124
+            break
         fi
         sleep 0.2
-        _rb_n=$((_rb_n + 1))
     done
-    wait "$_rb_pid"
+    if [ -z "$_rb_rc" ]; then
+        wait "$_rb_pid"
+        _rb_rc=$?
+    fi
+    kill "$_rb_timer" 2>/dev/null
+    wait "$_rb_timer" 2>/dev/null
+    cat "$_rb_out"
+    rm -f "$_rb_out"
+    return "$_rb_rc"
 }
 
 # mss_mlx_version_ok <bin> [user] [var]: the probe. The first line of
