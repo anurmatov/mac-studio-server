@@ -520,10 +520,7 @@ validate_optional_backend() {
 
 # The mlx branch (D7): loopback only, one model, the pinned version.
 validate_mlx() {
-    for _mv in MLX_HOST MLX_ALLOW_FROM MLX_API_KEY_FILE; do
-        [ -z "$(printenv "$_mv")" ] \
-            || mss_die "$_mv: mlx is loopback-only in this release (mlx-serve cannot disable /v1/load-model or /api/pull)"
-    done
+    mss_mlx_loopback_check || exit 1
     [ -n "$MLX_BIN" ] || mss_die "MLX_BIN is required when 'mlx' is selected"
     [ -n "$MLX_MODEL_DIR" ] || mss_die "MLX_MODEL_DIR is required when 'mlx' is selected"
     MLX_BIN_RESOLVED=$(mss_resolve_path "$MLX_BIN") || mss_die "MLX_BIN: cannot resolve '$MLX_BIN'"

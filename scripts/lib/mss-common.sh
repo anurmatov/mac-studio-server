@@ -53,6 +53,20 @@ mss_validate_selection() {
 
 mss_backend_selected() { case ",${MSS_BACKENDS:-ollama}," in *",$1,"*) return 0 ;; esac; return 1; }
 
+# mss_mlx_loopback_check: MLX_HOST, MLX_ALLOW_FROM and MLX_API_KEY_FILE are not
+# keys (#1 D7); any non-empty one refuses. The root check and run_install_backends
+# both call it, because sudo would drop them before the root check sees them.
+mss_mlx_loopback_check() {
+    for _ml_var in MLX_HOST MLX_ALLOW_FROM MLX_API_KEY_FILE; do
+        eval "_ml_val=\${$_ml_var:-}"
+        [ -z "$_ml_val" ] || {
+            mss_error "$_ml_var: mlx is loopback-only in this release (mlx-serve cannot disable /v1/load-model or /api/pull)"
+            return 1
+        }
+    done
+    return 0
+}
+
 # mss_optional_backends <selection>: its optional backends, space separated, in
 # the fixed order llamacpp ds4 mlx.
 mss_optional_backends() {

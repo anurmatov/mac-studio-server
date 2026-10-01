@@ -2688,6 +2688,65 @@ ma8 space "MLX_MODEL_DIR: '$PTMP/i1/m8 space' must be an absolute path without s
 ma8 host "MLX_HOST: mlx is loopback-only in this release" MLX_HOST=0.0.0.0
 ma8 allow "MLX_ALLOW_FROM: mlx is loopback-only in this release" MLX_ALLOW_FROM=192.0.2.0/24
 ma8 key "MLX_API_KEY_FILE: mlx is loopback-only in this release" MLX_API_KEY_FILE=/tmp/k
+# The same three through the entry points. sudo resets the environment, so the
+# root check above never sees them: they are refused before sudo. The shim
+# records each root pass and runs none, so a refusal records nothing.
+MA8E=$T1/ma8e; mkdir -p "$MA8E/bin" "$MA8E/home" "$MA8E/base"; ln -sf "$ROOT/config" "$MA8E/base/config"
+cat > "$MA8E/bin/sudo" <<SHIM
+#!/bin/sh
+case \$1 in -v) exit 0 ;; -n) shift ;; esac
+case " \$* " in *install-backends.sh*) echo "\$*" >> '$MA8E/root'; exit 0 ;; esac
+exec "\$@"
+SHIM
+chmod +x "$MA8E/bin/sudo"
+printf 'MSS_BACKENDS=mlx\nMSS_TUNE_MACOS=no\nMLX_BIN=%s\nMLX_MODEL_DIR=%s\n' "$TMP/fix/mlx/mlx-serve" "$TMP/fix/mlx/model" \
+    > "$MA8E/backends.env"; chmod 600 "$MA8E/backends.env"
+ma8e_run() { # ma8e_run <name> <env... command...>: output in $MA8E/<name>.out, root passes in $MA8E/root
+    _en=$1; shift; : > "$MA8E/root"
+    ( export MSS_TEST_SYSROOT=$TMP/h27r/sysroot MSS_STUB_STATE=$HR_STATE MSS_LAUNCHD_TIMEOUT=1 MSS_SUDO=$MA8E/bin/sudo \
+          MSS_SYSCTL="$TMP/h27r-bin/sysctl" PATH="$MA8E/bin:$TMP/h27r-bin:$PATH" MSS_INSTALL_SANDBOX=1 \
+          OLLAMA_BASE_DIR="$MA8E/base" HOME="$MA8E/home" MSS_ENV_FILE="$MA8E/backends.env" \
+          OLLAMA_USER="$TUSER" MSS_CONF="$MA8E/none.conf"
+      unset MSS_BACKENDS MSS_ACTIVE_BACKEND MLX_HOST MLX_ALLOW_FROM MLX_API_KEY_FILE
+      env "$@" </dev/null ) >"$MA8E/$_en.out" 2>&1
+}
+ma8e() { # ma8e <name> <variable> <env... command...>: exits 1 naming it, before any root pass
+    _en=$1; _ev=$2; shift 2
+    ma8e_run "$_en" "$@"; _er=$?
+    if [ "$_er" = 1 ] && grep -q "^ERROR: $_ev: mlx is loopback-only in this release" "$MA8E/$_en.out" && [ ! -s "$MA8E/root" ]; then
+        ok "MA8 $_en refuses $_ev before sudo"
+    else
+        fail "MA8 $_en (rc $_er, $(wc -l < "$MA8E/root" | tr -d ' ') root passes): $(tail -n 3 "$MA8E/$_en.out")"
+    fi
+}
+MA8I="MSS_BACKENDS=mlx MSS_TUNE_MACOS=no MLX_BIN=$TMP/fix/mlx/mlx-serve MLX_MODEL_DIR=$TMP/fix/mlx/model"
+# The control: with none of them set, install.sh reaches both root passes and
+# passes the three on (empty), so the refusals below are not the harness failing.
+# shellcheck disable=SC2086  # MA8I is a word list of assignments
+ma8e_run install-none $MA8I /bin/bash "$ROOT/scripts/install.sh"
+check "MA8 control: install.sh with none set runs both root passes" 2 "$(wc -l < "$MA8E/root" | tr -d ' ')"
+grep -v -- '--check-only' "$MA8E/root" | grep -q ' MLX_HOST= MLX_ALLOW_FROM= MLX_API_KEY_FILE= ' \
+    && ok "MA8 the root pass is given all three" || fail "MA8 root passes: $(cat "$MA8E/root") / $(tail -n 3 "$MA8E/install-none.out")"
+# shellcheck disable=SC2086
+ma8e install-host MLX_HOST $MA8I MLX_HOST=0.0.0.0 /bin/bash "$ROOT/scripts/install.sh"
+# shellcheck disable=SC2086
+ma8e install-allow MLX_ALLOW_FROM $MA8I MLX_ALLOW_FROM=192.0.2.0/24 /bin/bash "$ROOT/scripts/install.sh"
+# shellcheck disable=SC2086
+ma8e install-key MLX_API_KEY_FILE $MA8I MLX_API_KEY_FILE=/tmp/k /bin/bash "$ROOT/scripts/install.sh"
+# backend.sh loads backends.env, which the loader refuses unless this user owns it.
+if [ "$(id -u)" -ne 0 ]; then
+    ma8e_run backend-none /bin/bash "$ROOT/scripts/backend.sh" activate mlx
+    check "MA8 control: backend.sh activate mlx with none set runs both root passes" 2 "$(wc -l < "$MA8E/root" | tr -d ' ')"
+    ma8e backend-host MLX_HOST MLX_HOST=0.0.0.0 /bin/bash "$ROOT/scripts/backend.sh" activate mlx
+    ma8e backend-key MLX_API_KEY_FILE MLX_API_KEY_FILE=/tmp/k /bin/bash "$ROOT/scripts/backend.sh" activate mlx
+else
+    echo "skip - MA8 backend.sh rows need a non-root user (the loader refuses a file it does not own)"
+fi
+# model.sh needs a terminal; it reaches sudo through the same run_install_backends,
+# the only caller of install-backends.sh.
+check "MA8 run_install_backends is the only caller of install-backends.sh" "scripts/lib/mss-run.sh" \
+    "$(grep -l 'install-backends\.sh"' "$ROOT"/scripts/*.sh "$ROOT"/scripts/lib/*.sh "$ROOT"/libexec/*.sh "$ROOT"/bootstrap.sh \
+        | sed "s|^$ROOT/||" | grep -vx 'scripts/install-backends.sh')"
 ma8 defer "MSS_DEFER_MODEL=yes is not supported for mlx" MSS_DEFER_MODEL=yes
 ma8 ctx0 "MLX_CTX: '0' is below 1" MLX_CTX=0
 ma8 ctxabc "MLX_CTX: 'abc' is not a non-negative integer" MLX_CTX=abc
