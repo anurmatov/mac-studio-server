@@ -2656,7 +2656,7 @@ ma8 version "MLX_BIN: mlx-serve 26.9.7 is installed; this release supports 26.9.
 ma8 non-zero "MLX_BIN: $PTMP/fix/mlx/mlx-serve --version exited 3" MSS_STUB_MLX_RC=3
 # The hung probe: the whole refusal, and the probe alone, end within 11 s
 # (milliseconds, so a second boundary cannot hide an overrun).
-ms_now() { /usr/bin/perl -MTime::HiRes=time -e 'printf "%d\n", time * 1000'; }
+ms_now() { LC_ALL=C /usr/bin/perl -MTime::HiRes=time -e 'printf "%d\n", time * 1000'; }
 : > "$T1/hang"; T0=$(ms_now)
 ma8 hang "MLX_BIN: $PTMP/fix/mlx/mlx-serve --version timed out after 10s" MSS_STUB_MLX_HANG="$T1/hang"
 EL=$(( $(ms_now) - T0 ))
@@ -2955,7 +2955,7 @@ check "MA23 staged and backup copies both missing" refuse "$(plan23 none)"
 # MA20, MA24, MA26: the lock, with the non-root test hooks.
 LK=$T1/lock; mkdir -p "$LK"
 MSS_LOCK_FILE="$LK/lock"; MSS_MUT_FILE="$LK/mut"; export MSS_LOCK_FILE MSS_MUT_FILE
-now_ms() { /usr/bin/perl -MTime::HiRes=time -e 'printf "%d\n", time * 1000'; }
+now_ms() { LC_ALL=C /usr/bin/perl -MTime::HiRes=time -e 'printf "%d\n", time * 1000'; }
 sh "$ROOT/tests/stubs/hold-lock.sh" 60 > "$LK/h1.out" 2>&1 & H1=$!
 _i=0; while ! grep -q '^held' "$LK/h1.out" 2>/dev/null && [ "$_i" -lt 50 ]; do sleep 0.1; _i=$((_i + 1)); done
 T0=$(now_ms)
@@ -2995,7 +2995,7 @@ cat > "$LK/ma26.sh" <<'MA26'
 D=$2
 mss_lock_acquire ma26
 run() { # run <tag>: the raw runner, so a refusal does not end this shell
-    /usr/bin/perl -e "$_MSS_LOCK_PL" mut "$MSS_LOCK_FILE" "$MSS_MUT_FILE" "$MSS_LOCK_SESSION" /bin/sh -c ": > '$D/ran-$1'" 2>"$D/err-$1"
+    LC_ALL=C /usr/bin/perl -e "$_MSS_LOCK_PL" mut "$MSS_LOCK_FILE" "$MSS_MUT_FILE" "$MSS_LOCK_SESSION" /bin/sh -c ": > '$D/ran-$1'" 2>"$D/err-$1"
     echo "$1 rc=$? $(ls "$MSS_MUT_FILE.d" | wc -l | tr -d ' ')"
 }
 run match
@@ -3289,7 +3289,7 @@ SUM=$(grep '^phase A: [0-9]* passed, [0-9]* failed$' "$PB/phase-a-installed.log"
 if [ "$RC" = 0 ] && printf '%s' "$SUM" | grep -q ', 0 failed$' && ! grep -Eq 'panic|Setting locale failed' "$PB/phase-a-installed.log"; then
     ok "phase A on an installed host under C.UTF-8: $SUM (#21)"
 else
-    fail "phase A on an installed host under C.UTF-8 (exit $RC): $(tail -n 20 "$PB/phase-a-installed.log")"
+    fail "phase A on an installed host under C.UTF-8 (exit $RC; $SUM): $(grep -E 'panic|Setting locale failed|^FAIL' "$PB/phase-a-installed.log" | head -n 5)"
 fi
 sudo sh "$ROOT/scripts/uninstall.sh" --backend ds4 >/dev/null 2>&1
 
@@ -3805,6 +3805,21 @@ mbsnap() {
 # mlx_servers: running stub mlx servers (a stub runs as sh, so by its arguments).
 mlx_servers() { pgrep -f "$MLXB --serve" 2>/dev/null | wc -l | tr -d ' '; }
 ds4_servers() { pgrep -f "$DS4B -m" 2>/dev/null | wc -l | tr -d ' '; }
+# mut_holders: who holds the mutation lock, for the log when a release is slow.
+mut_holders() {
+    echo "note - mutation lock holders: $(sudo lsof -n /var/run/com.mac-studio-server.mut 2>/dev/null | awk 'NR > 1 { print $1 "/" $2 }' | tr '\n' ' ')"
+    for _mh in $(sudo lsof -n -t /var/run/com.mac-studio-server.mut 2>/dev/null); do
+        echo "note -   $(ps -o pid=,pgid=,ppid=,lstart=,command= -p "$_mh" 2>/dev/null | cut -c1-200)"
+    done
+    echo "note - owner: $(cat /var/run/com.mac-studio-server.lock.owner 2>/dev/null)"
+}
+# lock_free <seconds>: wait until the previous command's keeper has let go.
+lock_free() {
+    _lf0=$(date +%s)
+    OUT=$(sudo env MSS_LOCK_TIMEOUT="$1" sh -c '. "$1/scripts/lib/mss-common.sh"; mss_lock_acquire probe; echo acquired' sh "$ROOT" 2>&1)
+    [ $(( $(date +%s) - _lf0 )) -le 2 ] || { echo "note - the lock took $(( $(date +%s) - _lf0 ))s to free"; mut_holders; }
+    [ "$OUT" = acquired ]
+}
 
 # MB1: mlx alone, active.
 mbi "$MBD/mb1.log" MSS_BACKENDS=mlx
@@ -3919,8 +3934,11 @@ sh "$ROOT/scripts/status.sh" >"$MBD/mb7.status" 2>&1
 grep -q "unmanaged mlx-serve pid $MB7S (not guarded)" "$MBD/mb7.status" && ok "MB7 status names the unmanaged server" \
     || fail "MB7 status: $(cat "$MBD/mb7.status")"
 kill "$MB7S"; wait "$MB7S" 2>/dev/null
+# launchd does not respawn a job whose program exits 78 (EX_CONFIG): once the
+# other server is gone, stop and start bring the backend back.
+bsh stop mlx >/dev/null 2>&1; bsh start mlx >"$MBD/mb7.start" 2>&1
 _i=0; while ! port_open 18234 && [ "$_i" -lt 45 ]; do sleep 1; _i=$((_i + 1)); done
-port_open 18234 && ok "MB7 after the kill, mlx listens within 45 s ($_i s)" || fail "MB7 not listening after 45 s"
+port_open 18234 && ok "MB7 after the kill, stop and start: mlx listens within 45 s ($_i s)" || fail "MB7 not listening: $(cat "$MBD/mb7.start")"
 
 # MB5: a trip holds through bootstrap, re-install, start and activation; mss-enable starts ds4.
 MB5P=$(jobpid "$ML")
@@ -4149,13 +4167,13 @@ mbi "$MBD/mb27a.install" MSS_BACKENDS=ds4,mlx MSS_ACTIVE_BACKEND=mlx PATH="$ROOT
     MSS_STUB_SLOW_DEST="$ETCB/backends.conf" &
 _i=0; while [ ! -e "$ETCB/commit.journal" ] && [ "$_i" -lt 100 ]; do sleep 0.1; _i=$((_i + 1)); done
 sleep 1
-KS=$(sed -n 's/^session=\([0-9a-f]*\) .*/\1/p' /var/run/com.mac-studio-server.lock.owner)
+KS=$(sed -n 's/^session=\([0-9a-f]*\) .*/\1/p' /var/run/com.mac-studio-server.lock.owner); KT=$(date +%s)
 sudo kill -9 "$(sed -n 's/.* holder=\([0-9]*\)@.*/\1/p' /var/run/com.mac-studio-server.lock.owner)"
 env MSS_LOCK_TIMEOUT=60 MSS_ENV_FILE="$MBE" "$ROOT/scripts/backend.sh" activate ds4 >"$MBD/mb27a.log" 2>&1
 check "MB27 a: the competitor exits 0" 0 $?
 : > "$MBD/mb27.stop"; wait "$OWNP" 2>/dev/null; rm -f "$MBD/mb27.stop"
 SLOW=$(cat /tmp/mss-stub-mv-slow.log 2>/dev/null | head -n 1)
-FIRST=$(awk -v k="session=$KS " 'index($0, "cmd=install-backends") && index($0, "session=") && !index($0, k) { print $1; exit }' "$OWNLOG")
+FIRST=$(awk -v k="session=$KS " -v t="$KT" '$1 >= t && index($0, "cmd=install-backends") && index($0, "session=") && !index($0, k) { print $1; exit }' "$OWNLOG")
 [ -n "$SLOW" ] && [ -n "$FIRST" ] && [ "$FIRST" -ge "$SLOW" ] && ok "MB27 a: the competitor's lock follows the slow rename" \
     || fail "MB27 a: slow mv at ${SLOW:-none}, next holder at ${FIRST:-none}"
 grep -q '^NOTICE: completed an interrupted commit' "$MBD/mb27a.log" && ok "MB27 a: the competitor completes the commit" || fail "MB27 a: $(head -3 "$MBD/mb27a.log")"
@@ -4185,10 +4203,12 @@ env MSS_LOCK_TIMEOUT=60 MSS_ENV_FILE="$MBE" "$ROOT/scripts/backend.sh" activate 
 check "MB27 c: the competitor exits 0" 0 $?
 EL=$(( $(date +%s) - T0 ))
 [ "$EL" -ge 34 ] && [ "$EL" -le 60 ] && ok "MB27 c: the hung save was killed after 30 + 5 s (${EL}s)" || fail "MB27 c: ${EL}s"
+[ "$EL" -le 45 ] || mut_holders
 pgrep -f 'sleep 90' >/dev/null && fail "MB27 c: the hung save survives" || ok "MB27 c: the hung save is gone"
 check "MB27 c: saved = installed = ds4" "ds4 ds4" "$(saved_active) $(conf_active)"
 
 # MB28: a runner that reaches the mutation lock after its session ended never runs.
+lock_free 90 && ok "MB28 the previous command's keeper has let go" || fail "MB28 the lock is still held: $OUT"
 sudo rm -f /tmp/mss-late
 sudo sh "$ROOT/tests/stubs/hold-mut-ex.sh" >"$MBD/mb28.ex" 2>&1 & MB28X=$!
 _i=0; while ! grep -q '^held' "$MBD/mb28.ex" 2>/dev/null && [ "$_i" -lt 50 ]; do sleep 0.1; _i=$((_i + 1)); done
@@ -4247,8 +4267,9 @@ for b in ds4 llamacpp; do
     sudo grep -q "REFUSE: model server already running (mlx-serve pid $MB23S)" "$LOGB/$b.log" && ! port_open "$_p" \
         && ok "MB23 $b refuses beside an unmanaged mlx-serve, port closed" || fail "MB23 $b: $(sudo tail -3 "$LOGB/$b.log")"
     kill "$MB23S"; wait "$MB23S" 2>/dev/null
+    bsh stop "$b" >/dev/null 2>&1; bsh start "$b" >"$MBD/mb23-$b.start" 2>&1
     _i=0; while ! port_open "$_p" && [ "$_i" -lt 45 ]; do sleep 1; _i=$((_i + 1)); done
-    port_open "$_p" && ok "MB23 $b starts once it is gone" || fail "MB23 $b did not start"
+    port_open "$_p" && ok "MB23 $b starts once it is gone" || fail "MB23 $b did not start: $(cat "$MBD/mb23-$b.start")"
 done
 
 # MB12: ollama,mlx; removing Ollama leaves mlx and the guard; --all twice.

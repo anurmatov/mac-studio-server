@@ -954,6 +954,8 @@ if ($mode eq "mut") {
     }
     my $fl = fcntl($M, F_GETFD, 0);
     fcntl($M, F_SETFD, $fl & ~FD_CLOEXEC);
+    my $lc = delete $ENV{MSS_MUT_LC_ALL};
+    if (!defined $lc || $lc eq "mss-unset") { delete $ENV{LC_ALL}; } else { $ENV{LC_ALL} = $lc; }
     { no warnings "exec"; exec { $cmd[0] } @cmd; }
     print STDERR "ERROR: cannot run $cmd[0]: $!\n";
     exit 127;
@@ -986,7 +988,7 @@ mss_lock_acquire() {
     [ -x /usr/bin/perl ] || mss_die "/usr/bin/perl is required for the lifecycle lock"
     _la_dir=$(mktemp -d "${TMPDIR:-/tmp}/mss-lock.XXXXXX") || mss_die "cannot create a temporary directory for the lifecycle lock"
     mkfifo "$_la_dir/fifo" || { rm -rf "$_la_dir"; mss_die "cannot create the lifecycle lock fifo"; }
-    /usr/bin/perl -e "$_MSS_LOCK_PL" keeper "$(mss_lock_file)" "$_la_to" "$$" "$(mss_pid_start $$)" "$1" "$(mss_mut_file)" \
+    LC_ALL=C /usr/bin/perl -e "$_MSS_LOCK_PL" keeper "$(mss_lock_file)" "$_la_to" "$$" "$(mss_pid_start $$)" "$1" "$(mss_mut_file)" \
         9>&- </dev/null >"$_la_dir/fifo" 2>/dev/null &
     MSS_LOCK_KEEPER=$!
     _la_line=""
@@ -1008,7 +1010,7 @@ mss_lock_acquire() {
 # mss_lock_check: this shell still holds its session, or exit 1. Runs before
 # every bootout, bootstrap, commit step and save.
 mss_lock_check() {
-    /usr/bin/perl -e "$_MSS_LOCK_PL" check "$(mss_lock_file)" "${MSS_LOCK_SESSION:-}" \
+    LC_ALL=C /usr/bin/perl -e "$_MSS_LOCK_PL" check "$(mss_lock_file)" "${MSS_LOCK_SESSION:-}" \
         || mss_die "lifecycle lock lost; nothing further was changed"
 }
 
@@ -1018,7 +1020,11 @@ mss_lock_check() {
 # so does the holder (exit 1).
 mss_mut() {
     _mm_rc=0
-    /usr/bin/perl -e "$_MSS_LOCK_PL" mut "$(mss_lock_file)" "$(mss_mut_file)" "${MSS_LOCK_SESSION:-}" "$@" || _mm_rc=$?
+    # Perl warns on a locale it cannot load (C.UTF-8 over SSH, as for shasum);
+    # the command it runs gets the caller's LC_ALL back.
+    # shellcheck disable=SC2097,SC2098  # the caller's LC_ALL, read before the override
+    MSS_MUT_LC_ALL=${LC_ALL-mss-unset} LC_ALL=C \
+        /usr/bin/perl -e "$_MSS_LOCK_PL" mut "$(mss_lock_file)" "$(mss_mut_file)" "${MSS_LOCK_SESSION:-}" "$@" || _mm_rc=$?
     [ "$_mm_rc" != 75 ] || mss_die "lifecycle lock lost; nothing further was changed"
     return "$_mm_rc"
 }
