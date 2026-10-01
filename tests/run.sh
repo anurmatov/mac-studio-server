@@ -3794,7 +3794,10 @@ bsh() { env MSS_ENV_FILE="$MBE" "$ROOT/scripts/backend.sh" "$@"; }
 saved_active() { sed -n 's/^MSS_ACTIVE_BACKEND=//p' "$MBE"; }
 conf_active() { sed -n 's/^MSS_GUARD_BACKEND=//p' "$CONFB" 2>/dev/null; }
 port_open() { nc -z 127.0.0.1 "$1" >/dev/null 2>&1; }
-wait_closed() { _i=0; while port_open "$1" && [ "$_i" -lt 30 ]; do sleep 1; _i=$((_i + 1)); done; ! port_open "$1"; }
+# wait_closed / wait_open <port> <seconds>: the loop's own answer. A stub serves
+# one connection at a time, so a second probe right after can miss it.
+wait_closed() { _i=0; while [ "$_i" -lt 30 ]; do port_open "$1" || return 0; sleep 1; _i=$((_i + 1)); done; return 1; }
+wait_open() { _i=0; while [ "$_i" -lt "$2" ]; do port_open "$1" && return 0; sleep 1; _i=$((_i + 1)); done; return 1; }
 # mbsnap: every lifecycle file, as "<sha256> <path>" lines (root reads them).
 mbsnap() {
     sudo sh -c 'for f in /usr/local/etc/mac-studio-server/backends.conf /usr/local/etc/mac-studio-server/pf.conf \
@@ -3805,6 +3808,7 @@ mbsnap() {
 # mlx_servers: running stub mlx servers (a stub runs as sh, so by its arguments).
 mlx_servers() { pgrep -f "$MLXB --serve" 2>/dev/null | wc -l | tr -d ' '; }
 ds4_servers() { pgrep -f "$DS4B -m" 2>/dev/null | wc -l | tr -d ' '; }
+llama_servers() { pgrep -f "$LLB -m" 2>/dev/null | wc -l | tr -d ' '; }
 # mut_holders: who holds the mutation lock, for the log when a release is slow.
 mut_holders() {
     echo "note - mutation lock holders: $(sudo lsof -n /var/run/com.mac-studio-server.mut 2>/dev/null | awk 'NR > 1 { print $1 "/" $2 }' | tr '\n' ' ')"
@@ -3934,11 +3938,9 @@ sh "$ROOT/scripts/status.sh" >"$MBD/mb7.status" 2>&1
 grep -q "unmanaged mlx-serve pid $MB7S (not guarded)" "$MBD/mb7.status" && ok "MB7 status names the unmanaged server" \
     || fail "MB7 status: $(cat "$MBD/mb7.status")"
 kill "$MB7S"; wait "$MB7S" 2>/dev/null
-# launchd does not respawn a job whose program exits 78 (EX_CONFIG): once the
-# other server is gone, stop and start bring the backend back.
-bsh stop mlx >/dev/null 2>&1; bsh start mlx >"$MBD/mb7.start" 2>&1
-_i=0; while ! port_open 18234 && [ "$_i" -lt 45 ]; do sleep 1; _i=$((_i + 1)); done
-port_open 18234 && ok "MB7 after the kill, stop and start: mlx listens within 45 s ($_i s)" || fail "MB7 not listening: $(cat "$MBD/mb7.start")"
+# KeepAlive retries the refused job every ThrottleInterval (30 s).
+wait_open 18234 45 && ok "MB7 after the kill, mlx listens within 45 s (${_i}s)" \
+    || fail "MB7 not listening after 45 s: $(sudo tail -n 3 "$LOGB/mlx.log")"
 
 # MB5: a trip holds through bootstrap, re-install, start and activation; mss-enable starts ds4.
 MB5P=$(jobpid "$ML")
@@ -3975,7 +3977,7 @@ sudo kill "$(sed -n 's/^held \([0-9]*\) .*/\1/p' "$MBD/mb22.hold")" 2>/dev/null;
 mbi "$MBD/mb22.log" MSS_BACKENDS=ds4,mlx MSS_ACTIVE_BACKEND=ds4
 grep -q '^WARNING: guard tripped' "$MBD/mb22.log" && ok "MB22 the next install warns" || fail "MB22 no warning"
 sudo launchctl kickstart -k "system/$DL" >/dev/null 2>&1; sleep 3
-! port_open 18000 && ok "MB22 the backend refuses to start" || fail "MB22 ds4 started after a trip"
+! port_open 18000 && [ "$(ds4_servers)" = 0 ] && ok "MB22 the backend refuses to start" || fail "MB22 ds4 started after a trip"
 sudo "$ENABLE" >/dev/null 2>&1; wait_listen 18000 >/dev/null
 
 # MB10: uninstall the standby mlx: only its files go.
@@ -4208,7 +4210,11 @@ pgrep -f 'sleep 90' >/dev/null && fail "MB27 c: the hung save survives" || ok "M
 check "MB27 c: saved = installed = ds4" "ds4 ds4" "$(saved_active) $(conf_active)"
 
 # MB28: a runner that reaches the mutation lock after its session ended never runs.
+# The probe's own keeper must have let go too: a keeper still draining would
+# wait on the blocker below (which no real command ever takes outside a lock).
 lock_free 90 && ok "MB28 the previous command's keeper has let go" || fail "MB28 the lock is still held: $OUT"
+_i=0; while ! grep -q '^released after draining' /var/run/com.mac-studio-server.lock.owner 2>/dev/null && [ "$_i" -lt 100 ]; do
+    sleep 0.1; _i=$((_i + 1)); done
 sudo rm -f /tmp/mss-late
 sudo sh "$ROOT/tests/stubs/hold-mut-ex.sh" >"$MBD/mb28.ex" 2>&1 & MB28X=$!
 _i=0; while ! grep -q '^held' "$MBD/mb28.ex" 2>/dev/null && [ "$_i" -lt 50 ]; do sleep 0.1; _i=$((_i + 1)); done
@@ -4264,12 +4270,11 @@ for b in ds4 llamacpp; do
     wait_listen "$_p" >/dev/null
     "$MBD/unmanaged/mlx-serve" 600 & MB23S=$!
     sudo launchctl kickstart -k "system/com.mac-studio-server.$b" >/dev/null 2>&1; sleep 4
-    sudo grep -q "REFUSE: model server already running (mlx-serve pid $MB23S)" "$LOGB/$b.log" && ! port_open "$_p" \
+    [ "$b" = ds4 ] && _ns=$(ds4_servers) || _ns=$(llama_servers)
+    sudo grep -q "REFUSE: model server already running (mlx-serve pid $MB23S)" "$LOGB/$b.log" && ! port_open "$_p" && [ "$_ns" = 0 ] \
         && ok "MB23 $b refuses beside an unmanaged mlx-serve, port closed" || fail "MB23 $b: $(sudo tail -3 "$LOGB/$b.log")"
     kill "$MB23S"; wait "$MB23S" 2>/dev/null
-    bsh stop "$b" >/dev/null 2>&1; bsh start "$b" >"$MBD/mb23-$b.start" 2>&1
-    _i=0; while ! port_open "$_p" && [ "$_i" -lt 45 ]; do sleep 1; _i=$((_i + 1)); done
-    port_open "$_p" && ok "MB23 $b starts once it is gone" || fail "MB23 $b did not start: $(cat "$MBD/mb23-$b.start")"
+    wait_open "$_p" 45 && ok "MB23 $b starts once it is gone (${_i}s)" || fail "MB23 $b did not start: $(sudo tail -n 3 "$LOGB/$b.log")"
 done
 
 # MB12: ollama,mlx; removing Ollama leaves mlx and the guard; --all twice.

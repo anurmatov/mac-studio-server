@@ -325,10 +325,7 @@ Placeholders: `<checkout>`, `<user>`, `<mlx-serve>`, `<model-dir>`, `<prior vars
 - **R-1** mlx-serve's local `/v1/load-model` and `/api/pull` stay open on
   loopback; the disk a pull uses, where it writes and which model is loaded are
   not enforced.
-- **R-2** KeepAlive retries a crashing server every 30 s, but launchd does
-  not respawn a job whose wrapper refused (exit 78, EX_CONFIG): once the
-  cause is gone, `scripts/backend.sh stop <b>` then `start <b>` (or
-  `sudo launchctl kickstart -k system/com.mac-studio-server.<b>`) starts it.
+- **R-2** KeepAlive retries a crashing or refusing server every 30 s (existing).
 - **R-3** The mlx manifest misses an in-place write that keeps a file's size,
   inode and mtime.
 - **R-4** Model-server detection is by process name (`pgrep -x`, 15
