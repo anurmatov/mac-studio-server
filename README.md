@@ -45,7 +45,7 @@ Ollama listens on all interfaces (0.0.0.0) by default and has no password; set O
 
 - **LAN access for llama.cpp or ds4:** answer yes in the installer. A macOS firewall (pf) allowlist
   guards the port; llama.cpp can use an API key file instead. See [docs/backends.md](docs/backends.md).
-- **MLX-Serve:** exactly `mlx-serve` 26.9.6 with a native MLX model directory, on this Mac only (no LAN).
+- **MLX-Serve:** exactly `mlx-serve` 26.10.1 with a native MLX model directory, on this Mac only (no LAN); needs macOS 26.2 or later.
   See [docs/backends.md](docs/backends.md).
 - **GPU memory:** set `MSS_GPU_PERCENT=80` in `backends.env` to let Metal use 80% of RAM
   for every backend. See [docs/options.md](docs/options.md).

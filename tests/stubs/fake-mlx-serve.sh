@@ -1,6 +1,7 @@
 #!/bin/sh
-# fake-mlx-serve.sh — test stub for mlx-serve 26.9.6 (#1).
-# --version prints "mlx-serve $MSS_STUB_MLX_VERSION" (default 26.9.6) and exits
+# fake-mlx-serve.sh — test stub for mlx-serve 26.10.1 (#1).
+# --version prints "mlx-serve $MSS_STUB_MLX_VERSION" (default 26.10.1), then
+# component lines like the real multi-line report, and exits
 # MSS_STUB_MLX_RC (default 0); while the file ${MSS_STUB_MLX_HANG:-/tmp/mss-stub-mlx-hang}
 # exists it hangs instead. Serving, it logs "<pid> <argv>" to $MSS_STUB_ARGV
 # (default /tmp/mss-stub-mlx-argv) and answers every request on --port with 200
@@ -11,7 +12,8 @@ set -u
 
 if [ "${1:-}" = --version ]; then
     while [ -e "${MSS_STUB_MLX_HANG:-/tmp/mss-stub-mlx-hang}" ]; do sleep 1; done
-    echo "mlx-serve ${MSS_STUB_MLX_VERSION:-26.9.6}"
+    echo "mlx-serve ${MSS_STUB_MLX_VERSION:-26.10.1}"
+    printf 'mlx 0.0.0-stub\nmlx-c 0.0.0-stub\nggml unknown\nllama.cpp unknown\ngguf 3\nds4 unknown\n'
     exit "${MSS_STUB_MLX_RC:-0}"
 fi
 

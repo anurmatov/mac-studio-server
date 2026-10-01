@@ -649,7 +649,7 @@ mss_envfile_write() {
 # ── MLX-Serve (#1 D7) ──────────────────────────────────────────────────────────
 # The one supported upstream version. A bump is its own PR that re-verifies the
 # upstream contracts (docs/backends.md).
-MSS_MLX_SERVE_VERSION=26.9.6
+MSS_MLX_SERVE_VERSION=26.10.1
 
 # mss_run_bounded <seconds> <cmd...>: run cmd, stopping it after <seconds>
 # (macOS has no timeout(1)). The deadline is a background `sleep <seconds>`, so

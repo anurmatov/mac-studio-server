@@ -7,7 +7,7 @@ All notable changes to this project will be documented in this file.
 ## [1.7.0] - 2026-10-01
 
 ### Added
-- MLX-Serve 26.9.6 as an optional backend: one native MLX model, on this Mac only
+- MLX-Serve 26.10.1 as an optional backend: one native MLX model, on this Mac only (macOS 26.2 or later)
 - Several optional backends at once: one runs, the others wait on standby and switch without a re-hash
 - A command to switch, stop and start the optional backend, and a status row for every backend
 - An interrupted or failed install is finished, rolled back or reported, never left half-switched

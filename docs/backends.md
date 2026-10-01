@@ -13,7 +13,7 @@ optional backends; **one** of them runs, the others wait on standby:
 | `ollama` | `/usr/local/bin/ollama serve` | `0.0.0.0:11434` (`OLLAMA_BIND`) | none (unchanged) | zero-config default |
 | `llamacpp` | `llama-server` (any GGUF) | `127.0.0.1:8080` | optional `--api-key-file` | LAN bind needs an allowlist or a key |
 | `ds4` | `ds4-server` (DwarfStar) | `127.0.0.1:8000` | **none** | LAN bind always needs `DS4_ALLOW_FROM` |
-| `mlx` | `mlx-serve` 26.9.6 (MLX-Serve) | `127.0.0.1:11234` | none | loopback only; one native MLX model directory |
+| `mlx` | `mlx-serve` 26.10.1 (MLX-Serve) | `127.0.0.1:11234` | none | loopback only; one native MLX model directory |
 
 `MSS_BACKENDS` is any comma list of distinct names from `ollama`, `llamacpp`,
 `ds4` and `mlx`, in any order. An empty element, an unknown name or a
@@ -257,11 +257,21 @@ guarded)`).
 
 `mlx-serve` comes from the Homebrew tap
 `brew tap ddalcu/mlx-serve https://github.com/ddalcu/mlx-serve`, then
-`brew install ddalcu/mlx-serve/mlx-serve` (macOS 14+, arm64). Exactly version
-26.9.6 is supported: the installer and the wrapper run `mlx-serve --version`
-(10 s at most) and require `mlx-serve 26.9.6`. The tap tracks upstream `main`,
-so `brew pin mlx-serve`; after a `brew upgrade` the wrapper refuses until a
-release of this project supports the new version.
+`brew install ddalcu/mlx-serve/mlx-serve` (arm64). It needs macOS 26.2 or later:
+upstream builds the binary for 26.2, though the formula declares macOS 14. Exactly
+version 26.10.1 is supported: the installer and the wrapper run `mlx-serve --version`
+(10 s at most) and require its first line to be `mlx-serve 26.10.1`. The tap
+tracks upstream `main`, so `brew pin mlx-serve`; after a `brew upgrade` the
+wrapper refuses until a release of this project supports the new version.
+
+The release is tag `v26.10.1` (commit `02bee553`). Its asset
+`mlx-serve-bin-macos-arm64.tar.gz` has sha256
+`e53056e481364ff72188fafea8b3eb0aeb0b5b7cebcd6e6e7d26bf1ce4223873`, the same
+value the tap's formula declares for 26.10.1. The installer does not check
+this hash: Homebrew checks it on download, and only the version line is
+checked here. That line is a version check, not proof of where the binary
+came from. To confirm a Homebrew install, compare its formula's `sha256` with
+this value.
 
 | variable | default | rule |
 |---|---|---|
@@ -281,11 +291,15 @@ as the service user, as
 with its output in `/var/log/mac-studio-server/mlx.log`. `MSS_DEFER_MODEL` does
 not apply to mlx. `mlx.distributed` is out of scope.
 
-Checked against upstream v26.9.6 (commit `1745ffe8`) source: the defaults
+Checked against upstream v26.10.1 (commit `02bee553`) source: the defaults
 (`0.0.0.0:11234`), `--version`, one model with `--model <dir> --serve`, the
 flags above and their limits, SIGTERM shutdown, `/health` answering before a
 model is loaded (so readiness is `"state":"ready"` in `/v1/models`), and the
-load, unload and pull endpoints that cannot be disabled. Not tested on a real
+load, unload and pull endpoints that cannot be disabled. In 26.10.1 `--mtp`
+is the default and accepted for compatibility; `--no-mtp` turns it off.
+Upstream also turns speculative drafting on by default and loads a model's
+bundled drafter automatically. Neither is tested here. Neither are upstream's
+speed claims. Not tested on a real
 Mac by this project's CI (it uses a stub): the installed `--version` line,
 loopback-only listening, `"state":"ready"` after a load, SIGTERM releasing the
 label in time, streamed Responses, a forced function call and the cancellation

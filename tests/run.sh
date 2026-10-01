@@ -2408,10 +2408,10 @@ else
     done
 
     # ── #1 D8: the multi-select picker (MP1-MP6) ──────────────────────────────
-    mkdir -p "$PK/mlxbin" "$PK/mlx927" "$PK/mp6bin"
+    mkdir -p "$PK/mlxbin" "$PK/mlxold" "$PK/mp6bin"
     cp "$ROOT/tests/stubs/fake-mlx-serve.sh" "$PK/mlxbin/mlx-serve"; chmod +x "$PK/mlxbin/mlx-serve"
-    printf '#!/bin/sh\nMSS_STUB_MLX_VERSION=26.9.7 exec "%s" "$@"\n' "$ROOT/tests/stubs/fake-mlx-serve.sh" > "$PK/mlx927/mlx-serve"
-    chmod +x "$PK/mlx927/mlx-serve"
+    printf '#!/bin/sh\nMSS_STUB_MLX_VERSION=26.9.6 exec "%s" "$@"\n' "$ROOT/tests/stubs/fake-mlx-serve.sh" > "$PK/mlxold/mlx-serve"
+    chmod +x "$PK/mlxold/mlx-serve"
     MLXD="$TMP/fix/mlx/model"
     MLX_DIR_Q="(config.json and *.safetensors): ${T}$MLXD"
 
@@ -2481,11 +2481,11 @@ PICK
     check "MP4 the menu was asked three times" 3 "$(tr_of mp4 | grep -c 'Choose \[1\]: ')"
 
     # MP5: another mlx-serve version on PATH: named, then the path is asked.
-    DRIVE_PATH="$PK/mlx927" drive mp5 "Choose [1]: ${T}4" "mlx-serve 26.9.6 binary path: ${T}$PK/mlxbin/mlx-serve" "$MLX_DIR_Q" \
+    DRIVE_PATH="$PK/mlxold" drive mp5 "Choose [1]: ${T}4" "mlx-serve 26.10.1 binary path: ${T}$PK/mlxbin/mlx-serve" "$MLX_DIR_Q" \
         "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" "$DA_ENTER" "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/mp5.env"
     check "MP5 a mismatched mlx-serve, then a good path, completes" 0 $?
-    _mm=$(tr_of mp5 | grep -n 'mlx-serve 26.9.7 is installed; this release supports 26.9.6 only' | head -n 1 | cut -d: -f1)
-    _mq=$(tr_of mp5 | grep -n 'mlx-serve 26.9.6 binary path: ' | head -n 1 | cut -d: -f1)
+    _mm=$(tr_of mp5 | grep -n 'mlx-serve 26.9.6 is installed; this release supports 26.10.1 only' | head -n 1 | cut -d: -f1)
+    _mq=$(tr_of mp5 | grep -n 'mlx-serve 26.10.1 binary path: ' | head -n 1 | cut -d: -f1)
     [ -n "$_mm" ] && [ -n "$_mq" ] && [ "$_mm" -lt "$_mq" ] && ok "MP5 the mismatch is named before the path question" \
         || fail "MP5 order: mismatch line ${_mm:-none}, path question ${_mq:-none}"
     check "MP5 saved the good binary" "$PK/mlxbin/mlx-serve" "$(saved mp5.env MLX_BIN)"
@@ -2652,7 +2652,19 @@ ma8() { # ma8 <name> <expected text> <env...>
 }
 ma8 missing-bin "MLX_BIN is required" MLX_BIN=
 ma8 not-executable "MLX_BIN: not executable" MLX_BIN="$T1/mlx-noexec"
-ma8 version "MLX_BIN: mlx-serve 26.9.7 is installed; this release supports 26.9.6 only" MSS_STUB_MLX_VERSION=26.9.7
+ma8 version "MLX_BIN: mlx-serve 26.9.6 is installed; this release supports 26.10.1 only" MSS_STUB_MLX_VERSION=26.9.6
+# The first line must match exactly: a longer version sharing the prefix is refused.
+ma8 version-prefix "MLX_BIN: mlx-serve 26.10.10 is installed; this release supports 26.10.1 only" MSS_STUB_MLX_VERSION=26.10.10
+# The real report is several lines (mlx, mlx-c, ggml, ...); only the first is compared.
+OUT=$("$TMP/fix/mlx/mlx-serve" --version); RC=$?
+check "MA8 the pinned multi-line report passes the probe" "0 7 0" \
+    "$RC $(printf '%s\n' "$OUT" | wc -l | tr -d ' ') $(mss_mlx_version_ok "$TMP/fix/mlx/mlx-serve" "" MLX_BIN >/dev/null 2>&1; echo $?)"
+# Every user-facing file names the pinned version, and none an older one.
+_vd=""; for f in README.md CHANGELOG.md docs/backends.md config/backends.env.example; do
+    grep -q "mlx-serve\` $MSS_MLX_SERVE_VERSION\|MLX-Serve $MSS_MLX_SERVE_VERSION\|mlx-serve $MSS_MLX_SERVE_VERSION" "$ROOT/$f" || _vd="$_vd $f(no pin)"
+    grep -q '26\.9\.[0-9]' "$ROOT/$f" && _vd="$_vd $f(old version)"
+done
+check "MA8 the docs name mlx-serve $MSS_MLX_SERVE_VERSION only" "" "$_vd"
 ma8 non-zero "MLX_BIN: $PTMP/fix/mlx/mlx-serve --version exited 3" MSS_STUB_MLX_RC=3
 # The hung probe: the whole refusal, and the probe alone, end within 11 s
 # (milliseconds, so a second boundary cannot hide an overrun).
@@ -2949,8 +2961,8 @@ mss_mlx_manifest "$TMP/fix/mlx/model" > "$T1/ma18/mlx.model.verified"
 OUT=$(MSS_CONF="$T1/ma18.conf" MSS_STAMP_DIR="$T1/ma18" sh "$ROOT/libexec/mlx-start.sh" 2>&1); RC=$?
 check "MA18 a changed manifest" "78 REFUSE: model changed since verification (manifest differs)" "$RC $OUT"
 rm -f "$TMP/fix/mlx/model/added.safetensors"
-OUT=$(MSS_CONF="$T1/ma18.conf" MSS_STAMP_DIR="$T1/ma18" MSS_STUB_MLX_VERSION=26.9.7 sh "$ROOT/libexec/mlx-start.sh" 2>&1); RC=$?
-check "MA18 a version mismatch" "78 REFUSE: MLX_BIN: mlx-serve 26.9.7 is installed; this release supports 26.9.6 only" "$RC $OUT"
+OUT=$(MSS_CONF="$T1/ma18.conf" MSS_STAMP_DIR="$T1/ma18" MSS_STUB_MLX_VERSION=26.9.6 sh "$ROOT/libexec/mlx-start.sh" 2>&1); RC=$?
+check "MA18 a version mismatch" "78 REFUSE: MLX_BIN: mlx-serve 26.9.6 is installed; this release supports 26.10.1 only" "$RC $OUT"
 
 # MA19: a standby GGUF with a stale stamp is not hashed beside a model server.
 cp /bin/sleep "$T1/llama-server"
