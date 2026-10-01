@@ -4195,7 +4195,8 @@ sudo sh "$ROOT/tests/stubs/hold-lock.sh" --mut 'touch /tmp/mss-late' >"$MBD/mb28
 _i=0; while ! grep -q '^held' "$MBD/mb28.hold" 2>/dev/null && [ "$_i" -lt 50 ]; do sleep 0.1; _i=$((_i + 1)); done
 H28=$(sed -n 's/^held \([0-9]*\) .*/\1/p' "$MBD/mb28.hold"); SA=$(sed -n 's/^held [0-9]* [0-9]* \([0-9a-f]*\)$/\1/p' "$MBD/mb28.hold")
 sleep 1
-R28=$(pgrep -P "$H28" perl | head -n 1)
+K28=$(sed -n 's/^held [0-9]* \([0-9]*\) .*/\1/p' "$MBD/mb28.hold")
+R28=$(pgrep -P "$H28" perl | grep -vx "$K28" | head -n 1)
 [ -n "$R28" ] && ok "MB28 the runner is blocked before LOCK_SH" || fail "MB28 no blocked runner"
 sudo kill -STOP "$R28"; sudo kill -9 "$H28"; sleep 2
 grep -q "^session=$SA " /var/run/com.mac-studio-server.lock.owner && ok "MB28 keeper A holds on while the blocker holds LOCK_EX" \
