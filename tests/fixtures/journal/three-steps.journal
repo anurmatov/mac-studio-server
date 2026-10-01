@@ -1,0 +1,4 @@
+mss-commit-v1 2026-01-01T00:00:00Z
+1 @DIR@/a @OLD@ @NEW@
+2 @DIR@/b @OLD@ @NEW@
+3 @DIR@/c absent @NEW@

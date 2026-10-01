@@ -68,7 +68,7 @@ esac
     || mss_die "MSS_TEST_SYSROOT is for tests/run.sh only and is refused as root"
 
 # ── inputs (env) ───────────────────────────────────────────────────────────────
-MSS_BACKENDS=${MSS_BACKENDS:-ollama}
+MSS_BACKENDS=${MSS_BACKENDS-ollama}
 MSS_ACTIVE_BACKEND=${MSS_ACTIVE_BACKEND:-}
 # Under a direct `sudo`, id -un is root; the invoking user is the default.
 MSS_SERVICE_USER=${OLLAMA_USER:-${SUDO_USER:-$(id -un)}}

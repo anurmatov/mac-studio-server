@@ -21,7 +21,10 @@ check() { # check <desc> <expected> <actual>
     if [ "$2" = "$3" ]; then ok "$1"; else fail "$1 (expected '$2' got '$3')"; fi
 }
 check_fail() { # check_fail <desc> <cmd...>
-    if "$@" >/dev/null 2>&1; then fail "$1 (command unexpectedly succeeded)"; else ok "$1"; fi
+    # The description is not part of the command: before #1 it was run as the
+    # command, so every row passed whatever the command did.
+    _cf_desc=$1; shift
+    if "$@" >/dev/null 2>&1; then fail "$_cf_desc (command unexpectedly succeeded)"; else ok "$_cf_desc"; fi
 }
 
 . "$ROOT/scripts/lib/mss-common.sh"
@@ -208,13 +211,34 @@ check_fail "relative path rejected" mss_validate_path_chars P 'path/to/model.ggu
 check_fail "uint with newline rejected" mss_validate_uint N "$(printf '4096\nDS4_ARGS=--trace x')" 1
 check_fail "uint non-numeric rejected" mss_validate_uint N abc 1
 
-echo "== phase A: selections =="
-for good in ollama llamacpp ds4 'ollama,llamacpp' 'ollama,ds4'; do
-    if mss_validate_selection "$good"; then ok "selection '$good'"; else fail "selection '$good'"; fi
+echo "== phase A: selections (#1 MA1, MA2, MA3) =="
+for good in ollama llamacpp ds4 'ollama,llamacpp' 'ollama,ds4' mlx 'ollama,mlx' 'ds4,mlx' 'llamacpp,ds4' \
+    'mlx,ollama,llamacpp,ds4'; do
+    if mss_validate_selection "$good"; then ok "MA1 selection '$good'"; else fail "MA1 selection '$good'"; fi
 done
-for bad in '' 'foo' 'llamacpp,ds4' 'ollama,llamacpp,ds4' 'ollama,ollama' 'llamacpp,llamacpp' ','; do
-    check_fail "selection rejected: '$bad'" mss_validate_selection "$bad"
+for case in "|is empty" "ollama,,mlx|empty element in 'ollama,,mlx'" "mlx,mlx|duplicate 'mlx'" "foo|unknown backend 'foo'" \
+    "MLX|unknown backend 'MLX'" "ollama,ollama|duplicate 'ollama'" ",|empty element" "mlx,|empty element"; do
+    _sel=${case%%|*}; _want=${case#*|}
+    OUT=$(mss_validate_selection "$_sel" 2>&1) && fail "MA2 selection '$_sel' accepted" \
+        || { printf '%s' "$OUT" | grep -qF "$_want" && ok "MA2 '$_sel' refused naming it" || fail "MA2 '$_sel': $OUT"; }
 done
+# MA3: every D2 cell. Prints the resolved backend, or "refused".
+ab() { mss_active_backend "$1" "$2" 2>/dev/null || echo refused; }
+check "MA3 no optional, unset" none "$(ab ollama '')"
+check "MA3 no optional, none" none "$(ab ollama none)"
+check "MA3 no optional, ds4 is refused" refused "$(ab ollama ds4)"
+check "MA3 one optional, unset is that backend (1.6.0)" ds4 "$(ab ollama,ds4 '')"
+check "MA3 one optional, itself" ds4 "$(ab ollama,ds4 ds4)"
+check "MA3 one optional, none" none "$(ab ollama,ds4 none)"
+check "MA3 one optional, a name that is not selected" refused "$(ab ollama,ds4 mlx)"
+check "MA3 two optional, mlx" mlx "$(ab ds4,mlx mlx)"
+check "MA3 two optional, none" none "$(ab ds4,mlx none)"
+check "MA3 two optional, a name that is not selected" refused "$(ab ds4,mlx llamacpp)"
+check "MA3 ollama is never the active backend" refused "$(ab ollama,ds4 ollama)"
+check "MA3 two optional and unset names the choices" \
+    "ERROR: MSS_ACTIVE_BACKEND is required when 2 or more optional backends are selected (one of: ds4 mlx none)" \
+    "$(mss_active_backend ollama,ds4,mlx '' 2>&1)"
+check "MA3 three optional, unset is refused" refused "$(ab llamacpp,ds4,mlx '')"
 
 echo "== phase A: waiting for launchd to release a label (#18) =="
 mkdir -p "$TMP/lc-twice" "$TMP/lc-always"
@@ -238,10 +262,11 @@ printf '%s' "$OUT" | grep -q 'did not stop within 1s' && ok "mss_launchd_wait_go
     || fail "mss_launchd_wait_gone timeout output: $OUT"
 BOOTS=$(cd "$ROOT" && grep -rl 'launchctl bootstrap' scripts libexec bootstrap.sh | sort | tr '\n' ' ' | sed 's/ $//')
 # #27 adds mss-host.sh: the GPU and Colima boot jobs converge through the same
-# bootstrap/wait/enable sequence as the backend jobs.
-check "launchctl bootstrap appears only in install-backends.sh, mss-enable.sh and mss-host.sh" \
-    "libexec/mss-enable.sh scripts/install-backends.sh scripts/lib/mss-host.sh" "$BOOTS"
-for f in libexec/mss-enable.sh scripts/install-backends.sh scripts/lib/mss-host.sh; do
+# bootstrap/wait/enable sequence as the backend jobs. #1 adds mss-lifecycle.sh
+# (backend.sh start), which refuses a label launchd still holds.
+check "launchctl bootstrap appears only in install-backends.sh, mss-enable.sh, mss-lifecycle.sh and mss-host.sh" \
+    "libexec/mss-enable.sh libexec/mss-lifecycle.sh scripts/install-backends.sh scripts/lib/mss-host.sh" "$BOOTS"
+for f in libexec/mss-enable.sh libexec/mss-lifecycle.sh scripts/install-backends.sh scripts/lib/mss-host.sh; do
     grep -q 'mss_launchd_wait_gone "' "$ROOT/$f" && ok "$f calls mss_launchd_wait_gone" || fail "$f never calls mss_launchd_wait_gone"
 done
 
@@ -453,10 +478,16 @@ render() { # render <backends> <dir> [extra env...]
         DS4_BIN="$TMP/fix/ds4/ds4-server" \
         DS4_MODEL="$TMP/fix/ds4/model.gguf" \
         DS4_MODEL_SHA256="$(cat "$TMP/fix/ds4/model.sha")" \
+        MLX_BIN="$TMP/fix/mlx/mlx-serve" MLX_MODEL_DIR="$TMP/fix/mlx/model" \
         "$@" sh "$ROOT/scripts/install-backends.sh" --render-only "$_dir"
 }
 make_fixture llamacpp "$TMP/fix/llamacpp"
 make_fixture ds4 "$TMP/fix/ds4"
+# mlx (#1): the stub server and a native MLX checkpoint directory.
+mkdir -p "$TMP/fix/mlx/model"
+cp "$ROOT/tests/stubs/fake-mlx-serve.sh" "$TMP/fix/mlx/mlx-serve"; chmod +x "$TMP/fix/mlx/mlx-serve"
+printf '{"model_type":"stub"}\n' > "$TMP/fix/mlx/model/config.json"
+printf 'stub-weights' > "$TMP/fix/mlx/model/model.safetensors"
 
 for sel in ollama llamacpp ds4 'ollama,llamacpp' 'ollama,ds4'; do
     d="$TMP/render-$(echo "$sel" | tr , -)"
@@ -773,7 +804,7 @@ TUSER=$(id -un); [ "$TUSER" != root ] || TUSER=nobody
 OUT=$(env MSS_BACKENDS=ds4 OLLAMA_USER="$TUSER" MSS_REPLACE_BACKEND=llamacpp DS4_BIN="$TMP/fix/ds4/ds4-server" \
     DS4_MODEL="$TMP/fix/ds4/model.gguf" DS4_MODEL_SHA256="$(cat "$TMP/fix/ds4/model.sha")" DS4_PORT=18999 \
     sh "$ROOT/scripts/install-backends.sh" --check-only 2>&1) && fail "A15 accepted a replace of a backend that is not installed" \
-    || { printf '%s' "$OUT" | grep -q 'is not the installed optional backend' && ok "A15 refuses a replace of a backend that is not installed" || fail "A15: $OUT"; }
+    || { printf '%s' "$OUT" | grep -q 'is not an installed optional backend' && ok "A15 refuses a replace of a backend that is not installed" || fail "A15: $OUT"; }
 
 echo "== phase A: 1.5.0 pure functions and static checks (#15) =="
 . "$ROOT/scripts/lib/mss-acquire.sh"
@@ -1824,7 +1855,7 @@ grep -q 'Loading Ollama service' "$TMP/h27r/e8.log" && fail "E8 the Ollama steps
     || ok "E8 the Docker install runs before the Ollama steps"
 _d7() { grep -nF -- "$1" "$ROOT/scripts/install.sh" | head -n 1 | cut -d: -f1; }
 D7ORDER="$(_d7 'if [ "$MSS_FLAG" = --configure-only ]; then') $(_d7 'mss_apply_step mss_docker_install_apply') \
-$(_d7 'uninstall.sh" --backend "$MSS_SWITCH_FROM"') $(_d7 'launchctl load -w') $(_d7 'mss_apply_step mss_gpu_apply') \
+$(_d7 'uninstall.sh" --backend "$mss_sw"') $(_d7 'launchctl load -w') $(_d7 'mss_apply_step mss_gpu_apply') \
 $(_d7 'mss_apply_step mss_power_apply') $(_d7 'mss_apply_step mss_docker_autostart_apply') $(_d7 '    mss_check || exit 1')"
 check "E8 install.sh keeps the D7 order (steps 4, 6, 7, 8, 9, 10, 11, 12)" "sorted" \
     "$(printf '%s\n' $D7ORDER | awk 'NF { if (n++ && $1 <= p) bad = 1; p = $1 } END { print (n == 8 && !bad) ? "sorted" : "out of order: " n }')"
@@ -2109,14 +2140,14 @@ else
     check "3 bad menu answers exit 2 (A12)" 2 $?
     [ ! -e "$PK/menu3.env" ] && ok "3 bad menu answers write nothing (A12)" || fail "A12 menu wrote a file"
 
-    drive noallow "Choose [1]: ${T}5" "later [4]: ${T}3" "path or https URL: ${T}$DS4M" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" \
+    drive noallow "Choose [1]: ${T}3" "later [4]: ${T}3" "path or https URL: ${T}$DS4M" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" \
         "LAN access to ds4? [y/N]: ${T}y" "listen on [192.0.2.10]: ${T}@ENTER" \
         "(space-separated): ${T}@ENTER" "(space-separated): ${T}@ENTER" "(space-separated): ${T}@ENTER" -- \
         MSS_ENV_FILE="$PK/noallow.env" DS4_BIN="$DS4B"
     check "LAN ds4 with an empty allowlist cannot complete (A12)" 2 $?
     [ ! -e "$PK/noallow.env" ] && ok "LAN ds4 with an empty allowlist writes nothing" || fail "A12 allowlist wrote a file"
 
-    drive keyfile "Choose [1]: ${T}4" "later [1]: ${T}3" "path or https URL: ${T}$LLM" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" \
+    drive keyfile "Choose [1]: ${T}2" "later [1]: ${T}3" "path or https URL: ${T}$LLM" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" \
         "LAN access to llamacpp? [y/N]: ${T}y" "listen on [192.0.2.10]: ${T}@ENTER" \
         "use an allowlist instead): ${T}sk-test123" "use an allowlist instead): ${T}@ENTER" \
         "(space-separated): ${T}192.0.2.99" "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" "$DA_ENTER" \
@@ -2132,11 +2163,11 @@ else
     LEAK=$(grep -l 'sk-test123' "$PK"/*.env "$MSS_CONF" 2>/dev/null || true)
     [ -z "$LEAK" ] && ok "the rejected key is in no file (A12)" || fail "sk-test123 found in: $LEAK"
 
-    drive intr "Choose [1]: ${T}5" "later [4]: ${T}3" "path or https URL: ${T}@INTR" -- MSS_ENV_FILE="$PK/intr.env" DS4_BIN="$DS4B"
+    drive intr "Choose [1]: ${T}3" "later [4]: ${T}3" "path or https URL: ${T}@INTR" -- MSS_ENV_FILE="$PK/intr.env" DS4_BIN="$DS4B"
     check "Ctrl-C at the model prompt exits 130 (A13)" 130 $?
     [ ! -e "$PK/intr.env" ] && ok "Ctrl-C writes nothing (A13)" || fail "A13 wrote a file"
 
-    drive envdef "Choose [5]: ${T}@ENTER" "later [4]: ${T}3" "path or https URL: ${T}$DS4M" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" \
+    drive envdef "Choose [3]: ${T}@ENTER" "later [4]: ${T}3" "path or https URL: ${T}$DS4M" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" \
         "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" "$DA_ENTER" \
         "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/envdef.env" MSS_BACKENDS=ds4 DS4_PORT=8001 DS4_BIN="$DS4B"
     check "--configure-only with MSS_BACKENDS set shows the menu with env defaults (A3b)" 0 $?
@@ -2146,7 +2177,7 @@ else
     grep -q "^DS4_MODEL_SHA256=$DS4S\$" "$PK/envdef.env" && ok "A3b saved the computed sha256" || fail "A3b sha"
     grep -q 'Port' "$PK/envdef.transcript" && fail "the port was asked (I6)" || ok "no port prompt (I6)"
 
-    drive saved "Choose [5]: ${T}@ENTER" "(.gguf) path [$DS4M]: ${T}@ENTER" \
+    drive saved "Choose [3]: ${T}@ENTER" "(.gguf) path [$DS4M]: ${T}@ENTER" \
         "c computes it now) [$DS4S]: ${T}@ENTER" "LAN access to ds4? [y/N]: ${T}@ENTER" \
         "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" "$DA_ENTER" "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/envdef.env"
     check "--configure-only reuses every saved answer as its default" 0 $?
@@ -2155,7 +2186,7 @@ else
 
     # F5: a llama-server found on PATH and the default port: neither is asked.
     mkdir -p "$TMP/found"; cp "$ROOT/tests/stubs/fake-server.sh" "$TMP/found/llama-server"; chmod +x "$TMP/found/llama-server"
-    DRIVE_PATH="$TMP/found" drive found "Choose [1]: ${T}4" "later [1]: ${T}4" "LAN access to llamacpp? [y/N]: ${T}@ENTER" \
+    DRIVE_PATH="$TMP/found" drive found "Choose [1]: ${T}2" "later [1]: ${T}4" "LAN access to llamacpp? [y/N]: ${T}@ENTER" \
         "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" "$DA_ENTER" "Save? [Y/n]: ${T}@ENTER" -- \
         MSS_ENV_FILE="$PK/found.env"
     check "F5 found llama-server, later" 0 $?
@@ -2166,7 +2197,7 @@ else
     grep -q '^MSS_TUNE_MACOS=no$' "$PK/found.env" && ok "I2 is asked without Ollama too and saved as no (A1)" || fail "I2 without Ollama"
 
     # M4: ds4 with nothing found: the build offer (declined), the manual command, then the menu.
-    drive ds4menu "Choose [1]: ${T}5" "in ~/ds4? [y/N]: ${T}@ENTER" "binary path: ${T}$DS4B" "later [4]: ${T}@ENTER" \
+    drive ds4menu "Choose [1]: ${T}3" "in ~/ds4? [y/N]: ${T}@ENTER" "binary path: ${T}$DS4B" "later [4]: ${T}@ENTER" \
         "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" "$DA_ENTER" \
         "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/ds4menu.env" HOME="$PK/home"
     check "M4 ds4 with the build declined and a model later" 0 $?
@@ -2272,7 +2303,7 @@ else
     # DS4-only after an Ollama configuration whose binary was then removed: the
     # save drops OLLAMA_BIN, and the run's own validation passes.
     envfile a8ds4.env "MSS_BACKENDS=ollama\nOLLAMA_BIN=$PK/gone/ollama\n"
-    drive a8ds4 "Choose [1]: ${T}5" "later [4]: ${T}3" "path or https URL: ${T}$DS4M" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" \
+    drive a8ds4 "Choose [1]: ${T}3" "later [4]: ${T}3" "path or https URL: ${T}$DS4M" "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" \
         "LAN access to ds4? [y/N]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" "$DA_ENTER" \
         "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/a8ds4.env" DS4_BIN="$DS4B"
     check "DS4-only after Ollama, with the Ollama binary gone, completes" 0 $?
@@ -2387,11 +2418,499 @@ else
         || fail "picker binaries outside the test directory: ${BADBIN:-no *_BIN line saved}"
 fi
 
+echo "== phase A: #1 MLX-Serve, multi-select and the lifecycle lock =="
+T1=$TMP/i1; mkdir -p "$T1"
+TUSER=$(id -un); [ "$TUSER" != root ] || TUSER=nobody
+# empty_dir <dir>: absent or empty (a refusal wrote nothing).
+empty_dir() { [ ! -e "$1" ] || [ -z "$(ls -A "$1" 2>/dev/null)" ]; }
+# r1 <name> <selection> [env...]: a render into $T1/<name>, output in $T1/<name>.out.
+r1() { _rn=$1; _rs=$2; shift 2; render "$_rs" "$T1/$_rn" "$@" >"$T1/$_rn.out" 2>&1; }
+
+# MA4: port clashes refuse before anything is written.
+r1 ma4a ds4,mlx MSS_ACTIVE_BACKEND=ds4 MLX_PORT=8000; RC=$?
+check "MA4 ds4 = mlx port exits 1" 1 "$RC"
+grep -q 'port collision: DS4_PORT and MLX_PORT are both 8000' "$T1/ma4a.out" && ok "MA4 names both ports" || fail "MA4a: $(cat "$T1/ma4a.out")"
+empty_dir "$T1/ma4a" && ok "MA4 ds4 = mlx wrote nothing" || fail "MA4a wrote $(ls "$T1/ma4a")"
+r1 ma4b ollama,mlx MLX_PORT=11434; RC=$?
+check "MA4 mlx = 11434 with Ollama exits 1" 1 "$RC"
+grep -q "MLX_PORT equals Ollama's 11434" "$T1/ma4b.out" && empty_dir "$T1/ma4b" && ok "MA4 names Ollama's port, nothing written" \
+    || fail "MA4b: $(cat "$T1/ma4b.out")"
+r1 ma4c llamacpp,ds4 MSS_ACTIVE_BACKEND=ds4 LLAMACPP_PORT=8000; RC=$?
+check "MA4 llamacpp = ds4 port exits 1" 1 "$RC"
+grep -q 'port collision: LLAMACPP_PORT and DS4_PORT are both 8000' "$T1/ma4c.out" && empty_dir "$T1/ma4c" \
+    && ok "MA4 llamacpp = ds4 names both, nothing written" || fail "MA4c: $(cat "$T1/ma4c.out")"
+
+# MA5: mlx active. A 0-byte and an unreadable (mode 000) 1 KiB weight file:
+# the manifest lists both and nothing under the directory is read.
+M5=$T1/ma5-model; mkdir -p "$M5/sub"
+printf '{}\n' > "$M5/config.json"; : > "$M5/a.safetensors"
+head -c 1024 /dev/zero > "$M5/b.safetensors"; chmod 000 "$M5/b.safetensors"
+: > "$M5/sub/tokenizer.json"; : > "$M5/.hidden"
+cp "$AUDIT_LOG" "$AUDIT_LOG.ma5"
+if r1 ma5 mlx MLX_MODEL_DIR="$M5"; then
+    ok "MA5 render mlx active"
+    M5P=$(cd "$M5" && pwd -P)
+    grep -qx 'MSS_GUARD_BACKEND=mlx' "$T1/ma5/backends.conf" && grep -qx "MLX_MODEL_DIR=$M5P" "$T1/ma5/backends.conf" \
+        && grep -qx "MLX_BIN=$PTMP/fix/mlx/mlx-serve" "$T1/ma5/backends.conf" && grep -qx 'MLX_PORT=11234' "$T1/ma5/backends.conf" \
+        && ok "MA5 conf has the mlx keys and MSS_GUARD_BACKEND=mlx" || fail "MA5 conf: $(cat "$T1/ma5/backends.conf")"
+    grep -q -- '--ctx-size' "$T1/ma5/backends.conf" && fail "MA5 a ctx size without MLX_CTX" \
+        || { grep -qx 'MLX_CTX=' "$T1/ma5/backends.conf" && ok "MA5 no --ctx-size without MLX_CTX" || fail "MA5 MLX_CTX line"; }
+    cmp -s "$T1/ma5/com.mac-studio-server.mlx.plist" "$ROOT/tests/golden/com.mac-studio-server.mlx.plist" \
+        && ok "MA5 the mlx plist equals the golden file" || fail "MA5 plist: $(diff "$ROOT/tests/golden/com.mac-studio-server.mlx.plist" "$T1/ma5/com.mac-studio-server.mlx.plist")"
+    if command -v plutil >/dev/null 2>&1; then
+        plutil -lint "$T1/ma5/com.mac-studio-server.mlx.plist" >/dev/null 2>&1 && ok "MA5 plutil -lint" || fail "MA5 plutil -lint"
+    fi
+    check "MA5 manifest" "mlx-manifest-v1 $M5P
+a.safetensors 0 $(stat -f '%i %m' "$M5/a.safetensors")
+b.safetensors 1024 $(stat -f '%i %m' "$M5/b.safetensors")
+config.json 3 $(stat -f '%i %m' "$M5/config.json")
+sub/tokenizer.json 0 $(stat -f '%i %m' "$M5/sub/tokenizer.json")" "$(cat "$T1/ma5/mlx.model.verified")"
+    check "MA5 no pf rules" "" "$(grep -v '^#' "$T1/ma5/pf.conf")"
+    [ -e "$T1/ma5/mlx-start.sh" ] && ok "MA5 the render carries the mlx wrapper" || fail "MA5 no mlx-start.sh"
+    check "MA5 no file under the model directory was read" "" "$(diff "$AUDIT_LOG.ma5" "$AUDIT_LOG" | grep -F "$M5" || true)"
+else
+    fail "MA5 render mlx: $(cat "$T1/ma5.out")"
+fi
+chmod 600 "$M5/b.safetensors"
+
+# MA6: ds4 active with mlx on standby, then none active.
+if r1 ma6 ds4,mlx MSS_ACTIVE_BACKEND=ds4; then
+    check "MA6 top-level plists" "com.mac-studio-server.ds4.plist com.mac-studio-server.guard.plist" \
+        "$(cd "$T1/ma6" && ls ./*.plist | sed 's|^\./||' | tr '\n' ' ' | sed 's/ $//')"
+    check "MA6 standby plists" "com.mac-studio-server.mlx.plist" "$(ls "$T1/ma6/standby" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')"
+    cmp -s "$T1/ma6/standby/com.mac-studio-server.mlx.plist" "$ROOT/tests/golden/com.mac-studio-server.mlx.plist" \
+        && ok "MA6 a standby plist is byte-identical to its active form" || fail "MA6 standby plist bytes"
+else
+    fail "MA6 render ds4,mlx: $(cat "$T1/ma6.out")"
+fi
+if r1 ma6n ds4,mlx MSS_ACTIVE_BACKEND=none; then
+    check "MA6 none: no top-level backend or guard plist" "" "$(cd "$T1/ma6n" && ls ./*.plist 2>/dev/null)"
+    check "MA6 none: both on standby" "com.mac-studio-server.ds4.plist com.mac-studio-server.mlx.plist" \
+        "$(ls "$T1/ma6n/standby" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')"
+    grep -q '^MSS_GUARD_BACKEND=' "$T1/ma6n/backends.conf" && fail "MA6 none kept MSS_GUARD_BACKEND" || ok "MA6 none: no MSS_GUARD_BACKEND"
+else
+    fail "MA6 render none: $(cat "$T1/ma6n.out")"
+fi
+
+# MA7: v1.6.0 parity. Every 1.6.0-valid selection, deferred variants included,
+# renders byte-identically with MSS_ACTIVE_BACKEND unset.
+V16=b3baca0977093b6977fcb1994dadae1a6b0aac37
+if git -C "$ROOT" cat-file -e "$V16^{commit}" 2>/dev/null; then
+    mkdir -p "$TMP/v160"; git -C "$ROOT" archive "$V16" | tar -x -C "$TMP/v160"
+    for case in ollama llamacpp ds4 ollama,llamacpp ollama,ds4 llamacpp:defer ds4:defer ollama,llamacpp:defer ollama,ds4:defer; do
+        sel=${case%:*}; defer=""
+        [ "$case" = "$sel" ] || defer="MSS_DEFER_MODEL=yes LLAMACPP_MODEL= LLAMACPP_MODEL_SHA256= DS4_MODEL= DS4_MODEL_SHA256="
+        tag=$(echo "$case" | tr ,: --)
+        for tree in old new; do
+            if [ "$tree" = old ]; then src="$TMP/v160"; else src="$ROOT"; fi
+            d="$TMP/p16-$tree-$tag"
+            # shellcheck disable=SC2086  # $defer is a word list
+            env MSS_BACKENDS="$sel" OLLAMA_USER=testuser DS4_BATCHED_SESSIONS=1 \
+                LLAMACPP_BIN="$TMP/fix/llamacpp/llamacpp-server" LLAMACPP_MODEL="$TMP/fix/llamacpp/model.gguf" \
+                LLAMACPP_MODEL_SHA256="$(cat "$TMP/fix/llamacpp/model.sha")" \
+                DS4_BIN="$TMP/fix/ds4/ds4-server" DS4_MODEL="$TMP/fix/ds4/model.gguf" \
+                DS4_MODEL_SHA256="$(cat "$TMP/fix/ds4/model.sha")" $defer \
+                sh "$src/scripts/install-backends.sh" --render-only "$d" >/dev/null 2>&1
+            echo $? > "$d.rc"
+        done
+        check "MA7 '$case' exits 0 at v1.6.0 and at head" "0 0" "$(cat "$TMP/p16-old-$tag.rc") $(cat "$TMP/p16-new-$tag.rc")"
+        if diff -r -x '*.sh' "$TMP/p16-old-$tag" "$TMP/p16-new-$tag" >/dev/null 2>&1 \
+            && [ "$(cd "$TMP/p16-old-$tag" && ls -A)" = "$(cd "$TMP/p16-new-$tag" && ls -A)" ]; then
+            ok "MA7 '$case' renders byte-identically to v1.6.0"
+        else
+            fail "MA7 '$case' differs from v1.6.0: $(diff -r -x '*.sh' "$TMP/p16-old-$tag" "$TMP/p16-new-$tag" 2>&1 | head -5)"
+        fi
+    done
+else
+    fail "MA7 needs commit $V16 (fetch full history)"
+fi
+
+# MA8: every mlx refusal exits 1 naming the variable, and writes nothing.
+cp "$TMP/fix/mlx/mlx-serve" "$T1/mlx-noexec"; chmod 644 "$T1/mlx-noexec"
+mkdir -p "$T1/m8-nocfg" "$T1/m8-nost" "$T1/m8-gguf/sub" "$T1/m8 space"
+: > "$T1/m8-nocfg/x.safetensors"; : > "$T1/m8-nost/config.json"
+: > "$T1/m8-gguf/config.json"; : > "$T1/m8-gguf/x.safetensors"; : > "$T1/m8-gguf/sub/m.gguf"
+: > "$T1/m8 space/config.json"; : > "$T1/m8 space/x.safetensors"; : > "$T1/m8-file"
+ma8() { # ma8 <name> <expected text> <env...>
+    _mn=$1; _mt=$2; shift 2
+    r1 "ma8-$_mn" mlx "$@"; _mr=$?
+    if [ "$_mr" = 1 ] && grep -qF -- "$_mt" "$T1/ma8-$_mn.out" && empty_dir "$T1/ma8-$_mn"; then
+        ok "MA8 $_mn refused naming $(printf '%s' "$_mt" | cut -d: -f1)"
+    else
+        fail "MA8 $_mn (rc $_mr): $(cat "$T1/ma8-$_mn.out")"
+    fi
+}
+ma8 missing-bin "MLX_BIN is required" MLX_BIN=
+ma8 not-executable "MLX_BIN: not executable" MLX_BIN="$T1/mlx-noexec"
+ma8 version "MLX_BIN: mlx-serve 26.9.7 is installed; this release supports 26.9.6 only" MSS_STUB_MLX_VERSION=26.9.7
+ma8 non-zero "MLX_BIN: $PTMP/fix/mlx/mlx-serve --version exited 3" MSS_STUB_MLX_RC=3
+: > "$T1/hang"; T0=$(date +%s)
+ma8 hang "MLX_BIN: $PTMP/fix/mlx/mlx-serve --version timed out after 10s" MSS_STUB_MLX_HANG="$T1/hang"
+check "MA8 the hung probe is stopped within 11 s" yes "$([ $(( $(date +%s) - T0 )) -le 11 ] && echo yes || echo "no ($(( $(date +%s) - T0 ))s)")"
+rm -f "$T1/hang"
+ma8 missing-dir "MLX_MODEL_DIR: '$T1/nope' does not exist" MLX_MODEL_DIR="$T1/nope"
+ma8 a-file "MLX_MODEL_DIR: not a directory" MLX_MODEL_DIR="$T1/m8-file"
+ma8 no-config "MLX_MODEL_DIR: $PTMP/i1/m8-nocfg has no top-level config.json" MLX_MODEL_DIR="$T1/m8-nocfg"
+ma8 no-safetensors "MLX_MODEL_DIR: $PTMP/i1/m8-nost has no top-level *.safetensors file" MLX_MODEL_DIR="$T1/m8-nost"
+ma8 nested-gguf "MLX_MODEL_DIR: $PTMP/i1/m8-gguf contains a GGUF file" MLX_MODEL_DIR="$T1/m8-gguf"
+ma8 space "MLX_MODEL_DIR: '$PTMP/i1/m8 space' must be an absolute path without spaces" MLX_MODEL_DIR="$T1/m8 space"
+ma8 host "MLX_HOST: mlx is loopback-only in this release" MLX_HOST=0.0.0.0
+ma8 allow "MLX_ALLOW_FROM: mlx is loopback-only in this release" MLX_ALLOW_FROM=192.0.2.0/24
+ma8 key "MLX_API_KEY_FILE: mlx is loopback-only in this release" MLX_API_KEY_FILE=/tmp/k
+ma8 defer "MSS_DEFER_MODEL=yes is not supported for mlx" MSS_DEFER_MODEL=yes
+ma8 ctx0 "MLX_CTX: '0' is below 1" MLX_CTX=0
+ma8 ctxabc "MLX_CTX: 'abc' is not a non-negative integer" MLX_CTX=abc
+ma8 ctxbig "MLX_CTX: '1048577' is above 1048576" MLX_CTX=1048577
+
+# MA9: the D7 allowlist.
+check "MA9 the allowlist in canonical form" \
+    "--max-concurrent 4 --prefill-chunk 2048 --kv-quant 8 --prefix-cache-mem 512MB --prefix-cache-mem 2GB --timeout 600 --metrics --mtp --no-mtp --no-vision" \
+    "$(mss_validate_extra_args mlx '--max-concurrent=4 --prefill-chunk 2048 --kv-quant=8 --prefix-cache-mem 512MB --prefix-cache-mem=2GB --timeout 600 --metrics --mtp --no-mtp --no-vision' T)"
+check "MA9 edges" "--max-concurrent 1 --max-concurrent 16 --prefill-chunk 512 --prefill-chunk 65536 --kv-quant off --kv-quant 4" \
+    "$(mss_validate_extra_args mlx '--max-concurrent 1 --max-concurrent 16 --prefill-chunk 512 --prefill-chunk 65536 --kv-quant off --kv-quant 4' T)"
+for f in --host --port --model --model-dir --serve --ctx-size --max-resident-models --max-resident-mem --idle-evict-secs \
+    --skip-mem-preflight --os-reserve-gib --wired-margin-gib --lan-share --lan-name --lan-discover --api-key --api-key-env \
+    --api-key-strict --drafter --dspark --prefix-cache-disk --log-file --config-overrides --hf-overrides --engine --ssd-streaming; do
+    check_fail "MA9 rejects $f" mss_validate_extra_args mlx "$f" T
+    check_fail "MA9 rejects $f x" mss_validate_extra_args mlx "$f x" T
+    check_fail "MA9 rejects $f=x" mss_validate_extra_args mlx "$f=x" T
+done
+for bad in '--prefix-cache-mem 0' '--prefix-cache-mem off' '--prefix-cache-mem 1TB' '--max-concurrent 17' '--max-concurrent 0' \
+    '--kv-quant 2' '--prefill-chunk 511' '--timeout 1234567' '--metrics=1' '--mtp x'; do
+    check_fail "MA9 rejects '$bad'" mss_validate_extra_args mlx "$bad" T
+done
+
+# MA10: an installed backend left out of the selection is refused, except in
+# the switch check for exactly the installed names.
+printf 'MSS_BACKENDS=ollama,ds4\nMSS_GUARD_BACKEND=ds4\n' > "$T1/inst-ds4.conf"
+r1 ma10a ollama,mlx MSS_CONF="$T1/inst-ds4.conf"; RC=$?
+check "MA10 deselecting an installed ds4 exits 1" 1 "$RC"
+grep -q 'ERROR: ds4 is installed but not selected; keep it, or run sudo scripts/uninstall.sh --backend ds4 first (model files are kept)' \
+    "$T1/ma10a.out" && ok "MA10 names the uninstall command" || fail "MA10a: $(cat "$T1/ma10a.out")"
+ckone() { # ckone <log> <env...>: a non-root --check-only with the fixtures
+    _cl=$1; shift
+    env MSS_BACKENDS=ollama,mlx OLLAMA_USER="$TUSER" MLX_BIN="$TMP/fix/mlx/mlx-serve" MLX_MODEL_DIR="$TMP/fix/mlx/model" \
+        MLX_PORT=18234 DS4_BIN="$TMP/fix/ds4/ds4-server" DS4_MODEL="$TMP/fix/ds4/model.gguf" \
+        DS4_MODEL_SHA256="$(cat "$TMP/fix/ds4/model.sha")" DS4_PORT=18999 \
+        "$@" sh "$ROOT/scripts/install-backends.sh" --check-only >"$_cl" 2>&1
+}
+ckone "$T1/ma10b.out" MSS_CONF="$T1/inst-ds4.conf" MSS_REPLACE_BACKEND=ds4
+check "MA10 the switch check with MSS_REPLACE_BACKEND=ds4 passes" 0 $?
+ckone "$T1/ma10c.out" MSS_CONF="$T1/inst-ds4.conf" MSS_REPLACE_BACKEND=llamacpp
+check "MA10 MSS_REPLACE_BACKEND=llamacpp is refused" 1 $?
+grep -q "MSS_REPLACE_BACKEND: 'llamacpp' is not an installed optional backend (installed: ds4)" "$T1/ma10c.out" \
+    && ok "MA10 names the installed set" || fail "MA10c: $(cat "$T1/ma10c.out")"
+
+# MA11: a backend waiting for a model stays the only optional one.
+printf 'MSS_BACKENDS=ds4\nMSS_GUARD_BACKEND=ds4\nMSS_MODEL_STATE=waiting\n' > "$T1/waiting.conf"
+ckone "$T1/ma11.out" MSS_CONF="$T1/waiting.conf" MSS_BACKENDS=ds4,mlx MSS_ACTIVE_BACKEND=ds4
+check "MA11 adding mlx beside a waiting ds4 exits 1" 1 $?
+grep -q 'ds4 is installed and waiting for a model; add one with scripts/model.sh before adding mlx' "$T1/ma11.out" \
+    && ok "MA11 names the waiting backend" || fail "MA11: $(cat "$T1/ma11.out")"
+
+# MA12: plists edited outside the installer. The installed state lives under a
+# sysroot of its own; the check reads it in a non-root --check-only.
+S12=$T1/ma12; P12=$S12/Library/LaunchDaemons; mkdir -p "$P12" "$S12/usr/local/etc/mac-studio-server" "$S12/var/db/mac-studio-server"
+printf 'MSS_BACKENDS=ds4\nMSS_SERVICE_USER=testuser\nMSS_GUARD_BACKEND=ds4\nDS4_BIN=%s/fix/ds4/ds4-server\n' "$PTMP" \
+    > "$S12/usr/local/etc/mac-studio-server/backends.conf"
+DS4PL=$P12/com.mac-studio-server.ds4.plist
+ma12_reset() { sed -e 's|<OLLAMA_USER>|testuser|g' -e "s|<MSS_WORKDIR>|$PTMP/fix/ds4|g" "$ROOT/config/com.mac-studio-server.ds4.plist" > "$DS4PL"; }
+ma12() { # ma12 <name>: rc of the check against the sysroot
+    env MSS_TEST_SYSROOT="$S12" MSS_CONF="$S12/usr/local/etc/mac-studio-server/backends.conf" MSS_BACKENDS=ds4 \
+        OLLAMA_USER="$TUSER" DS4_BIN="$TMP/fix/ds4/ds4-server" DS4_MODEL="$TMP/fix/ds4/model.gguf" \
+        DS4_MODEL_SHA256="$(cat "$TMP/fix/ds4/model.sha")" DS4_PORT=18999 \
+        sh "$ROOT/scripts/install-backends.sh" --check-only >"$T1/ma12-$1.out" 2>&1
+}
+ma12_reset; ma12 render; check "MA12 a 1.6.0 ds4 render without a record is accepted" 0 $?
+for edit in 'username|s|<string>testuser</string>|<string>other</string>|' \
+    'argument|s|<string>/usr/local/libexec/mac-studio-server/ds4-start.sh</string>|&<string>--extra</string>|' \
+    'keepalive|/<key>KeepAlive<\/key>/{n;s|<true/>|<false/>|;}' \
+    'workdir|s|<string>'"$PTMP"'/fix/ds4</string>|<string>/tmp/elsewhere</string>|' \
+    'label|s|<string>com.mac-studio-server.ds4</string>|<string>com.example.ds4</string>|'; do
+    _en=${edit%%|*}; _es=${edit#*|}
+    ma12_reset; sed "$_es" "$DS4PL" > "$DS4PL.new" && mv "$DS4PL.new" "$DS4PL"
+    _before=$(mss_shasum256 "$DS4PL" | awk '{print $1}')
+    ma12 "$_en"; RC=$?
+    if [ "$RC" = 1 ] && grep -qF "ERROR: $DS4PL was changed outside this installer; copy it aside, remove it, then re-run" "$T1/ma12-$_en.out" \
+        && [ "$(mss_shasum256 "$DS4PL" | awk '{print $1}')" = "$_before" ]; then
+        ok "MA12 a changed $_en is refused naming the plist, which is untouched"
+    else
+        fail "MA12 $_en (rc $RC): $(cat "$T1/ma12-$_en.out")"
+    fi
+done
+ma12_reset
+printf '%s %s\n' "$(mss_shasum256 "$DS4PL" | awk '{print $1}')" "$DS4PL" > "$S12/var/db/mac-studio-server/plists.sha256"
+ma12 record; check "MA12 a plist matching its record is accepted" 0 $?
+printf ' ' >> "$DS4PL"; _before=$(mss_shasum256 "$DS4PL" | awk '{print $1}')
+ma12 onebyte; RC=$?
+[ "$RC" = 1 ] && grep -q 'was changed outside this installer' "$T1/ma12-onebyte.out" \
+    && [ "$(mss_shasum256 "$DS4PL" | awk '{print $1}')" = "$_before" ] \
+    && ok "MA12 a 1-byte edit against the record is refused, the file untouched" || fail "MA12 one byte (rc $RC): $(cat "$T1/ma12-onebyte.out")"
+
+# MA13: saved answers.
+cp "$ROOT/tests/fixtures/envfile/v160.env" "$T1/v160.env"; chmod 600 "$T1/v160.env"
+cp "$ROOT/tests/fixtures/envfile/multi.env" "$T1/multi.env"; chmod 600 "$T1/multi.env"
+envkeys() { sed -n 's/^\([A-Z][A-Z0-9_]*\)=.*/\1/p' "$1" | tr '\n' ' ' | sed 's/ $//'; }
+roundtrip() { # roundtrip <in> <out>: load into a clean environment, then save
+    env -i PATH="$PATH" HOME="$HOME" sh -c '. "$1/scripts/lib/mss-common.sh"; mss_envfile_load "$2" && mss_envfile_write "$3"' \
+        sh "$ROOT" "$1" "$2"
+}
+roundtrip "$T1/v160.env" "$T1/v160.out"
+check "MA13 a 1.6.0 file re-saves with no new line" "$(grep -v '^#' "$T1/v160.env")" "$(grep -v '^#' "$T1/v160.out")"
+roundtrip "$T1/multi.env" "$T1/multi.out"
+check "MA13 multi.env round-trips" "$(grep -v '^#' "$T1/multi.env")" "$(grep -v '^#' "$T1/multi.out")"
+printf 'MSS_BACKENDS=ollama,ds4\nMSS_ACTIVE_BACKEND=ds4\n' > "$T1/one.env"; chmod 600 "$T1/one.env"
+roundtrip "$T1/one.env" "$T1/one.out"
+check "MA13 one optional backend: MSS_ACTIVE_BACKEND is not saved" "MSS_BACKENDS" "$(envkeys "$T1/one.out")"
+printf 'MSS_BACKENDS=ollama,ds4\nMSS_ACTIVE_BACKEND=none\n' > "$T1/none.env"; chmod 600 "$T1/none.env"
+roundtrip "$T1/none.env" "$T1/none.out"
+check "MA13 one optional backend and none: saved" "MSS_BACKENDS MSS_ACTIVE_BACKEND" "$(envkeys "$T1/none.out")"
+
+# MA14: --evaluate on the mlx fixtures; the existing results stay as above.
+check "MA14 mlx-free" trip:free "$("$ROOT/libexec/mss-guard.sh" --evaluate "$ROOT/tests/fixtures/guard/mlx-free.jsonl")"
+check "MA14 mlx-swap" trip:swap "$("$ROOT/libexec/mss-guard.sh" --evaluate "$ROOT/tests/fixtures/guard/mlx-swap.jsonl")"
+check "MA14 mlx-none" none "$("$ROOT/libexec/mss-guard.sh" --evaluate "$ROOT/tests/fixtures/guard/mlx-none.jsonl")"
+
+# MA15: install.sh in the sandbox with ollama,mlx. The root passes are logged,
+# not run; Ollama reloads only when its plist changes.
+mkdir -p "$T1/ma15bin" "$T1/ma15base"; ln -sf "$ROOT/config" "$T1/ma15base/config"
+cat > "$T1/ma15bin/sudo" <<SHIM
+#!/bin/sh
+case \$1 in -v) exit 0 ;; -n) shift ;; esac
+case " \$* " in *install-backends.sh*) echo "\$*" >> '$T1/ma15.root'; exit 0 ;; esac
+exec "\$@"
+SHIM
+chmod +x "$T1/ma15bin/sudo"
+OPL="$TMP/h27r/sysroot/Library/LaunchDaemons/com.ollama.service.plist"
+ma15() { # ma15 <name>
+    : > "$T1/ma15.root"
+    install_case "$T1/ma15-$1.log" MSS_BACKENDS=ollama,mlx MSS_TUNE_MACOS=no OLLAMA_USER="$TUSER" \
+        OLLAMA_BIN="$TMP/nosudo/ollama" OLLAMA_BASE_DIR="$T1/ma15base" MSS_SUDO="$T1/ma15bin/sudo" \
+        MLX_BIN="$TMP/fix/mlx/mlx-serve" MLX_MODEL_DIR="$TMP/fix/mlx/model"
+}
+rm -f "${HSD_R:?}/"*.plist
+mss_render_ollama_plist "$ROOT/config/com.ollama.service.plist" "$TUSER" 0.0.0.0 "$TMP/nosudo/ollama" > "$OPL"
+: > "$HR_STATE/loaded-com.ollama.service"
+ma15 same
+check "MA15 (a) exits 0" "rc=0" "$(tail -n 1 "$T1/ma15-same.log")"
+grep -q 'Ollama service unchanged; not restarted' "$T1/ma15-same.log" && ok "MA15 (a) an unchanged, loaded Ollama is not restarted" \
+    || fail "MA15 (a): $(grep -i ollama "$T1/ma15-same.log" | tail -3)"
+grep -Eq 'launchctl (un)?load' "$HR_STATE/calls.log" && fail "MA15 (a) Ollama was reloaded" || ok "MA15 (a) no unload or load"
+check "MA15 (a) the check, then the install" "--check-only install" \
+    "$(awk '{ print ($NF == "--check-only") ? "--check-only" : "install" }' "$T1/ma15.root" | tr '\n' ' ' | sed 's/ $//')"
+mss_render_ollama_plist "$ROOT/config/com.ollama.service.plist" "$TUSER" 127.0.0.1 "$TMP/nosudo/ollama" > "$OPL"
+ma15 changed
+check "MA15 (b) exits 0" "rc=0" "$(tail -n 1 "$T1/ma15-changed.log")"
+grep -q 'launchctl unload' "$HR_STATE/calls.log" && grep -q 'launchctl load -w' "$HR_STATE/calls.log" \
+    && ok "MA15 (b) a changed plist reloads Ollama as in 1.6.0" || fail "MA15 (b): $(cat "$HR_STATE/calls.log")"
+check "MA15 (b) the check, then the install" "--check-only install" \
+    "$(awk '{ print ($NF == "--check-only") ? "--check-only" : "install" }' "$T1/ma15.root" | tr '\n' ' ' | sed 's/ $//')"
+rm -f "${HSD_R:?}/"*.plist "$HR_STATE/loaded-com.ollama.service"
+
+# MA16: which backend model.sh targets. A sudo that refuses its one password
+# prompt stops model.sh right after it saved the model, so nothing installs.
+if command -v expect >/dev/null 2>&1; then
+    mkdir -p "$T1/ma16bin"; printf '#!/bin/sh\nexit 1\n' > "$T1/ma16bin/sudo"; chmod +x "$T1/ma16bin/sudo"
+    cp "$ROOT/tests/stubs/stat-bsd" "$T1/ma16bin/stat"; chmod +x "$T1/ma16bin/stat"
+    ma16() { # ma16 <name> <selection> [model.sh args...]: rc
+        _m6=$1; _ms=$2; shift 2
+        printf 'MSS_BACKENDS=%s\nDS4_BIN=%s\nLLAMACPP_BIN=%s\nMLX_BIN=%s\n' "$_ms" "$TMP/fix/ds4/ds4-server" \
+            "$TMP/fix/llamacpp/llamacpp-server" "$TMP/fix/mlx/mlx-serve" > "$T1/ma16-$_m6.env"
+        chmod 600 "$T1/ma16-$_m6.env"
+        env PATH="$T1/ma16bin:$PATH" MSS_ENV_FILE="$T1/ma16-$_m6.env" MSS_TEST_SYSROOT="$TMP/sysroot" \
+            expect "$ROOT/tests/expect/drive.exp" /dev/null "$T1/ma16-$_m6.transcript" /bin/bash "$ROOT/scripts/model.sh" \
+            "$@" --path "$TMP/fix/ds4/model.gguf" --sha256 "$(cat "$TMP/fix/ds4/model.sha")" >/dev/null 2>&1
+        echo "rc=$?"
+    }
+    check "MA16 mlx only refuses" "rc=1" "$(ma16 mlx mlx)"
+    grep -q 'model.sh: mlx models are directories; set MLX_MODEL_DIR with scripts/install.sh --configure' "$T1/ma16-mlx.transcript" \
+        && ok "MA16 mlx only names MLX_MODEL_DIR" || fail "MA16 mlx: $(tr -d '\r' < "$T1/ma16-mlx.transcript")"
+    ma16 ds4mlx ds4,mlx >/dev/null
+    grep -q "^DS4_MODEL=$TMP/fix/ds4/model.gguf\$" "$T1/ma16-ds4mlx.env" && ok "MA16 ds4,mlx targets ds4" \
+        || fail "MA16 ds4,mlx: $(cat "$T1/ma16-ds4mlx.env")"
+    check "MA16 llamacpp,ds4 without --backend refuses" "rc=1" "$(ma16 both llamacpp,ds4)"
+    grep -q 'choose one with --backend llamacpp or --backend ds4' "$T1/ma16-both.transcript" && ! grep -q '_MODEL=' "$T1/ma16-both.env" \
+        && ok "MA16 names --backend and saves nothing" || fail "MA16 both: $(tr -d '\r' < "$T1/ma16-both.transcript")"
+    ma16 both2 llamacpp,ds4 --backend ds4 >/dev/null
+    grep -q "^DS4_MODEL=$TMP/fix/ds4/model.gguf\$" "$T1/ma16-both2.env" && ! grep -q '^LLAMACPP_MODEL=' "$T1/ma16-both2.env" \
+        && ok "MA16 --backend ds4 targets ds4" || fail "MA16 --backend ds4: $(cat "$T1/ma16-both2.env")"
+fi
+
+# MA17: only the active backend's wrapper starts. The binary would leave a mark.
+printf '#!/bin/sh\n: > "%s/ran"\n' "$T1" > "$T1/marker-bin"; chmod +x "$T1/marker-bin"
+for w in ds4 llamacpp mlx; do
+    for other in ds4 none; do
+        [ "$w" != "$other" ] || other=llamacpp
+        { [ "$other" = none ] || echo "MSS_GUARD_BACKEND=$other"
+          echo "DS4_BIN=$T1/marker-bin"; echo "DS4_MODEL=$T1/m"; echo "LLAMACPP_BIN=$T1/marker-bin"; echo "LLAMACPP_MODEL=$T1/m"
+          echo "MLX_BIN=$T1/marker-bin"; echo "MLX_MODEL_DIR=$TMP/fix/mlx/model"; echo "MLX_PORT=18234"; } > "$T1/ma17.conf"
+        rm -f "$T1/ran"
+        OUT=$(MSS_CONF="$T1/ma17.conf" MSS_STAMP_DIR="$T1" sh "$ROOT/libexec/$w-start.sh" 2>&1); RC=$?
+        check "MA17 $w-start.sh with $other active" "78 REFUSE: $w is not the active backend (active: $other) no-exec" \
+            "$RC $OUT $([ -e "$T1/ran" ] && echo exec || echo no-exec)"
+    done
+done
+
+# MA18: the mlx wrapper refuses a changed manifest and another version.
+mkdir -p "$T1/ma18"
+printf 'MSS_GUARD_BACKEND=mlx\nMLX_BIN=%s\nMLX_MODEL_DIR=%s\nMLX_PORT=18234\n' "$TMP/fix/mlx/mlx-serve" "$TMP/fix/mlx/model" > "$T1/ma18.conf"
+mss_mlx_manifest "$TMP/fix/mlx/model" > "$T1/ma18/mlx.model.verified"
+: > "$TMP/fix/mlx/model/added.safetensors"
+OUT=$(MSS_CONF="$T1/ma18.conf" MSS_STAMP_DIR="$T1/ma18" sh "$ROOT/libexec/mlx-start.sh" 2>&1); RC=$?
+check "MA18 a changed manifest" "78 REFUSE: model changed since verification (manifest differs)" "$RC $OUT"
+rm -f "$TMP/fix/mlx/model/added.safetensors"
+OUT=$(MSS_CONF="$T1/ma18.conf" MSS_STAMP_DIR="$T1/ma18" MSS_STUB_MLX_VERSION=26.9.7 sh "$ROOT/libexec/mlx-start.sh" 2>&1); RC=$?
+check "MA18 a version mismatch" "78 REFUSE: MLX_BIN: mlx-serve 26.9.7 is installed; this release supports 26.9.6 only" "$RC $OUT"
+
+# MA19: a standby GGUF with a stale stamp is not hashed beside a model server.
+cp /bin/sleep "$T1/llama-server"
+"$T1/llama-server" 60 & SLEEPER=$!
+sleep 0.5
+cp "$AUDIT_LOG" "$AUDIT_LOG.ma19"
+ckone "$T1/ma19.out" MSS_BACKENDS=ds4,mlx MSS_ACTIVE_BACKEND=mlx
+check "MA19 a stale standby stamp beside llama-server exits 1" 1 $?
+grep -q 'ERROR: ds4 model needs a full read; stop the running server (scripts/backend.sh stop llama-server) or stamp offline (R1b)' \
+    "$T1/ma19.out" && ok "MA19 names the server and R1b" || fail "MA19: $(cat "$T1/ma19.out")"
+grep -q '^hashing' "$T1/ma19.out" && fail "MA19 printed a hashing line" || ok "MA19 no hashing line"
+check "MA19 nothing was read" "" "$(diff "$AUDIT_LOG.ma19" "$AUDIT_LOG" | grep -F 'fix/ds4/model.gguf' || true)"
+kill "$SLEEPER" 2>/dev/null; wait "$SLEEPER" 2>/dev/null
+
+# MA22: the ds4 and llama.cpp wrappers refuse beside any model server.
+cp /bin/sleep "$T1/mlx-serve"
+"$T1/mlx-serve" 60 & SLEEPER2=$!
+sleep 0.5
+for w in ds4 llamacpp; do
+    printf 'MSS_GUARD_BACKEND=%s\n' "$w" > "$T1/ma22.conf"
+    OUT=$(MSS_CONF="$T1/ma22.conf" sh "$ROOT/libexec/$w-start.sh" 2>&1); RC=$?
+    check "MA22 $w-start.sh beside an unmanaged mlx-serve" "78 REFUSE: model server already running (mlx-serve pid $SLEEPER2)" "$RC $OUT"
+done
+kill "$SLEEPER2" 2>/dev/null; wait "$SLEEPER2" 2>/dev/null
+cp /bin/sleep "$T1/my-ds4"
+"$T1/my-ds4" 60 & SLEEPER3=$!
+sleep 0.5
+for w in ds4 llamacpp; do
+    printf 'MSS_GUARD_BACKEND=%s\nDS4_BIN=/opt/x/my-ds4\n' "$w" > "$T1/ma22.conf"
+    OUT=$(MSS_CONF="$T1/ma22.conf" sh "$ROOT/libexec/$w-start.sh" 2>&1); RC=$?
+    check "MA22 $w-start.sh beside a process named like a configured *_BIN" "78 REFUSE: model server already running (my-ds4 pid $SLEEPER3)" "$RC $OUT"
+done
+kill "$SLEEPER3" 2>/dev/null; wait "$SLEEPER3" 2>/dev/null
+
+# MA21: the job plan, a pure function over fixtures.
+for f in "$ROOT"/tests/fixtures/plan/*.in; do
+    check "MA21 plan: $(sed -n '1s/^# //p' "$f")" "$(cat "${f%.in}.out")" "$(grep -v '^#' "$f" | mss_plan_jobs)"
+done
+
+# MA23: the interrupted-commit decision, a pure function over the journal and files.
+ma23() { # ma23 <case>: a fresh three-step commit under $T1/ma23-<case>, journal in place
+    _md=$T1/ma23-$1; rm -rf "${_md:?}"; mkdir -p "$_md/stage/new" "$_md/stage/prev"
+    printf 'old\n' > "$_md/old"; printf 'new\n' > "$_md/new"
+    _o=$(mss_file_sha "$_md/old"); _w=$(mss_file_sha "$_md/new")
+    sed -e "s|@DIR@|$_md|g" -e "s|@OLD@|$_o|g" -e "s|@NEW@|$_w|g" "$ROOT/tests/fixtures/journal/three-steps.journal" > "$_md/journal"
+    cp "$_md/old" "$_md/a"; cp "$_md/old" "$_md/b"
+    for n in 1 2 3; do cp "$_md/new" "$_md/stage/new/$n"; done
+    cp "$_md/old" "$_md/stage/prev/1"; cp "$_md/old" "$_md/stage/prev/2"
+}
+plan23() { mss_commit_recover_plan "$T1/ma23-$1/journal" "$T1/ma23-$1/stage"; }
+ma23 pending; check "MA23 all pending" "forward 3 3" "$(plan23 pending)"
+ma23 some; mv "$T1/ma23-some/stage/new/1" "$T1/ma23-some/a"
+check "MA23 some done, staged files present" "forward 2 3" "$(plan23 some)"
+ma23 back; mv "$T1/ma23-back/stage/new/1" "$T1/ma23-back/a"; rm -f "$T1/ma23-back/stage/new/2"
+check "MA23 a pending staged file missing, backups valid" "back 1" "$(plan23 back)"
+ma23 foreign; printf 'edited\n' > "$T1/ma23-foreign/b"
+check "MA23 a target with foreign content" "refuse-foreign 2 $T1/ma23-foreign/b" "$(plan23 foreign)"
+ma23 none; mv "$T1/ma23-none/stage/new/1" "$T1/ma23-none/a"; rm -f "$T1/ma23-none/stage/new/2" "$T1/ma23-none/stage/prev/1"
+check "MA23 staged and backup copies both missing" refuse "$(plan23 none)"
+
+# MA20, MA24, MA26: the lock, with the non-root test hooks.
+LK=$T1/lock; mkdir -p "$LK"
+MSS_LOCK_FILE="$LK/lock"; MSS_MUT_FILE="$LK/mut"; export MSS_LOCK_FILE MSS_MUT_FILE
+now_ms() { /usr/bin/perl -MTime::HiRes=time -e 'printf "%d\n", time * 1000'; }
+sh "$ROOT/tests/stubs/hold-lock.sh" 60 > "$LK/h1.out" 2>&1 & H1=$!
+_i=0; while ! grep -q '^held' "$LK/h1.out" 2>/dev/null && [ "$_i" -lt 50 ]; do sleep 0.1; _i=$((_i + 1)); done
+T0=$(now_ms)
+OUT=$(MSS_LOCK_TIMEOUT=1 sh -c '. "$1/scripts/lib/mss-common.sh"; mss_lock_acquire second; echo acquired' sh "$ROOT" 2>&1); RC=$?
+EL=$(( $(now_ms) - T0 ))
+check "MA20 a held lock: the second command exits 1" 1 "$RC"
+printf '%s' "$OUT" | grep -q "another mac-studio-server command holds the lock (holder=$H1@.* cmd=hold-lock since=" \
+    && [ "$EL" -le 2000 ] && ok "MA20 it names the holder within 2 s (${EL} ms)" || fail "MA20 timeout (${EL} ms): $OUT"
+H1SLEEP=$(pgrep -P "$H1" sleep | head -n 1)
+kill -9 "$H1"; wait "$H1" 2>/dev/null
+T0=$(now_ms)
+OUT=$(MSS_LOCK_TIMEOUT=5 sh -c '. "$1/scripts/lib/mss-common.sh"; mss_lock_acquire third; echo acquired' sh "$ROOT" 2>&1)
+EL=$(( $(now_ms) - T0 ))
+[ "$OUT" = acquired ] && [ "$EL" -le 1000 ] && ok "MA20 a killed holder frees the lock within 1 s (${EL} ms)" \
+    || fail "MA20 after kill -9 (${EL} ms): $OUT"
+[ -n "$H1SLEEP" ] && kill -0 "$H1SLEEP" 2>/dev/null && ok "MA20 the holder's foreground sleep is still alive" || fail "MA20 the orphaned sleep is gone"
+[ -z "$H1SLEEP" ] || kill "$H1SLEEP" 2>/dev/null
+# A keeper killed under a holder that keeps checking: the holder stops.
+sh -c '. "$1/scripts/lib/mss-common.sh"; mss_lock_acquire looping; echo "keeper $MSS_LOCK_KEEPER"; while :; do mss_lock_check; sleep 0.2; done' \
+    sh "$ROOT" > "$LK/h2.out" 2>&1 & H2=$!
+_i=0; while ! grep -q '^keeper' "$LK/h2.out" 2>/dev/null && [ "$_i" -lt 50 ]; do sleep 0.1; _i=$((_i + 1)); done
+kill -9 "$(sed -n 's/^keeper //p' "$LK/h2.out")"
+wait "$H2"; RC=$?
+check "MA20 a lost keeper stops the holder" "1 ERROR: lifecycle lock lost; nothing further was changed" "$RC $(tail -n 1 "$LK/h2.out")"
+
+# MA24: the watchdog kills a read-only child once its holder is gone.
+sh -c '. "$1/scripts/lib/mss-common.sh"; sleep 300 & echo "child $!"; mss_watchdog $!; wait' sh "$ROOT" > "$LK/w.out" 2>&1 & W1=$!
+_i=0; while ! grep -q '^child' "$LK/w.out" 2>/dev/null && [ "$_i" -lt 50 ]; do sleep 0.1; _i=$((_i + 1)); done
+WC=$(sed -n 's/^child //p' "$LK/w.out")
+kill -9 "$W1"; wait "$W1" 2>/dev/null
+_i=0; while kill -0 "$WC" 2>/dev/null && [ "$_i" -lt 20 ]; do sleep 0.1; _i=$((_i + 1)); done
+if kill -0 "$WC" 2>/dev/null; then fail "MA24 the child outlived its holder by 2 s"; kill "$WC"; else ok "MA24 the watched child is gone within 2 s"; fi
+
+# MA26: mss_mut runs only inside the live session that started it.
+cat > "$LK/ma26.sh" <<'MA26'
+. "$1/scripts/lib/mss-common.sh"
+D=$2
+mss_lock_acquire ma26
+run() { # run <tag>: the raw runner, so a refusal does not end this shell
+    /usr/bin/perl -e "$_MSS_LOCK_PL" mut "$MSS_LOCK_FILE" "$MSS_MUT_FILE" "$MSS_LOCK_SESSION" /bin/sh -c ": > '$D/ran-$1'" 2>"$D/err-$1"
+    echo "$1 rc=$? $(ls "$MSS_MUT_FILE.d" | wc -l | tr -d ' ')"
+}
+run match
+O="$MSS_LOCK_FILE.owner"; cp "$O" "$D/owner"
+sed 's/^session=[0-9a-f]*/session=00000000000000000000000000000000/' "$D/owner" > "$O"; run token
+sed 's/ keeper=[0-9]*@/ keeper=999999@/' "$D/owner" > "$O"; run keeper
+sed 's/ holder=\([0-9]*\)@[^ ]*/ holder=\1@Mon_Jan_1_00:00:00_2001/' "$D/owner" > "$O"; run start
+cp "$D/owner" "$O"
+MA26
+sh "$LK/ma26.sh" "$ROOT" "$LK" > "$LK/ma26.out" 2>&1
+check "MA26 a matching session runs the command" "match rc=0 1" "$(sed -n 1p "$LK/ma26.out")"
+[ -e "$LK/ran-match" ] && ok "MA26 the command ran" || fail "MA26 the command did not run"
+for c in token:2 keeper:3 start:4; do
+    _t=${c%:*}; _l=${c#*:}
+    check "MA26 $_t: refused, nothing run, registry unchanged" "$_t rc=75 1 no" \
+        "$(sed -n "${_l}p" "$LK/ma26.out") $([ -e "$LK/ran-$_t" ] && echo ran || echo no)"
+    grep -q '^REFUSE: lifecycle session .* ended; /bin/sh -c ' "$LK/err-$_t" && ok "MA26 $_t prints the REFUSE line" \
+        || fail "MA26 $_t message: $(cat "$LK/err-$_t")"
+done
+unset MSS_LOCK_FILE MSS_MUT_FILE
+
+# MA25: the phase 6 save helper.
+printf 'MSS_BACKENDS=ollama,ds4,mlx\nMSS_SERVICE_USER=u\nMSS_GUARD_BACKEND=mlx\n' > "$T1/ma25.conf"
+printf '# kept\nMSS_BACKENDS=ollama,ds4\nMSS_ACTIVE_BACKEND=ds4\nDS4_PORT=8001\nMLX_PORT=11234\n' > "$T1/ma25.env"; chmod 600 "$T1/ma25.env"
+cp "$T1/ma25.env" "$T1/ma25.orig"
+ESET="$ROOT/scripts/lib/mss-envfile-set.sh"
+MSS_CONF="$T1/ma25.conf" sh "$ESET" "$T1/ma25.env" "$(mss_file_sha "$T1/ma25.conf")"
+check "MA25 the right conf sha rewrites only the two keys" "0 <MSS_BACKENDS=ollama,ds4 <MSS_ACTIVE_BACKEND=ds4 >MSS_BACKENDS=ollama,ds4,mlx >MSS_ACTIVE_BACKEND=mlx " \
+    "$? $(diff "$T1/ma25.orig" "$T1/ma25.env" | sed -n 's/^\([<>]\) /\1/p' | tr '\n' ' ')"
+cp "$T1/ma25.orig" "$T1/ma25.env"
+OUT=$(MSS_CONF="$T1/ma25.conf" sh "$ESET" "$T1/ma25.env" "$(printf '0%.0s' $(seq 64))" 2>&1); RC=$?
+check "MA25 a wrong sha exits 3, file unchanged" "3 same" "$RC $(cmp -s "$T1/ma25.orig" "$T1/ma25.env" && echo same || echo changed)"
+printf '%s' "$OUT" | grep -q 'installed state changed meanwhile; not saved' && ok "MA25 says not saved" || fail "MA25 wrong sha: $OUT"
+ln -sf "$T1/ma25.env" "$T1/ma25.link"
+OUT=$(MSS_CONF="$T1/ma25.conf" sh "$ESET" "$T1/ma25.link" "$(mss_file_sha "$T1/ma25.conf")" 2>&1); RC=$?
+check "MA25 a symlinked file is refused" "1 same" "$RC $(cmp -s "$T1/ma25.orig" "$T1/ma25.env" && echo same || echo changed)"
+mkdir -p "$T1/rootid"; printf '#!/bin/sh\n[ "$1" = -u ] && { echo 0; exit 0; }\nexec /usr/bin/id "$@"\n' > "$T1/rootid/id"; chmod +x "$T1/rootid/id"
+OUT=$(PATH="$T1/rootid:$PATH" MSS_CONF="$T1/ma25.conf" sh "$ESET" "$T1/ma25.env" "$(mss_file_sha "$T1/ma25.conf")" 2>&1); RC=$?
+check "MA25 root is refused" "1 same" "$RC $(cmp -s "$T1/ma25.orig" "$T1/ma25.env" && echo same || echo changed)"
+printf '%s' "$OUT" | grep -q 'refusing to write .* as root' && ok "MA25 says root" || fail "MA25 root: $OUT"
+
 echo "== phase A: an installed Mac and the hashing locale (#21) =="
 # D7 against a fixture conf: MSS_CONF decides in a non-root pass.
 printf 'MSS_GUARD_BACKEND=ds4\n' > "$TMP/installed-ds4.conf"
 OUT=$(render llamacpp "$TMP/d7-render" MSS_CONF="$TMP/installed-ds4.conf" 2>&1) && fail "D7 rendered llama.cpp over an installed ds4" \
-    || { printf '%s' "$OUT" | grep -q "installed optional backend is 'ds4'" && ok "D7 reads MSS_CONF without root" || fail "D7 with a fixture conf: $OUT"; }
+    || { printf '%s' "$OUT" | grep -q "ds4 is installed but not selected" && ok "D7 reads MSS_CONF without root" || fail "D7 with a fixture conf: $OUT"; }
 OUT=$(env MSS_BACKENDS=llamacpp OLLAMA_USER="$TUSER" MSS_CONF="$TMP/installed-ds4.conf" MSS_REPLACE_BACKEND=ds4 \
     LLAMACPP_BIN="$TMP/fix/llamacpp/llamacpp-server" LLAMACPP_MODEL="$TMP/fix/llamacpp/model.gguf" \
     LLAMACPP_MODEL_SHA256="$(cat "$TMP/fix/llamacpp/model.sha")" LLAMACPP_PORT=18998 \
@@ -2400,7 +2919,7 @@ OUT=$(env MSS_BACKENDS=llamacpp OLLAMA_USER="$TUSER" MSS_CONF="$TMP/installed-ds
 OUT=$(env MSS_BACKENDS=ds4 OLLAMA_USER="$TUSER" MSS_CONF="$TMP/installed-ds4.conf" MSS_REPLACE_BACKEND=llamacpp \
     DS4_BIN="$TMP/fix/ds4/ds4-server" DS4_MODEL="$TMP/fix/ds4/model.gguf" DS4_MODEL_SHA256="$(cat "$TMP/fix/ds4/model.sha")" \
     DS4_PORT=18999 sh "$ROOT/scripts/install-backends.sh" --check-only 2>&1) && fail "replace of a backend the fixture does not have accepted" \
-    || { printf '%s' "$OUT" | grep -q "('ds4')" && ok "a replace of a backend not in the fixture conf is refused" || fail "replace check: $OUT"; }
+    || { printf '%s' "$OUT" | grep -q "(installed: ds4)" && ok "a replace of a backend not in the fixture conf is refused" || fail "replace check: $OUT"; }
 # The hash under a locale Perl cannot load, the first field against FIPS 180-2 "abc".
 check "mss_shasum256 under C.UTF-8 gives the abc digest" "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" \
     "$(printf abc | env LC_ALL=C.UTF-8 LANG=C.UTF-8 sh -c '. "$1/scripts/lib/mss-common.sh"; mss_shasum256' sh "$ROOT" | awk '{print $1}')"

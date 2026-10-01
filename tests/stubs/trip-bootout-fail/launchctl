@@ -1,0 +1,8 @@
+#!/bin/sh
+# launchctl for MB6: every label reports pid 4242 and bootout exits 5; anything
+# else is the real launchctl.
+case ${1:-} in
+    print) echo "    state = running"; echo "    pid = 4242"; exit 0 ;;
+    bootout) exit 5 ;;
+esac
+exec /bin/launchctl "$@"
