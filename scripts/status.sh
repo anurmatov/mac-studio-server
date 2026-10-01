@@ -145,10 +145,14 @@ fi
 
 # Any model server that is not the active job is outside the guard's view.
 if [ -n "$_all" ]; then
-    _apid=""
-    [ -z "$_opt" ] || _apid=$(mss_label_pid "com.mac-studio-server.$_opt")
-    _aloaded=0
-    [ -z "$_opt" ] || ! launchctl print "system/com.mac-studio-server.$_opt" >/dev/null 2>&1 || _aloaded=1
+    # A running active job whose PID this user cannot read could be any of
+    # them; a job that is not running is none of them.
+    _apid=""; _arunning=0
+    if [ -n "$_opt" ]; then
+        _aprint=$(launchctl print "system/com.mac-studio-server.$_opt" 2>/dev/null)
+        _apid=$(printf '%s\n' "$_aprint" | sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\).*/\1/p' | head -n 1)
+        printf '%s\n' "$_aprint" | grep -q '^[[:space:]]*state = running' && _arunning=1
+    fi
     if ! _servers=$(mss_model_servers); then
         echo "servers:"; unhealthy servers "pgrep is missing; cannot check for other model servers"
     else
@@ -156,7 +160,7 @@ if [ -n "$_all" ]; then
         while read -r _sn _sp; do
             [ -n "$_sp" ] || continue
             if [ -n "$_apid" ] && mss_pid_under "$_sp" "$_apid"; then continue; fi
-            if [ -z "$_apid" ] && [ "$_aloaded" = 1 ]; then _hint=1; continue; fi
+            if [ -z "$_apid" ] && [ "$_arunning" = 1 ]; then _hint=1; continue; fi
             [ "$_hdr" = 1 ] || { echo "servers:"; _hdr=1; }
             unhealthy unmanaged "unmanaged $_sn pid $_sp (not guarded)"
         done <<MSS_SERVERS_EOF

@@ -582,6 +582,28 @@ for _b in $SELECTED_OPT; do
     fi
 done
 
+# ── phase 1 step 7: no unmanaged model server beside a start (D5.7) ─────────
+# active_will_start: whether this run starts the active backend, as far as it
+# is known before the plan: a backend that is not running yet. The install pass
+# checks again from its plan, which also restarts a running one that changed.
+active_will_start() {
+    [ "$NEW_ACTIVE" != none ] && [ "$DEFER" != 1 ] && [ -z "$(mss_label_pid "$(label "$NEW_ACTIVE")")" ]
+}
+
+# unmanaged_server_check (D5.7): a backend starts only when no other model
+# server runs, managed or not. Only a root pass can see the managed jobs' PIDs.
+unmanaged_server_check() {
+    _us_extra=""
+    for _us_v in "$LLAMACPP_BIN_RESOLVED" "$DS4_BIN_RESOLVED" "$MLX_BIN_RESOLVED"; do
+        [ -z "$_us_v" ] || _us_extra="$_us_extra $(basename "$_us_v")"
+    done
+    # shellcheck disable=SC2086  # a list of names
+    _us=$(MSS_CONF=$I_CONF mss_unmanaged_server $_us_extra) || mss_die "pgrep is missing; cannot check for other model servers"
+    [ -z "$_us" ] || mss_die "unmanaged model server running (${_us% *} pid ${_us#* }); stop it first"
+}
+
+if [ "$IS_ROOT" = 1 ] && active_will_start; then unmanaged_server_check; fi
+
 # ── phase 1 step 8: plists edited outside this installer ──────────────────────
 I_USER=$(conf_get_from "$I_CONF" MSS_SERVICE_USER); I_USER=${I_USER:-$MSS_SERVICE_USER}
 _i_ds4_bin=$(conf_get_from "$I_CONF" DS4_BIN)
@@ -650,26 +672,7 @@ if mss_backend_selected mlx; then
     MLX_MANIFEST=$(mss_mlx_manifest "$MLX_MODEL_DIR_RESOLVED") || exit 1
 fi
 
-# active_will_start: the backend this run would start, for the --check-only
-# pass, which has no plan; the install pass decides from its plan.
-active_will_start() {
-    [ "$NEW_ACTIVE" != none ] && [ "$DEFER" != 1 ] && [ -z "$(mss_label_pid "$(label "$NEW_ACTIVE")")" ]
-}
-
-# unmanaged_server_check (D5.7): a backend starts only when no other model
-# server runs, managed or not. Only a root pass can see the managed jobs' PIDs.
-unmanaged_server_check() {
-    _us_extra=""
-    for _us_v in "$LLAMACPP_BIN_RESOLVED" "$DS4_BIN_RESOLVED" "$MLX_BIN_RESOLVED"; do
-        [ -z "$_us_v" ] || _us_extra="$_us_extra $(basename "$_us_v")"
-    done
-    # shellcheck disable=SC2086  # a list of names
-    _us=$(MSS_CONF=$I_CONF mss_unmanaged_server $_us_extra) || mss_die "pgrep is missing; cannot check for other model servers"
-    [ -z "$_us" ] || mss_die "unmanaged model server running (${_us% *} pid ${_us#* }); stop it first"
-}
-
 if [ "$CHECK_ONLY" = 1 ]; then
-    if [ "$IS_ROOT" = 1 ] && active_will_start; then unmanaged_server_check; fi
     if [ "$DEFER" = 1 ]; then
         echo "install-backends: check passed (backends: $MSS_BACKENDS; $NEW_ACTIVE waiting for a model)"
     else
@@ -951,6 +954,7 @@ done
 _not_stopped=""
 for _j in $STOPPED; do
     mss_launchd_wait_gone "$(label "$_j")" "$MSS_LAUNCHD_TIMEOUT" || { _not_stopped=$_j; break; }
+    echo "stopped $(label "$_j")"
 done
 if [ -n "$_not_stopped" ]; then
     # Nothing is committed. The jobs this run stopped come back from the
