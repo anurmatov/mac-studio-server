@@ -2672,7 +2672,8 @@ rm -f "$T1/hang"
 T0=$(ms_now); OUT=$(mss_run_bounded 2 sh -c 'while :; do sleep 1; done'); RC=$?; EL=$(( $(ms_now) - T0 ))
 check "MA8 mss_run_bounded 2 on a hang returns 124 within 3 s" "124 yes" "$RC $([ "$EL" -le 3000 ] && echo yes || echo "no (${EL} ms)")"
 T0=$(ms_now); OUT=$(mss_run_bounded 2 sh -c 'trap "" TERM; while :; do sleep 1; done'); RC=$?; EL=$(( $(ms_now) - T0 ))
-check "MA8 mss_run_bounded 2 kills a command that ignores TERM within 3 s" "124 yes" "$RC $([ "$EL" -le 3000 ] && echo yes || echo "no (${EL} ms)")"
+# 2 s, the 0.5 s TERM grace, then KILL.
+check "MA8 mss_run_bounded 2 kills a command that ignores TERM within 3.5 s" "124 yes" "$RC $([ "$EL" -le 3500 ] && echo yes || echo "no (${EL} ms)")"
 T0=$(ms_now); OUT=$(mss_run_bounded 5 sh -c 'echo out; echo err >&2; exit 7'); RC=$?; EL=$(( $(ms_now) - T0 ))
 check "MA8 mss_run_bounded passes the status and output through, at once" "7 out err yes" \
     "$RC $(printf '%s' "$OUT" | tr '\n' ' ') $([ "$EL" -le 2000 ] && echo yes || echo "no (${EL} ms)")"

@@ -641,7 +641,7 @@ MSS_MLX_SERVE_VERSION=26.9.6
 # (macOS has no timeout(1)). The deadline is a background `sleep <seconds>`, so
 # the bound is wall time: counting 0.2 s polls let fork overhead on a slow Mac
 # stretch 10 s to 14 s. The loop checks both every 0.2 s; at the deadline it
-# sends TERM, waits up to 0.5 s, sends KILL and returns 124. Otherwise it
+# sends TERM, waits up to 0.5 s (also wall time), sends KILL and returns 124. Otherwise it
 # returns the command's status. The command's output (stdout and stderr) goes
 # to a temporary file and is printed when it ends, so a child it leaves behind
 # cannot hold the caller's command substitution open. Inside a lifecycle lock
@@ -658,11 +658,13 @@ mss_run_bounded() {
     while kill -0 "$_rb_pid" 2>/dev/null; do
         if ! kill -0 "$_rb_timer" 2>/dev/null; then
             kill -TERM "$_rb_pid" 2>/dev/null
-            _rb_n=0
-            while kill -0 "$_rb_pid" 2>/dev/null && [ "$_rb_n" -lt 5 ]; do
+            sleep 0.5 >/dev/null 2>&1 &
+            _rb_grace=$!
+            while kill -0 "$_rb_pid" 2>/dev/null && kill -0 "$_rb_grace" 2>/dev/null; do
                 sleep 0.1
-                _rb_n=$((_rb_n + 1))
             done
+            kill "$_rb_grace" 2>/dev/null
+            wait "$_rb_grace" 2>/dev/null
             kill -KILL "$_rb_pid" 2>/dev/null
             wait "$_rb_pid" 2>/dev/null
             _rb_rc=124
