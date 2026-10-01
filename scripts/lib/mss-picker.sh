@@ -88,9 +88,10 @@ _mss_pick_menu_valid() {
         mss_error "answer numbers from 1 to 4, comma-separated (for example 1,3)"
         return 1
     fi
-    case ",$a," in
-        *,1,*,1,*|*,2,*,2,*|*,3,*,3,*|*,4,*,4,*) mss_error "each number only once"; return 1 ;;
-    esac
+    if [ -n "$(printf '%s\n' "$a" | tr ',' '\n' | sort | uniq -d)" ]; then
+        mss_error "each number only once"
+        return 1
+    fi
     return 0
 }
 

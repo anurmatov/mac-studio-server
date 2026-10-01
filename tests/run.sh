@@ -2405,6 +2405,114 @@ else
         grep -qxF "  $v" "$SUMMARY_SEEN" && ok "A8j variant seen: $v" || fail "A8j variant never produced: $v"
     done
 
+    # ── #1 D8: the multi-select picker (MP1-MP6) ──────────────────────────────
+    mkdir -p "$PK/mlxbin" "$PK/mlx927" "$PK/mp6bin"
+    cp "$ROOT/tests/stubs/fake-mlx-serve.sh" "$PK/mlxbin/mlx-serve"; chmod +x "$PK/mlxbin/mlx-serve"
+    printf '#!/bin/sh\nMSS_STUB_MLX_VERSION=26.9.7 exec "%s" "$@"\n' "$ROOT/tests/stubs/fake-mlx-serve.sh" > "$PK/mlx927/mlx-serve"
+    chmod +x "$PK/mlx927/mlx-serve"
+    MLXD="$TMP/fix/mlx/model"
+    MLX_DIR_Q="(config.json and *.safetensors): ${T}$MLXD"
+
+    # MP1: fresh, ollama and mlx: no active question, no MSS_ACTIVE_BACKEND.
+    DRIVE_PATH="$PK/mlxbin" drive mp1 "Choose [1]: ${T}1,4" "$MLX_DIR_Q" "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" \
+        "$DA_ENTER" "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/mp1.env"
+    check "MP1 fresh 1,4 completes" 0 $?
+    tr_of mp1 | grep -q 'Which optional backend' && fail "MP1 asked the active question" || ok "MP1 no active question"
+    check "MP1 saved" "ollama,mlx|$PK/mlxbin/mlx-serve|$MLXD|11234|" \
+        "$(saved mp1.env MSS_BACKENDS)|$(saved mp1.env MLX_BIN)|$(saved mp1.env MLX_MODEL_DIR)|$(saved mp1.env MLX_PORT)|$(saved mp1.env MSS_ACTIVE_BACKEND)"
+    tr_of mp1 | grep -qx "  mlx: active, $PK/mlxbin/mlx-serve, $MLXD, 127.0.0.1:11234" && ok "MP1 the summary says mlx: active on 127.0.0.1:11234" \
+        || fail "MP1 summary: $(tr_of mp1 | grep '  mlx:')"
+    tr_of mp1 | grep -q '^mlx listens on 127.0.0.1 only' && ok "MP1 says loopback only" || fail "MP1 no loopback line"
+
+    # MP2: ds4 and mlx, mlx active; the ds4 model menu has no "later".
+    DRIVE_PATH="$PK/mlxbin" drive mp2 "Choose [1]: ${T}3,4" "own file/URL: ${T}3" "path or https URL: ${T}$DS4M" \
+        "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" "LAN access to ds4? [y/N]: ${T}@ENTER" "$MLX_DIR_Q" \
+        "1) ds4 2) mlx 3) none [1]: ${T}2" "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" "$DA_ENTER" \
+        "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/mp2.env" DS4_BIN="$DS4B"
+    check "MP2 3,4 with mlx active completes" 0 $?
+    check "MP2 saved" "ds4,mlx|mlx" "$(saved mp2.env MSS_BACKENDS)|$(saved mp2.env MSS_ACTIVE_BACKEND)"
+    tr_of mp2 | grep 'ds4 (no small one exists)' | grep -q later && fail "MP2 the ds4 menu offers later" \
+        || ok "MP2 no later in the ds4 model menu"
+    tr_of mp2 | grep -qx "  ds4: standby, $DS4B, $DS4M, 127.0.0.1:8000" && ok "MP2 the summary shows ds4 on standby" \
+        || fail "MP2 summary: $(tr_of mp2 | grep '  ds4:')"
+
+    # MP3: installed ollama,ds4; 1,4 and N keeps ds4; with y it goes (non-configure picker).
+    printf 'MSS_BACKENDS=ollama,ds4\nMSS_SERVICE_USER=%s\nMSS_GUARD_BACKEND=ds4\n' "$(id -un)" > "$PK/mp3.conf"
+    envfile mp3.env "MSS_BACKENDS=ollama,ds4\nMSS_TUNE_MACOS=no\nDS4_BIN=$DS4B\nDS4_MODEL=$DS4M\nDS4_MODEL_SHA256=$DS4S\n"
+    DRIVE_PATH="$PK/mlxbin" drive mp3n "Choose [1,3]: ${T}1,4" "saved answers are kept. [y/N]: ${T}@ENTER" \
+        "(.gguf) path [$DS4M]: ${T}@ENTER" "c computes it now) [$DS4S]: ${T}@ENTER" "LAN access to ds4? [y/N]: ${T}@ENTER" \
+        "$MLX_DIR_Q" "1) ds4 2) mlx 3) none [1]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" "$DA_ENTER" \
+        "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/mp3.env" MSS_CONF="$PK/mp3.conf"
+    check "MP3 N keeps ds4 and completes" 0 $?
+    tr_of mp3n | grep -q '^ds4 is installed. Remove it now with sudo scripts/uninstall.sh --backend ds4? Its model files and saved answers are kept. \[y/N\]: ' \
+        && ok "MP3 the removal question" || fail "MP3 question: $(tr_of mp3n | grep 'is installed')"
+    tr_of mp3n | grep -qx 'kept installed: ds4' && ok "MP3 says kept installed: ds4" || fail "MP3 no kept line"
+    check "MP3 N saved" "ollama,ds4,mlx|ds4" "$(saved mp3.env MSS_BACKENDS)|$(saved mp3.env MSS_ACTIVE_BACKEND)"
+    cat > "$PK/pick.sh" <<'PICK'
+REPO_DIR=$1
+. "$REPO_DIR/scripts/lib/mss-common.sh"; . "$REPO_DIR/scripts/lib/mss-acquire.sh"
+. "$REPO_DIR/scripts/lib/mss-host.sh"; . "$REPO_DIR/scripts/lib/mss-picker.sh"
+mss_picker_run "$2" "$3" "$4" 0
+echo "SWITCH=[$MSS_SWITCH_FROM] REPLACE=[$MSS_PICKER_REPLACE]"
+PICK
+    envfile mp3y.env "MSS_BACKENDS=ollama,ds4\nMSS_TUNE_MACOS=no\nDS4_BIN=$DS4B\nDS4_MODEL=$DS4M\nDS4_MODEL_SHA256=$DS4S\n"
+    : > "$PK/mp3y.steps"
+    for st in "Choose [1,3]: ${T}1,4" "saved answers are kept. [y/N]: ${T}y" "$MLX_DIR_Q" "auto-updates)? ${T}@ENTER" \
+        "$G_ENTER" "$P_ENTER" "$DA_ENTER" "Install with these settings? [Y/n]: ${T}@ENTER"; do
+        printf '%s\n' "$st" >> "$PK/mp3y.steps"
+    done
+    rm -rf "${PK:?}/state-mp3y"; mkdir -p "$PK/state-mp3y"
+    env PATH="$PK/mlxbin:$PK/bin:$TMP/nosudo:$PATH" MSS_CONF="$PK/mp3.conf" OLLAMA_USER="$(id -un)" \
+        MSS_IFCONFIG="$ROOT/tests/stubs/ifconfig-lan" MSS_TEST_SYSROOT="$PK/sysroot" MSS_STUB_STATE="$PK/state-mp3y" \
+        MSS_PMSET="$ROOT/tests/stubs/pmset-autorestart-0" MSS_SYSCTL="$ROOT/tests/stubs/sysctl-state" MSS_DOCKER_JOB_PATH="$PK/jobbin" \
+        expect "$ROOT/tests/expect/drive.exp" "$PK/mp3y.steps" "$PK/mp3y.transcript" \
+        /bin/bash "$PK/pick.sh" "$ROOT" "$PK/mp3y.env" ollama,ds4 ds4 >/dev/null 2>"$PK/mp3y.err"
+    check "MP3 y completes" 0 $?
+    tr_of mp3y | grep -q '^SWITCH=\[ds4\] REPLACE=\[ds4\]' && ok "MP3 y sets MSS_SWITCH_FROM=ds4" || fail "MP3 y: $(tr_of mp3y | tail -3)"
+    check "MP3 y saved ollama,mlx" "ollama,mlx|" "$(saved mp3y.env MSS_BACKENDS)|$(saved mp3y.env MSS_ACTIVE_BACKEND)"
+    tr_of mp3y | grep -qx '  remove after the check: ds4' && ok "MP3 the summary lists the removal" || fail "MP3 no removal line"
+
+    # MP4: invalid menu answers: re-asked, exit 2 after three, nothing saved.
+    drive mp4 "Choose [1]: ${T}5" "Choose [1]: ${T}1,1" "Choose [1]: ${T}a" -- MSS_ENV_FILE="$PK/mp4.env"
+    check "MP4 three invalid answers exit 2" 2 $?
+    [ ! -e "$PK/mp4.env" ] && ok "MP4 nothing saved" || fail "MP4 wrote a file"
+    check "MP4 the menu was asked three times" 3 "$(tr_of mp4 | grep -c 'Choose \[1\]: ')"
+
+    # MP5: another mlx-serve version on PATH: named, then the path is asked.
+    DRIVE_PATH="$PK/mlx927" drive mp5 "Choose [1]: ${T}4" "mlx-serve 26.9.6 binary path: ${T}$PK/mlxbin/mlx-serve" "$MLX_DIR_Q" \
+        "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" "$DA_ENTER" "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/mp5.env"
+    check "MP5 a mismatched mlx-serve, then a good path, completes" 0 $?
+    _mm=$(tr_of mp5 | grep -n 'mlx-serve 26.9.7 is installed; this release supports 26.9.6 only' | head -n 1 | cut -d: -f1)
+    _mq=$(tr_of mp5 | grep -n 'mlx-serve 26.9.6 binary path: ' | head -n 1 | cut -d: -f1)
+    [ -n "$_mm" ] && [ -n "$_mq" ] && [ "$_mm" -lt "$_mq" ] && ok "MP5 the mismatch is named before the path question" \
+        || fail "MP5 order: mismatch line ${_mm:-none}, path question ${_mq:-none}"
+    check "MP5 saved the good binary" "$PK/mlxbin/mlx-serve" "$(saved mp5.env MLX_BIN)"
+
+    # MP6: loaded mode with multi.env: no questions; the root passes get MSS_ACTIVE_BACKEND.
+    # Its paths are placeholders, so it stays out of the *.env files the #21 row scans.
+    mkdir -p "$PK/mp6"; cp "$ROOT/tests/fixtures/envfile/multi.env" "$PK/mp6/backends.env"; chmod 600 "$PK/mp6/backends.env"
+    cat > "$PK/mp6bin/sudo" <<SHIM
+#!/bin/sh
+case \$1 in -v) exit 0 ;; -n) shift ;; esac
+case " \$* " in *install-backends.sh*) echo "\$*" >> '$PK/mp6.root'; exit 0 ;; esac
+exec "\$@"
+SHIM
+    chmod +x "$PK/mp6bin/sudo"; : > "$PK/mp6.root"
+    mkdir -p "$TMP/h27r/base-mp6"; ln -sf "$ROOT/config" "$TMP/h27r/base-mp6/config"
+    ( export MSS_TEST_SYSROOT=$TMP/h27r/sysroot MSS_STUB_STATE=$HR_STATE MSS_LAUNCHD_TIMEOUT=1 MSS_SUDO=$PK/mp6bin/sudo \
+          MSS_SYSCTL="$TMP/h27r-bin/sysctl" PATH="$PK/mp6bin:$TMP/h27r-bin:$PATH" MSS_INSTALL_SANDBOX=1 \
+          OLLAMA_BASE_DIR="$TMP/h27r/base-mp6" HOME="$TMP/h27r/home" MSS_ENV_FILE="$PK/mp6/backends.env" \
+          OLLAMA_USER="$(id -un)" MSS_CONF="$TMP/h27r/none.conf"
+      unset MSS_BACKENDS
+      expect "$ROOT/tests/expect/drive.exp" /dev/null "$PK/mp6.transcript" /bin/bash "$ROOT/scripts/install.sh" ) \
+        >/dev/null 2>"$PK/mp6.err"
+    check "MP6 loaded mode with multi.env exits 0" 0 $?
+    tr_of mp6 | grep -Eq 'Choose|Which optional backend' && fail "MP6 asked a question" || ok "MP6 no questions"
+    check "MP6 both root passes get MSS_ACTIVE_BACKEND=mlx" 2 "$(grep -c 'MSS_ACTIVE_BACKEND=mlx ' "$PK/mp6.root")"
+    grep -v -- '--check-only' "$PK/mp6.root" | grep -q "MSS_SAVE_ENVFILE=$PK/mp6/backends.env " \
+        && ok "MP6 the install pass saves backends.env under its lock" || fail "MP6 root passes: $(cat "$PK/mp6.root")"
+    rm -f "${HSD_R:?}/"*.plist
+
     # S4: prompt lines stay within 100 characters.
     LONG=$(cat "$PK"/found.transcript "$PK"/ds4menu.transcript "$PK"/tweaks.transcript | tr -d '\r' \
         | sed -n 's/^\(.*\]: \).*/\1/p' | awk 'length($0) > 100')
