@@ -4270,10 +4270,14 @@ check "MB27 c: saved = installed = ds4" "ds4 ds4" "$(saved_active) $(conf_active
 
 # MB28: a runner that reaches the mutation lock after its session ended never runs.
 # The probe's own keeper must have let go too: a keeper still draining would
-# wait on the blocker below (which no real command ever takes outside a lock).
+# wait on the blocker below. (By design a keeper takes the mutation LOCK_EX only
+# while it holds the main lock, so real commands do not race it; no row tests that.)
 lock_free 90 && ok "MB28 the previous command's keeper has let go" || fail "MB28 the lock is still held: $OUT"
 _i=0; while ! grep -q '^released after draining' /var/run/com.mac-studio-server.lock.owner 2>/dev/null && [ "$_i" -lt 100 ]; do
     sleep 0.1; _i=$((_i + 1)); done
+grep -q '^released after draining' /var/run/com.mac-studio-server.lock.owner \
+    && ok "MB28 the probe's keeper released before the blocker starts" \
+    || fail "MB28 the probe's keeper did not release within 10 s: $(cat /var/run/com.mac-studio-server.lock.owner)"
 sudo rm -f /tmp/mss-late
 sudo sh "$ROOT/tests/stubs/hold-mut-ex.sh" >"$MBD/mb28.ex" 2>&1 & MB28X=$!
 _i=0; while ! grep -q '^held' "$MBD/mb28.ex" 2>/dev/null && [ "$_i" -lt 50 ]; do sleep 0.1; _i=$((_i + 1)); done
@@ -4284,7 +4288,12 @@ sleep 1
 K28=$(sed -n 's/^held [0-9]* \([0-9]*\) .*/\1/p' "$MBD/mb28.hold")
 R28=$(pgrep -P "$H28" perl | grep -vx "$K28" | head -n 1)
 [ -n "$R28" ] && ok "MB28 the runner is blocked before LOCK_SH" || fail "MB28 no blocked runner"
-sudo kill -STOP "$R28"; sudo kill -9 "$H28"; sleep 2
+# H1 first, then SIGSTOP: the runner leads its own process group, and killing
+# H1 while it is stopped orphans a group with a stopped member, which POSIX
+# answers with SIGHUP + SIGCONT (perl dies of the SIGHUP). The blocker still
+# holds LOCK_EX in between, so the runner cannot move.
+sudo kill -9 "$H28"; sudo kill -STOP "$R28"; sleep 2
+sudo kill -0 "$R28" && ok "MB28 the runner survives H1, stopped" || fail "MB28 the runner died with H1"
 grep -q "^session=$SA " /var/run/com.mac-studio-server.lock.owner && ok "MB28 keeper A holds on while the blocker holds LOCK_EX" \
     || fail "MB28 owner: $(cat /var/run/com.mac-studio-server.lock.owner)"
 sudo kill "$(sed -n 's/^held //p' "$MBD/mb28.ex")" 2>/dev/null; wait "$MB28X" 2>/dev/null
