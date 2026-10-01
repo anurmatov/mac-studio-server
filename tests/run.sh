@@ -119,12 +119,14 @@ fi
 
 echo "== phase A: static =="
 if command -v shellcheck >/dev/null 2>&1; then
-    if shellcheck -S warning -s sh "$ROOT"/libexec/*.sh "$ROOT"/scripts/lib/mss-common.sh "$ROOT"/scripts/lib/mss-host.sh "$ROOT"/scripts/install-backends.sh "$ROOT"/scripts/status.sh "$ROOT"/scripts/uninstall.sh "$ROOT"/tests/expect/host-steps.sh; then
+    if shellcheck -S warning -s sh "$ROOT"/libexec/*.sh "$ROOT"/scripts/lib/mss-common.sh "$ROOT"/scripts/lib/mss-host.sh "$ROOT"/scripts/install-backends.sh "$ROOT"/scripts/status.sh "$ROOT"/scripts/uninstall.sh "$ROOT"/scripts/lib/mss-envfile-set.sh "$ROOT"/tests/expect/host-steps.sh \
+        "$ROOT"/tests/stubs/fake-mlx-serve.sh "$ROOT"/tests/stubs/hold-lock.sh "$ROOT"/tests/stubs/hold-mut-ex.sh \
+        "$ROOT"/tests/stubs/mv-kill/mv "$ROOT"/tests/stubs/mv-slow/mv "$ROOT"/tests/stubs/*/launchctl; then
         ok "shellcheck -s sh"
     else
         fail "shellcheck -s sh"
     fi
-    if shellcheck -S warning "$ROOT"/scripts/install.sh "$ROOT"/scripts/model.sh "$ROOT"/scripts/lib/mss-picker.sh "$ROOT"/scripts/lib/mss-acquire.sh "$ROOT"/scripts/lib/mss-run.sh; then ok "shellcheck bash scripts"; else fail "shellcheck bash scripts"; fi
+    if shellcheck -S warning "$ROOT"/scripts/install.sh "$ROOT"/scripts/model.sh "$ROOT"/scripts/backend.sh "$ROOT"/scripts/lib/mss-picker.sh "$ROOT"/scripts/lib/mss-acquire.sh "$ROOT"/scripts/lib/mss-run.sh; then ok "shellcheck bash scripts"; else fail "shellcheck bash scripts"; fi
 else
     echo "skip - shellcheck not installed"
 fi
