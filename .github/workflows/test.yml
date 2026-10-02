@@ -48,6 +48,16 @@ jobs:
             MSS_IFCONFIG="$PWD/tests/stubs/ifconfig-lan" \
             sh scripts/install-backends.sh --render-only /tmp/mss-pf
           sudo /sbin/pfctl -n -f /tmp/mss-pf/pf.conf
+          # the mlx branch (#33): the stub answers the version probe
+          mkdir -p /tmp/mss-pf-mlx/model
+          printf '{}\n' > /tmp/mss-pf-mlx/model/config.json; printf 'w' > /tmp/mss-pf-mlx/model/model.safetensors
+          env MSS_BACKENDS=mlx OLLAMA_USER=runner \
+            MLX_BIN="$PWD/tests/stubs/fake-mlx-serve.sh" MLX_MODEL_DIR=/tmp/mss-pf-mlx/model \
+            MLX_HOST=192.0.2.10 MLX_ALLOW_FROM='192.0.2.99 198.51.100.0/24' \
+            MSS_IFCONFIG="$PWD/tests/stubs/ifconfig-lan" \
+            sh scripts/install-backends.sh --render-only /tmp/mss-pf-mlx/out
+          grep -q 'port 11234$' /tmp/mss-pf-mlx/out/pf.conf
+          sudo /sbin/pfctl -n -f /tmp/mss-pf-mlx/out/pf.conf
 
       - name: Diagnostics
         if: failure()
