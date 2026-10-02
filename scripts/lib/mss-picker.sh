@@ -9,13 +9,14 @@
 # after a y (the model menu's starter is the one default-yes), as the user.
 #
 # Results, as exported variables for the rest of install.sh:
-#   MSS_BACKENDS, OLLAMA_BIN, MSS_TUNE_MACOS, MSS_DEFER_MODEL and the chosen
-#   backend's *_BIN/_MODEL/_MODEL_SHA256/_HOST/_PORT/_ALLOW_FROM (and
-#   LLAMACPP_API_KEY_FILE)
+#   MSS_BACKENDS, MSS_ACTIVE_BACKEND (two or more optional backends),
+#   OLLAMA_BIN, MSS_TUNE_MACOS, MSS_DEFER_MODEL and every chosen backend's
+#   *_BIN/_MODEL/_MODEL_SHA256/_HOST/_PORT/_ALLOW_FROM (and
+#   LLAMACPP_API_KEY_FILE; MLX_BIN, MLX_MODEL_DIR and MLX_PORT for mlx)
 #   MSS_GPU_PERCENT, MSS_POWER_AUTORESTART, MSS_DOCKER_INSTALL and (when the
 #   autostart question ran) MSS_DOCKER_AUTOSTART
-#   MSS_PICKER_REPLACE  installed backend the check may look through
-#   MSS_SWITCH_FROM     installed backend to uninstall after the check passes
+#   MSS_PICKER_REPLACE  installed backends the check may look through (comma list)
+#   MSS_SWITCH_FROM     installed backends to uninstall after the check passes
 #   MSS_DOWNLOADED      a model file downloaded in this run
 
 # shellcheck disable=SC2034  # both are read by install.sh after the picker
@@ -24,6 +25,8 @@ MSS_PICKER_REPLACE=""
 MSS_SWITCH_FROM=""
 MSS_PICK_BREW_ASKED=0
 MSS_PICK_DS4_BUILT=""
+# The model menu offers "later" only with a single optional backend (#1 D3).
+MSS_PICK_LATER=1
 
 mss_pick_trap() {
     trap 'echo >&2; echo "install.sh: interrupted; nothing was saved or changed" >&2; exit 130' INT
@@ -77,10 +80,35 @@ _mss_pick_yn_valid() {
 }
 
 # ── validators (each prints its own error) ─────────────────────────────────────
+# The backend menu (#1 D8): numbers 1-4, comma-separated, no duplicates.
 _mss_pick_menu_valid() {
-    case $1 in [1-5]) return 0 ;; esac
-    mss_error "choose 1, 2, 3, 4 or 5"
-    return 1
+    local a
+    a=$(printf '%s' "$1" | tr -d ' ')
+    if ! mss_match "$a" '^[1-4](,[1-4])*$'; then
+        mss_error "answer numbers from 1 to 4, comma-separated (for example 1,3)"
+        return 1
+    fi
+    if [ -n "$(printf '%s\n' "$a" | tr ',' '\n' | sort | uniq -d)" ]; then
+        mss_error "each number only once"
+        return 1
+    fi
+    return 0
+}
+
+# MLX-Serve: an executable that is exactly the pinned version.
+_mss_pick_mlx_bin_valid() {
+    local r
+    r=$(mss_resolve_path "$1") || return 1
+    mss_validate_path_chars "binary" "$r" || return 1
+    [ -f "$r" ] && [ -x "$r" ] || { mss_error "not an executable file: $r"; return 1; }
+    mss_mlx_version_ok "$r" "" ""
+}
+
+_mss_pick_mlx_dir_valid() {
+    local r
+    case $1 in /*) ;; *) mss_error "enter the absolute path of a native MLX model directory"; return 1 ;; esac
+    r=$(mss_resolve_path "$1") || return 1
+    mss_mlx_check_dir "model directory" "$r"
 }
 
 _mss_pick_bin_valid() {
@@ -153,33 +181,39 @@ _mss_pick_dest_valid() {
 }
 
 # ── helpers ────────────────────────────────────────────────────────────────────
+# Menu numbers: 1 ollama, 2 llama.cpp, 3 ds4, 4 mlx.
+_MSS_PICK_NAMES="ollama llamacpp ds4 mlx"
+
+# _mss_pick_sel_to_num <selection>: its menu answer ("1,3"), or nothing when
+# the selection is not valid.
 _mss_pick_sel_to_num() {
-    case $1 in
-        ollama) echo 1 ;;
-        ollama,llamacpp|llamacpp,ollama) echo 2 ;;
-        ollama,ds4|ds4,ollama) echo 3 ;;
-        llamacpp) echo 4 ;;
-        ds4) echo 5 ;;
-        *) echo "" ;;
-    esac
+    local n=0 out="" b
+    [ -n "$1" ] && mss_validate_selection "$1" 2>/dev/null || return 0
+    for b in $_MSS_PICK_NAMES; do
+        n=$((n + 1))
+        case ",$1," in *",$b,"*) out="$out,$n" ;; esac
+    done
+    printf '%s\n' "${out#,}"
 }
 
+# _mss_pick_num_to_sel <answer>: the selection, in menu order.
 _mss_pick_num_to_sel() {
-    case $1 in
-        1) echo ollama ;;
-        2) echo ollama,llamacpp ;;
-        3) echo ollama,ds4 ;;
-        4) echo llamacpp ;;
-        5) echo ds4 ;;
-    esac
+    local a n=0 out="" b
+    a=$(printf '%s' "$1" | tr -d ' ')
+    for b in $_MSS_PICK_NAMES; do
+        n=$((n + 1))
+        case ",$a," in *",$n,"*) out="$out,$b" ;; esac
+    done
+    printf '%s\n' "${out#,}"
 }
 
-_mss_pick_optional_of() {
-    case ",$1," in
-        *,llamacpp,*) echo llamacpp ;;
-        *,ds4,*) echo ds4 ;;
-        *) echo "" ;;
-    esac
+# _mss_pick_sel_add <selection> <backend>: the selection with it, in menu order.
+_mss_pick_sel_add() {
+    local b out=""
+    for b in $_MSS_PICK_NAMES; do
+        case ",$1,$2," in *",$b,"*) out="$out,$b" ;; esac
+    done
+    printf '%s\n' "${out#,}"
 }
 
 _mss_pick_local_ipv4() {
@@ -449,7 +483,7 @@ _mss_pick_model() {
         _mss_pick_sha "$(mss_resolve_path "$MSS_ANSWER")" "$P"
         return 0
     fi
-    mss_pick_model_menu "$b" 1
+    mss_pick_model_menu "$b" "$MSS_PICK_LATER"
 }
 
 # ── Ollama starter (M2), after the Ollama service is loaded ────────────────────
@@ -661,14 +695,75 @@ _mss_pick_host_choices() {
     fi
 }
 
+# ── MLX-Serve (#1 D8) ──────────────────────────────────────────────────────────
+# A saved or found mlx-serve is used when it is exactly the pinned version. A
+# different version is named and the path asked; with none found, Homebrew is
+# offered. The model is a native MLX checkpoint directory; the port is kept.
+_mss_pick_mlx() {
+    local found bin="" mism=0 def
+    found=$(printenv MLX_BIN)
+    [ -n "$found" ] || found=$(command -v mlx-serve 2>/dev/null)
+    if [ -n "$found" ]; then
+        if _mss_pick_mlx_bin_valid "$found"; then
+            bin=$found
+            echo "Using mlx-serve: $found" >&2
+        else
+            mism=1
+        fi
+    fi
+    if [ -z "$bin" ] && [ "$mism" = 0 ]; then
+        if _mss_pick_need_brew; then
+            echo "mlx-serve comes from a Homebrew tap: $(mss_mlx_brew_cmd)" >&2
+            mss_ask_yn "Install mlx-serve with Homebrew?" N
+            if [ "$MSS_ANSWER" = y ] && mss_acquire_mlx_brew && _mss_pick_mlx_bin_valid "$MLX_BIN"; then
+                bin=$MLX_BIN
+            fi
+        fi
+        [ -n "$bin" ] || echo "manual: $(mss_mlx_brew_cmd)" >&2
+    fi
+    if [ -z "$bin" ]; then
+        mss_ask "mlx-serve $MSS_MLX_SERVE_VERSION binary path" "" _mss_pick_mlx_bin_valid
+        bin=$MSS_ANSWER
+    fi
+    _mss_pick_set MLX_BIN "$bin"
+    mss_ask "MLX model directory (config.json and *.safetensors)" "$(printenv MLX_MODEL_DIR)" _mss_pick_mlx_dir_valid
+    _mss_pick_set MLX_MODEL_DIR "$MSS_ANSWER"
+    echo "mlx listens on 127.0.0.1 only" >&2
+    def=$(printenv MLX_PORT)
+    _mss_pick_set MLX_PORT "${def:-11234}"
+}
+
+# ── the active optional backend (#1 D8 step 4) ─────────────────────────────────
+# Asked only with two or more optional backends: which one runs now, or none.
+_mss_pick_active() {
+    local opts=$1 current=$2 b n=0 line def=1 choice
+    line="Which optional backend should run now?"
+    for b in $opts; do
+        n=$((n + 1))
+        line="$line $n) $b"
+        [ "$b" != "$current" ] || def=$n
+    done
+    n=$((n + 1))
+    line="$line $n) none"
+    [ "$current" != none ] || def=$n
+    MSS_PICK_MENU_MAX=$n
+    mss_ask "$line" "$def" _mss_pick_num_valid
+    choice=$MSS_ANSWER
+    n=0
+    for b in $opts none; do
+        n=$((n + 1))
+        [ "$n" = "$choice" ] && { _mss_pick_set MSS_ACTIVE_BACKEND "$b"; return 0; }
+    done
+}
+
 # ── summary ────────────────────────────────────────────────────────────────────
 _mss_pick_summary() {
-    local sel=$1 b=$2 P
+    local sel=$1 active=$2 remove=$3 b P state
     echo >&2
     echo "Selection: $sel" >&2
     case ",$sel," in
         *,ollama,*)
-            echo "  ollama: the Ollama service is (re)installed and restarted" >&2
+            echo "  ollama: the Ollama service is (re)installed; it restarts only when its plist changes" >&2
             [ -z "$(printenv OLLAMA_BIN)" ] || echo "  ollama binary: $(printenv OLLAMA_BIN)" >&2
             ;;
     esac
@@ -677,35 +772,40 @@ _mss_pick_summary() {
     mss_power_summary_line >&2
     mss_docker_install_summary_line >&2
     mss_docker_autostart_summary_line >&2
-    if [ -n "$b" ]; then
+    # One line per optional backend: active or standby, binary, model, address.
+    for b in $(mss_optional_backends "$sel"); do
         P=$(mss_prefix "$b")
-        echo "  $b binary:  $(printenv "${P}_BIN")" >&2
+        [ "$b" = "$active" ] && state=active || state=standby
+        if [ "$b" = mlx ]; then
+            echo "  mlx: $state, $(printenv MLX_BIN), $(printenv MLX_MODEL_DIR), 127.0.0.1:$(printenv MLX_PORT)" >&2
+            continue
+        fi
         if [ "$(printenv MSS_DEFER_MODEL)" = yes ]; then
-            echo "  $b model:   later (scripts/model.sh)" >&2
+            echo "  $b: $state, $(printenv "${P}_BIN"), model later (scripts/model.sh), $(printenv "${P}_HOST"):$(printenv "${P}_PORT")" >&2
         else
-            echo "  $b model:   $(printenv "${P}_MODEL")" >&2
-            echo "  $b sha256:  $(printenv "${P}_MODEL_SHA256")" >&2
+            echo "  $b: $state, $(printenv "${P}_BIN"), $(printenv "${P}_MODEL"), $(printenv "${P}_HOST"):$(printenv "${P}_PORT")" >&2
+            echo "    sha256: $(printenv "${P}_MODEL_SHA256")" >&2
         fi
-        echo "  $b listens: $(printenv "${P}_HOST"):$(printenv "${P}_PORT")" >&2
         if ! mss_is_loopback_host "$(printenv "${P}_HOST")"; then
-            [ -z "$(printenv "${P}_ALLOW_FROM")" ] || echo "  allowed:   $(printenv "${P}_ALLOW_FROM")" >&2
+            [ -z "$(printenv "${P}_ALLOW_FROM")" ] || echo "    allowed: $(printenv "${P}_ALLOW_FROM")" >&2
             [ "$b" != llamacpp ] || [ -z "$(printenv LLAMACPP_API_KEY_FILE)" ] \
-                || echo "  key file:  $(printenv LLAMACPP_API_KEY_FILE)" >&2
+                || echo "    key file: $(printenv LLAMACPP_API_KEY_FILE)" >&2
         fi
-    fi
+    done
+    [ -z "$remove" ] || echo "  remove after the check: $remove" >&2
     echo >&2
 }
 
 # mss_picker_run <env file> <installed selection> <installed optional> <configure-only 0|1>
-# Asks, confirms, handles the switch question and saves the file. Exits on a
-# declined confirmation or a declined switch.
+# Asks, confirms and saves the file. Exits on a declined confirmation.
 mss_picker_run() {
     local file=$1 installed_sel=$2 installed_opt=$3 only=$4
-    local env_sel def num sel b
+    local env_sel env_active def num sel b opts n installed current remove=""
     mss_pick_trap
 
     # Environment values are the defaults, ahead of the saved file.
     env_sel=$(printenv MSS_BACKENDS)
+    env_active=$(printenv MSS_ACTIVE_BACKEND)
     if [ -e "$file" ] || [ -L "$file" ]; then
         mss_envfile_load "$file" || exit 1
     fi
@@ -717,33 +817,70 @@ mss_picker_run() {
     # and nothing saved (#27 r2).
     mss_choices_resolve || exit 1
 
-    # 1. menu
+    # 1. menu: the default comes from the environment, the installed conf,
+    #    the saved file, then 1.
     def=$(_mss_pick_sel_to_num "$env_sel")
     [ -n "$def" ] || def=$(_mss_pick_sel_to_num "$installed_sel")
     [ -n "$def" ] || def=$(_mss_pick_sel_to_num "$(printenv MSS_BACKENDS)")
     [ -n "$def" ] || def=1
-    echo "Which backends should this Mac run?" >&2
+    echo "Which backends should this Mac run? (numbers, comma-separated)" >&2
     echo "  1) ollama" >&2
-    echo "  2) ollama + llama.cpp" >&2
-    echo "  3) ollama + ds4" >&2
-    echo "  4) llama.cpp only" >&2
-    echo "  5) ds4 only" >&2
+    echo "  2) llama.cpp" >&2
+    echo "  3) ds4" >&2
+    echo "  4) mlx (MLX-Serve, loopback only)" >&2
     mss_ask "Choose" "$def" _mss_pick_menu_valid
     num=$MSS_ANSWER
     sel=$(_mss_pick_num_to_sel "$num")
+
+    # 2. an installed optional backend left out is removed only on a y.
+    installed=$(mss_optional_backends "$installed_sel")
+    if [ -n "$installed_opt" ]; then
+        case " $installed " in *" $installed_opt "*) ;; *) installed="$installed $installed_opt" ;; esac
+    fi
+    for b in $installed; do
+        case ",$sel," in *",$b,"*) continue ;; esac
+        mss_ask_yn "$b is installed. Remove it now with sudo scripts/uninstall.sh --backend $b? Its model files and saved answers are kept." N
+        if [ "$MSS_ANSWER" = y ]; then
+            # shellcheck disable=SC2034  # read by install.sh
+            MSS_PICKER_REPLACE=${MSS_PICKER_REPLACE:+$MSS_PICKER_REPLACE,}$b
+            if [ "$only" != 1 ]; then
+                # shellcheck disable=SC2034  # read by install.sh
+                MSS_SWITCH_FROM=${MSS_SWITCH_FROM:+$MSS_SWITCH_FROM,}$b
+                remove="${remove:+$remove }$b"
+            fi
+        else
+            sel=$(_mss_pick_sel_add "$sel" "$b")
+            echo "kept installed: $b" >&2
+        fi
+    done
     mss_validate_selection "$sel" || exit 1
     _mss_pick_set MSS_BACKENDS "$sel"
-    b=$(_mss_pick_optional_of "$sel")
+    opts=$(mss_optional_backends "$sel")
+    n=$(mss_count_words "$opts")
+    [ "$n" -lt 2 ] || MSS_PICK_LATER=0
+    # A model "later" is single-backend only; a saved one is cleared here.
+    [ "$n" -lt 2 ] || _mss_pick_set MSS_DEFER_MODEL ""
 
+    # 3. each optional backend, in menu order
     case ",$sel," in *,ollama,*) _mss_pick_ollama ;; esac
-    [ -z "$b" ] || _mss_pick_backend "$b"
+    for b in $opts; do
+        if [ "$b" = mlx ]; then _mss_pick_mlx; else _mss_pick_backend "$b"; fi
+    done
+
+    # 4. which optional backend runs now
+    if [ "$n" -ge 2 ]; then
+        current=$env_active
+        [ -n "$current" ] || current=$(printenv MSS_ACTIVE_BACKEND)
+        [ -n "$current" ] || current=$installed_opt
+        _mss_pick_active "$opts" "$current"
+    else
+        _mss_pick_set MSS_ACTIVE_BACKEND ""
+    fi
     _mss_pick_tweaks
 
-    # 6b. host choices (#27)
+    # 5. host choices (#27), then the summary and confirmation
     _mss_pick_host_choices
-
-    # 7. summary and confirmation
-    _mss_pick_summary "$sel" "$b"
+    _mss_pick_summary "$sel" "$(mss_active_backend "$sel" "$(printenv MSS_ACTIVE_BACKEND)" 2>/dev/null)" "$remove"
     if [ "$only" = 1 ]; then
         mss_ask_yn "Save?" Y
     else
@@ -754,22 +891,7 @@ mss_picker_run() {
         exit 1
     fi
 
-    # Switching: the installed optional backend differs from the new choice.
-    if [ -n "$installed_opt" ] && [ "$installed_opt" != "$b" ]; then
-        # shellcheck disable=SC2034  # read by install.sh
-        MSS_PICKER_REPLACE=$installed_opt
-        if [ "$only" != 1 ]; then
-            mss_ask_yn "$installed_opt is installed. Remove it first with sudo scripts/uninstall.sh --backend $installed_opt?" N
-            if [ "$MSS_ANSWER" != y ]; then
-                mss_envfile_write "$file" || exit 1
-                echo "Saved $file. Nothing was installed: $installed_opt is still installed." >&2
-                exit 1
-            fi
-            # shellcheck disable=SC2034  # read by install.sh
-            MSS_SWITCH_FROM=$installed_opt
-        fi
-    fi
-
+    # 6. save; the final root pass saves the installed answers again under its lock.
     mss_envfile_write "$file" || exit 1
     echo "Saved $file" >&2
     trap 'exit 130' INT

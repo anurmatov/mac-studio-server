@@ -1,5 +1,5 @@
 #!/bin/sh
-# status.sh — health report for the selected backends (#9).
+# status.sh — health report for the selected backends (#9, #1).
 # Exit 0 only if every selected backend is healthy. Never prints a key.
 # With sudo, also verifies pf (enabled, referenced, full rule count) whenever a
 # backend is LAN-bound.
@@ -26,18 +26,27 @@ has_conf() { [ -r "$MSS_CONF" ]; }
 healthy() { printf '  %-10s %s\n' "$1" "$2"; }
 unhealthy() { printf '  %-10s %s\n' "$1" "$2"; fail=1; }
 
+# The standby plists and the commit journal live beside the conf.
+ETC_DIR=$(dirname "$MSS_CONF")
+DB_DIR=/var/db/mac-studio-server
+
 check_backend() {
     _b=$1
-    _upper=$(echo "$_b" | tr '[:lower:]' '[:upper:]')
-    _host=$(conf_get "${_upper}_HOST"); _host=${_host:-127.0.0.1}
-    _port=$(conf_get "${_upper}_PORT"); _port=${_port:-$( [ "$_b" = ds4 ] && echo 8000 || echo 8080 )}
+    _upper=$(mss_backend_prefix "$_b")
+    if [ "$_b" = mlx ]; then _host=127.0.0.1; else _host=$(conf_get "${_upper}_HOST"); _host=${_host:-127.0.0.1}; fi
+    _port=$(conf_get "${_upper}_PORT"); _port=${_port:-$(mss_default_port "$_b")}
     _label="com.mac-studio-server.$_b"
     _lan=no; mss_is_loopback_host "$_host" || _lan=yes
 
     echo "$_b (host=$_host port=$_port lan-bound=$_lan):"
 
-    _state=$(launchctl print "system/$_label" 2>/dev/null | sed -n 's/^[[:space:]]*state = \(.*\)$/\1/p' | head -n 1)
+    _print=$(launchctl print "system/$_label" 2>/dev/null)
+    _state=$(printf '%s\n' "$_print" | sed -n 's/^[[:space:]]*state = \(.*\)$/\1/p' | head -n 1)
     [ -n "$_state" ] && healthy launchd "$_state" || unhealthy launchd "not loaded"
+    if [ "$_b" = mlx ]; then
+        _pid=$(printf '%s\n' "$_print" | sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\).*/\1/p' | head -n 1)
+        [ -z "$_pid" ] || healthy pid "$_pid"
+    fi
 
     if lsof -nP -iTCP:"$_port" -sTCP:LISTEN >/dev/null 2>&1; then
         healthy listener "listening on $_host:$_port"
@@ -46,8 +55,8 @@ check_backend() {
     fi
 
     case $_b in
-        ds4)      _path=/v1/models ;;
-        llamacpp) _path=/health ;;
+        ds4)          _path=/v1/models ;;
+        llamacpp|mlx) _path=/health ;;
     esac
     if _code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://$_host:$_port$_path" 2>/dev/null); then
         # llama-server returns 503 while loading; that is healthy-but-loading.
@@ -55,8 +64,17 @@ check_backend() {
     else
         unhealthy health "no response on $_path"
     fi
+    # mlx-serve answers /health before its model is resolved: ready is a model
+    # row with "state":"ready" in /v1/models; anything else is still loading.
+    if [ "$_b" = mlx ]; then
+        _models=$(curl -s --max-time 5 "http://127.0.0.1:$_port/v1/models" 2>/dev/null)
+        case $_models in
+            *'"state":"ready"'*|*'"state": "ready"'*) healthy model "ready" ;;
+            *) healthy model "loading" ;;
+        esac
+    fi
 
-    if [ -e /var/db/mac-studio-server/guard.tripped ]; then
+    if [ -e "$DB_DIR/guard.tripped" ]; then
         unhealthy guard "trip marker present"
     else
         healthy guard "no trip marker"
@@ -64,6 +82,23 @@ check_backend() {
 
     _last=$(tail -n 1 /var/log/mac-studio-server/guard.jsonl 2>/dev/null)
     [ -n "$_last" ] && healthy sample "$_last" || unhealthy sample "no guard samples yet"
+}
+
+# A standby backend is installed but never loaded: its plist sits in standby/,
+# where launchd does not look, and its stamp is kept for the next activation.
+check_standby() {
+    _b=$1
+    _label="com.mac-studio-server.$_b"
+    echo "$_b:"
+    if launchctl print "system/$_label" >/dev/null 2>&1; then
+        unhealthy standby "standby but loaded (sudo launchctl bootout system/$_label)"
+    elif [ ! -e "$ETC_DIR/standby/$_label.plist" ]; then
+        unhealthy standby "standby plist missing"
+    elif [ ! -e "$DB_DIR/$_b.model.verified" ]; then
+        unhealthy standby "standby stamp missing"
+    else
+        healthy standby "standby (not running; scripts/backend.sh activate $_b)"
+    fi
 }
 
 # Ollama
@@ -82,19 +117,63 @@ case ",$_sel," in
         ;;
 esac
 
-# Optional backend
-_opt=$(conf_get MSS_GUARD_BACKEND)
-if [ -n "$_opt" ]; then
-    # Installed without a model (M3): no backend or guard job exists yet.
-    if [ "$(conf_get MSS_MODEL_STATE)" = waiting ]; then
-        echo "$_opt: waiting for a model (run scripts/model.sh)"
-    else
-        check_backend "$_opt"
-    fi
+if [ -e "$ETC_DIR/commit.journal" ]; then
+    echo "install:"
+    unhealthy install "interrupted install (re-run the install to finish it)"
+fi
 
+# Optional backends: one row per selected one, active or standby.
+_opt=$(conf_get MSS_GUARD_BACKEND)
+_all=$(mss_optional_backends "$_sel")
+[ -z "$_opt" ] || case " $_all " in *" $_opt "*) ;; *) _all="$_opt $_all" ;; esac
+for _b in $_all; do
+    if [ "$_b" = "$_opt" ]; then
+        # Installed without a model (M3): no backend or guard job exists yet.
+        if [ "$(conf_get MSS_MODEL_STATE)" = waiting ]; then
+            echo "$_opt: waiting for a model (run scripts/model.sh)"
+        else
+            check_backend "$_opt"
+        fi
+    else
+        check_standby "$_b"
+    fi
+done
+if [ -n "$_all" ] && [ -z "$_opt" ]; then
+    echo "optional:"
+    healthy active "no optional backend active"
+fi
+
+# Any model server that is not the active job is outside the guard's view.
+if [ -n "$_all" ]; then
+    # A running active job whose PID this user cannot read could be any of
+    # them; a job that is not running is none of them.
+    _apid=""; _arunning=0
+    if [ -n "$_opt" ]; then
+        _aprint=$(launchctl print "system/com.mac-studio-server.$_opt" 2>/dev/null)
+        _apid=$(printf '%s\n' "$_aprint" | sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\).*/\1/p' | head -n 1)
+        printf '%s\n' "$_aprint" | grep -q '^[[:space:]]*state = running' && _arunning=1
+    fi
+    if ! _servers=$(mss_model_servers); then
+        echo "servers:"; unhealthy servers "pgrep is missing; cannot check for other model servers"
+    else
+        _hdr=0; _hint=0
+        while read -r _sn _sp; do
+            [ -n "$_sp" ] || continue
+            if [ -n "$_apid" ] && mss_pid_under "$_sp" "$_apid"; then continue; fi
+            if [ -z "$_apid" ] && [ "$_arunning" = 1 ]; then _hint=1; continue; fi
+            [ "$_hdr" = 1 ] || { echo "servers:"; _hdr=1; }
+            unhealthy unmanaged "unmanaged $_sn pid $_sp (not guarded)"
+        done <<MSS_SERVERS_EOF
+$_servers
+MSS_SERVERS_EOF
+        [ "$_hint" = 0 ] || echo "  (run with sudo to check for unmanaged servers)"
+    fi
+fi
+
+if [ -n "$_opt" ]; then
     # pf checks (sudo only): enabled, referenced by the main ruleset, and the
     # anchor rule count equals the rendered MSS_PF_RULE_COUNT.
-    _host=$(conf_get "$(echo "$_opt" | tr '[:lower:]' '[:upper:]')_HOST")
+    _host=$(conf_get "$(mss_backend_prefix "$_opt")_HOST")
     _host=${_host:-127.0.0.1}
     _count=$(conf_get MSS_PF_RULE_COUNT); _count=${_count:-0}
     if ! mss_is_loopback_host "$_host" && [ "$_count" != 0 ]; then
@@ -117,7 +196,7 @@ if [ -n "$_opt" ]; then
             echo "  (run with sudo for pf checks)"
         fi
     fi
-else
+elif [ -z "$_all" ]; then
     [ -r "$MSS_CONF" ] || [ "$_sel" = ollama ] || { echo "no backends.conf found and no optional backend installed"; exit 1; }
 fi
 

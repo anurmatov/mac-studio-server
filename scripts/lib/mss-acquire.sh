@@ -13,7 +13,7 @@ MSS_BREW_INSTALLER=https://raw.githubusercontent.com/Homebrew/install/HEAD/insta
 # The file a download in this run created, for the sha-mismatch rename (D6).
 MSS_DOWNLOADED=""
 
-mss_prefix() { case $1 in llamacpp) echo LLAMACPP ;; ds4) echo DS4 ;; esac; }
+mss_prefix() { case $1 in llamacpp) echo LLAMACPP ;; ds4) echo DS4 ;; mlx) echo MLX ;; esac; }
 
 # ── catalogue (D4) ─────────────────────────────────────────────────────────────
 mss_catalog_file() { printf '%s\n' "${MSS_CATALOG:-$REPO_DIR/config/models.catalog}"; }
@@ -218,6 +218,22 @@ mss_acquire_llamacpp_brew() {
     [ -x "$LLAMACPP_BIN" ] || return 1
     export LLAMACPP_BIN
     echo "llama-server: $("$LLAMACPP_BIN" --version 2>&1 | grep -m 1 -i 'version' || echo 'version unknown')" >&2
+}
+
+# MLX-Serve from its Homebrew tap (#1 D8). The tap tracks upstream main, so
+# the installed version is checked by the probe, never assumed.
+MSS_MLX_TAP=ddalcu/mlx-serve
+MSS_MLX_TAP_URL=https://github.com/ddalcu/mlx-serve
+mss_mlx_brew_cmd() { printf '%s\n' "brew tap $MSS_MLX_TAP $MSS_MLX_TAP_URL && brew install $MSS_MLX_TAP/mlx-serve"; }
+
+mss_acquire_mlx_brew() {
+    local brew
+    brew=$(mss_brew) || return 1
+    HOMEBREW_NO_ASK=1 "$brew" tap "$MSS_MLX_TAP" "$MSS_MLX_TAP_URL" </dev/null >&2 || return 1
+    HOMEBREW_NO_ASK=1 "$brew" install "$MSS_MLX_TAP/mlx-serve" </dev/null >&2 || return 1
+    MLX_BIN="$("$brew" --prefix)/bin/mlx-serve"
+    [ -x "$MLX_BIN" ] || return 1
+    export MLX_BIN
 }
 
 # ── ds4-server at the pinned commit (D1, D2) ───────────────────────────────────

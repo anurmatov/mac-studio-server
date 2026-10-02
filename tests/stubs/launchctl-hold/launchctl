@@ -1,0 +1,7 @@
+#!/bin/sh
+# launchctl for MB16: bootout of $MSS_STUB_HOLD_LABEL (default the ds4 label)
+# does nothing, so that job never stops; anything else is the real launchctl.
+if [ "${1:-}" = bootout ] && [ "${2:-}" = "system/${MSS_STUB_HOLD_LABEL:-com.mac-studio-server.ds4}" ]; then
+    exit 0
+fi
+exec /bin/launchctl "$@"

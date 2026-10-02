@@ -1,5 +1,5 @@
 #!/bin/sh
-# mss-guard.sh — memory guard for the ONE optional backend (#9 D5).
+# mss-guard.sh — memory guard for the ONE active optional backend (#9 D5, #1).
 # Root, launched by com.mac-studio-server.guard every 60 s (plus RunAtLoad).
 # NEVER targets Ollama. Sampling failures are sample_error events and take no
 # action. Flags: --simulate-trip, --rotate-now, --evaluate FILE (pure, non-root).
@@ -79,15 +79,21 @@ rotate_log() {
     : > "$_file"
 }
 
+# trip <reason> [pid]: the marker first, then the bootout (#1 D6). A start that
+# races the trip sees the marker and refuses, and a failed bootout is recorded;
+# the next sample trips again. The guard never waits for the lifecycle lock: a
+# safety stop must not queue behind an install.
 trip() {
-    _reason=$1
-    launchctl bootout "system/$BOOTSTRAP_LABEL.$_backend" 2>/dev/null || true
+    _reason=$1; _tpid=${2:-none}
+    _tlabel="$BOOTSTRAP_LABEL.$_backend"
     _tmp="${TRIP_MARKER}.$$"
-    printf '%s\n' "$_reason" > "$_tmp"
+    printf '%s; label=%s pid=%s\n' "$_reason" "$_tlabel" "$_tpid" > "$_tmp"
     chown root:wheel "$_tmp"
     chmod 0644 "$_tmp"
     mv "$_tmp" "$TRIP_MARKER"
-    log_event "trip" "$_reason"
+    launchctl bootout "system/$_tlabel" 2>/dev/null
+    _trc=$?
+    log_event "trip" "$_reason; label=$_tlabel pid=$_tpid; bootout_rc=$_trc"
     echo "$LABEL: TRIPPED — $_reason; sudo $LIBEXEC_DIR/mss-enable.sh recovers"
 }
 
@@ -148,7 +154,7 @@ case "${1:-}" in
         ;;
     --simulate-trip)
         [ "$(id -u)" -eq 0 ] || mss_die "--simulate-trip must run as root"
-        trip "simulate-trip (operator drill)"
+        trip "simulate-trip (operator drill)" "$(backend_pid || echo none)"
         exit 0
         ;;
     --rotate-now)
@@ -217,8 +223,8 @@ printf '{"ts":"%s","event":"sample","backend":"%s","pid":%s,"free_pct":%s,"swap_
 # ── trip decision (same code path as --evaluate) ───────────────────────────────
 decision=$(mss_guard_evaluate "$GUARD_LOG")
 case $decision in
-    trip:free) trip "free_pct below $FREE_PCT for $STREAK consecutive samples" ;;
-    trip:swap) trip "swap exceeded baseline+$SWAP_HEADROOM_MB MB for $STREAK consecutive samples" ;;
+    trip:free) trip "free_pct below $FREE_PCT for $STREAK consecutive samples" "$pid" ;;
+    trip:swap) trip "swap exceeded baseline+$SWAP_HEADROOM_MB MB for $STREAK consecutive samples" "$pid" ;;
 esac
 
 # ── rotation after the decision, so the fresh samples stay in the live file ────

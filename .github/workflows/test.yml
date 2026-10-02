@@ -10,11 +10,11 @@ jobs:
   tests:
     # macOS arm64: BSD userland, launchd, pfctl and plutil are all real here.
     runs-on: macos-14
-    timeout-minutes: 40
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
-          # render parity (A1) compares against the 1.3.0 merge commit
+          # render parity (A1, MA7) compares against the 1.3.0 and 1.6.0 commits
           fetch-depth: 0
 
       - name: Install shellcheck
@@ -25,7 +25,7 @@ jobs:
           test -x /usr/bin/expect || { echo "ERROR: /usr/bin/expect is missing; the picker tests need it"; exit 1; }
           /bin/bash --version | head -1
           /bin/bash --version | head -1 | grep -q 'version 3\.2' || { echo "ERROR: /bin/bash is not 3.2"; exit 1; }
-          if grep -nE 'declare -A|mapfile|readarray|,,\}|\^\^\}' scripts/install.sh scripts/model.sh scripts/lib/*.sh; then
+          if grep -nE 'declare -A|mapfile|readarray|,,\}|\^\^\}' scripts/install.sh scripts/model.sh scripts/backend.sh scripts/lib/*.sh; then
             echo "ERROR: bash 4 feature found"; exit 1
           fi
 
@@ -53,7 +53,9 @@ jobs:
         if: failure()
         run: |
           sudo launchctl print system/com.mac-studio-server.ds4 || true
-          sudo sh -c 'tail -n 50 /var/log/mac-studio-server/*.log /var/log/mac-studio-server/guard.jsonl' || true
+          sudo launchctl print system/com.mac-studio-server.mlx || true
+          sudo cat /usr/local/etc/mac-studio-server/commit.journal /var/run/com.mac-studio-server.lock.owner || true
+          sudo sh -c 'tail -n 50 /var/log/mac-studio-server/*.log /var/log/mac-studio-server/mlx.log /var/log/mac-studio-server/guard.jsonl' || true
 
   real-llama-server:
     runs-on: macos-14
@@ -163,7 +165,7 @@ jobs:
           T=$(printf '\t')
           # The #27 host prompts depend on the runner (pmset, colima, docker), so
           # host-steps.sh lists the ones this Mac will show, each answered with Enter.
-          { printf '%s\n' "Choose [1]: ${T}4" "brew install llama.cpp)? [y/N]: ${T}y" "later [1]: ${T}2" \
+          { printf '%s\n' "Choose [1]: ${T}2" "brew install llama.cpp)? [y/N]: ${T}y" "later [1]: ${T}2" \
               "Save the model to [${HOME}/models/stories260K.gguf]: ${T}@ENTER" "free)? [y/N]: ${T}y" \
               "LAN access to llamacpp? [y/N]: ${T}@ENTER" "auto-updates)? ${T}n"
             sh tests/expect/host-steps.sh
@@ -272,7 +274,7 @@ jobs:
           P=$(printf '%s\n' "$PATH" | tr ':' '\n' | while IFS= read -r d; do [ -x "$d/ollama" ] || printf '%s:' "$d"; done)
           T=$(printf '\t')
           # host-steps.sh: the #27 host prompts this runner will show, with the PATH install.sh gets.
-          { printf '%s\n' "Choose [1]: ${T}2" "(brew install ollama)? [y/N]: ${T}y" "brew install llama.cpp)? [y/N]: ${T}y" \
+          { printf '%s\n' "Choose [1]: ${T}1,2" "(brew install ollama)? [y/N]: ${T}y" "brew install llama.cpp)? [y/N]: ${T}y" \
               "later [1]: ${T}2" "Save the model to [${HOME}/models/stories260K.gguf]: ${T}@ENTER" "free)? [y/N]: ${T}y" \
               "LAN access to llamacpp? [y/N]: ${T}@ENTER" "auto-updates)? ${T}n"
             PATH="${P%:}" sh tests/expect/host-steps.sh

@@ -1,0 +1,9 @@
+#!/bin/sh
+# mv for MB27: a move to $MSS_STUB_SLOW_DEST waits 5 s first and logs the time
+# it finished to /tmp/mss-stub-mv-slow.log. Anything else is the real mv.
+for _last in "$@"; do :; done
+[ "${_last:-}" = "${MSS_STUB_SLOW_DEST:-}" ] || exec /bin/mv "$@"
+sleep 5
+/bin/mv "$@"; _rc=$?
+date +%s >> /tmp/mss-stub-mv-slow.log
+exit "$_rc"

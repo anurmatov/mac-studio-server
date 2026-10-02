@@ -5,6 +5,7 @@
 #   scripts/model.sh --catalog ID [--dest FILE]
 #   scripts/model.sh --path FILE --sha256 HEX
 #   scripts/model.sh --url URL --sha256 HEX [--dest FILE]
+#   any of the above with --backend llamacpp|ds4 (required when both are selected)
 #
 # Needs a terminal and a backends.env with llamacpp or ds4. Downloads as the
 # user, saves the model and sha256 to backends.env, then asks for the password
@@ -21,7 +22,7 @@ mss_host_root_guard
 
 mss_model_usage() {
     cat >&2 <<'USAGE'
-usage: scripts/model.sh [--catalog ID [--dest FILE] | --path FILE --sha256 HEX | --url URL --sha256 HEX [--dest FILE]]
+usage: scripts/model.sh [--backend llamacpp|ds4] [--catalog ID [--dest FILE] | --path FILE --sha256 HEX | --url URL --sha256 HEX [--dest FILE]]
 USAGE
 }
 
@@ -31,14 +32,14 @@ if ! [ -t 0 ] || ! [ -t 2 ]; then
     exit 2
 fi
 
-M_CATALOG="" M_PATH="" M_URL="" M_SHA="" M_DEST=""
+M_CATALOG="" M_PATH="" M_URL="" M_SHA="" M_DEST="" M_BACKEND=""
 while [ $# -gt 0 ]; do
     case $1 in
-        --catalog|--path|--url|--sha256|--dest)
+        --catalog|--path|--url|--sha256|--dest|--backend)
             [ $# -ge 2 ] || { mss_model_usage; exit 2; }
             case $1 in
                 --catalog) M_CATALOG=$2 ;; --path) M_PATH=$2 ;; --url) M_URL=$2 ;;
-                --sha256) M_SHA=$2 ;; --dest) M_DEST=$2 ;;
+                --sha256) M_SHA=$2 ;; --dest) M_DEST=$2 ;; --backend) M_BACKEND=$2 ;;
             esac
             shift 2 ;;
         -h|--help) mss_model_usage; exit 0 ;;
@@ -52,10 +53,12 @@ if [ -n "$M_PATH" ] || [ -n "$M_URL" ]; then
     [ -n "$M_SHA" ] || { echo "model.sh: --path and --url need --sha256" >&2; exit 2; }
 fi
 [ -z "$M_DEST" ] || [ -n "$M_CATALOG" ] || [ -n "$M_URL" ] || { echo "model.sh: --dest goes with --catalog or --url" >&2; exit 2; }
+case $M_BACKEND in ''|llamacpp|ds4) ;; *) echo "model.sh: --backend is llamacpp or ds4" >&2; exit 2 ;; esac
 [ "$(id -u)" -ne 0 ] || { echo "model.sh: run it as your user; it calls sudo itself" >&2; exit 1; }
 mss_host_root_guard
 
 MSS_ENV_FILE=${MSS_ENV_FILE:-$REPO_DIR/backends.env}
+case $MSS_ENV_FILE in /*) ;; *) MSS_ENV_FILE=$(pwd)/$MSS_ENV_FILE ;; esac
 if [ ! -e "$MSS_ENV_FILE" ] && [ ! -L "$MSS_ENV_FILE" ]; then
     echo "model.sh: no $MSS_ENV_FILE; run scripts/install.sh --configure" >&2
     exit 1
@@ -69,11 +72,27 @@ mss_choices_resolve || exit 1
 mss_choices_check_format || exit 1
 mss_gpu_job_precheck || exit 1
 mss_validate_selection "$MSS_BACKENDS" || exit 1
-case ",$MSS_BACKENDS," in
-    *,llamacpp,*) B=llamacpp ;;
-    *,ds4,*) B=ds4 ;;
-    *) echo "model.sh: no llama.cpp or ds4 backend in $MSS_ENV_FILE; run scripts/install.sh --configure" >&2; exit 1 ;;
-esac
+# The GGUF backend this model is for (#1 D13): mlx models are directories.
+M_GGUF=""
+for b in llamacpp ds4; do mss_backend_selected "$b" && M_GGUF="$M_GGUF $b"; done
+M_GGUF=${M_GGUF# }
+if [ -n "$M_BACKEND" ]; then
+    case " $M_GGUF " in
+        *" $M_BACKEND "*) B=$M_BACKEND ;;
+        *) echo "model.sh: $M_BACKEND is not selected in $MSS_ENV_FILE (MSS_BACKENDS=$MSS_BACKENDS)" >&2; exit 1 ;;
+    esac
+elif [ -z "$M_GGUF" ] && mss_backend_selected mlx; then
+    echo "model.sh: mlx models are directories; set MLX_MODEL_DIR with scripts/install.sh --configure" >&2
+    exit 1
+elif [ -z "$M_GGUF" ]; then
+    echo "model.sh: no llama.cpp or ds4 backend in $MSS_ENV_FILE; run scripts/install.sh --configure" >&2
+    exit 1
+elif [ "$M_GGUF" = "llamacpp ds4" ]; then
+    echo "model.sh: llamacpp and ds4 are both selected; choose one with --backend llamacpp or --backend ds4" >&2
+    exit 1
+else
+    B=$M_GGUF
+fi
 P=$(mss_prefix "$B")
 
 # ── the model ──────────────────────────────────────────────────────────────────
@@ -132,5 +151,10 @@ if [ "$rc" != 0 ]; then
     [ "$rc" != 3 ] || mss_sha_mismatch_rename
     exit 1
 fi
+# The install saves MSS_BACKENDS and MSS_ACTIVE_BACKEND (as loaded) under its lock.
+# shellcheck disable=SC2034  # read by run_install_backends
+MSS_SAVE_ENVFILE=$MSS_ENV_FILE
+# shellcheck disable=SC2034
+MSS_SAVE_USER=$(id -un)
 run_install_backends || exit 1
 echo "$B: model $(printenv "${P}_MODEL") installed" >&2

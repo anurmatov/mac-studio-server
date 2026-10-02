@@ -1,0 +1,36 @@
+# ds4 runs; mlx is added on standby (runbook R1)
+active.cur ds4
+active.new ds4
+waiting.new no
+pf.new no
+loaded ds4
+loaded guard
+keys.boot.cur k-boot
+keys.boot.new k-boot
+keys.ds4.cur k-ds4
+keys.ds4.new k-ds4
+keys.guard.cur k-guard
+keys.guard.new k-guard
+keys.llamacpp.cur k-none
+keys.llamacpp.new k-none
+keys.mlx.cur k-none
+keys.mlx.new k-mlx
+plist.boot.cur absent -
+plist.boot.new absent -
+plist.ds4.cur top p-ds4
+plist.ds4.new top p-ds4
+plist.guard.cur top p-guard
+plist.guard.new top p-guard
+plist.llamacpp.cur absent -
+plist.llamacpp.new absent -
+plist.mlx.cur absent -
+plist.mlx.new standby p-mlx
+stamp.ds4.cur s-ds4
+stamp.ds4.new s-ds4
+stamp.llamacpp.cur -
+stamp.llamacpp.new -
+stamp.mlx.cur -
+stamp.mlx.new s-mlx
+pf.cur pf-0
+pf.new.sha pf-0
+marker missing

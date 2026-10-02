@@ -1,0 +1,19 @@
+#!/bin/sh
+# mv for MB18: when the destination (the last argument) is $MSS_STUB_KILL_DEST,
+# SIGKILL the lifecycle lock's holder (the installer) once, after the move or,
+# with MSS_STUB_KILL_WHEN=before, just before it. The move itself always
+# happens: it runs under mss_mut, which the keeper drains. Anything else is the
+# real mv.
+for _last in "$@"; do :; done
+_once=/tmp/mss-stub-mv-killed
+if [ "${_last:-}" != "${MSS_STUB_KILL_DEST:-}" ] || [ -e "$_once" ]; then exec /bin/mv "$@"; fi
+: > "$_once"
+_owner=${MSS_LOCK_FILE:-/var/run/com.mac-studio-server.lock}.owner
+_holder=$(sed -n 's/.* holder=\([0-9][0-9]*\)@.*/\1/p' "$_owner" 2>/dev/null)
+if [ "${MSS_STUB_KILL_WHEN:-after}" = before ]; then
+    [ -z "$_holder" ] || kill -9 "$_holder"
+    exec /bin/mv "$@"
+fi
+/bin/mv "$@"; _rc=$?
+[ -z "$_holder" ] || kill -9 "$_holder"
+exit "$_rc"

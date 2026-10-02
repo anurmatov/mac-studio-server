@@ -1,0 +1,8 @@
+#!/bin/sh
+# launchctl for MB17: bootstrap of $MSS_STUB_FAIL_LABEL's plist (default the
+# mlx label) exits 5; anything else is the real launchctl.
+if [ "${1:-}" = bootstrap ] && [ "$(basename "${3:-}" .plist)" = "${MSS_STUB_FAIL_LABEL:-com.mac-studio-server.mlx}" ]; then
+    echo "Bootstrap failed: 5: Input/output error (stub)" >&2
+    exit 5
+fi
+exec /bin/launchctl "$@"

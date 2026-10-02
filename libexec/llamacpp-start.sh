@@ -22,6 +22,16 @@ refuse() { echo "REFUSE: $1"; exit 78; }
 
 # refuse must run in this shell: inside $(...) it would only exit the subshell.
 [ -r "$(mss_conf_path)" ] || refuse "conf missing ($(mss_conf_path))"
+
+# Only the active backend starts (#1 D4).
+ACTIVE=$(mss_conf_get MSS_GUARD_BACKEND)
+[ "$ACTIVE" = "$BACKEND" ] || refuse "$BACKEND is not the active backend (active: ${ACTIVE:-none})"
+
+# No other model server, managed or not: this runs before our own exec, so any
+# match is another server, and the guard watches only one process.
+_srv=$(mss_model_servers) || refuse "pgrep is missing; cannot check for other model servers"
+_srv=$(printf '%s\n' "$_srv" | head -n 1)
+[ -z "$_srv" ] || refuse "model server already running (${_srv%% *} pid ${_srv#* })"
 BIN=$(mss_conf_get LLAMACPP_BIN)
 [ -n "$BIN" ] || refuse "conf missing LLAMACPP_BIN"
 MODEL=$(mss_conf_get LLAMACPP_MODEL)

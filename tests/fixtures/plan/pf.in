@@ -1,0 +1,37 @@
+# only the pf allowlist changed
+active.cur ds4
+active.new ds4
+waiting.new no
+pf.new yes
+loaded ds4
+loaded guard
+loaded boot
+keys.boot.cur k-boot
+keys.boot.new k-boot
+keys.ds4.cur k-ds4
+keys.ds4.new k-ds4
+keys.guard.cur k-guard
+keys.guard.new k-guard
+keys.llamacpp.cur k-none
+keys.llamacpp.new k-none
+keys.mlx.cur k-none
+keys.mlx.new k-none
+plist.boot.cur top p-boot
+plist.boot.new top p-boot
+plist.ds4.cur top p-ds4
+plist.ds4.new top p-ds4
+plist.guard.cur top p-guard
+plist.guard.new top p-guard
+plist.llamacpp.cur absent -
+plist.llamacpp.new absent -
+plist.mlx.cur absent -
+plist.mlx.new absent -
+stamp.ds4.cur s-ds4
+stamp.ds4.new s-ds4
+stamp.llamacpp.cur -
+stamp.llamacpp.new -
+stamp.mlx.cur -
+stamp.mlx.new -
+pf.cur pf-1
+pf.new.sha pf-2
+marker ok

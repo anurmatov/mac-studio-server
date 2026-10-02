@@ -1,0 +1,3 @@
+{"ts":"2026-01-01T00:00:01Z","event":"sample","backend":"mlx","pid":20,"free_pct":7,"swap_used_mb":50,"swap_baseline_mb":50,"rss_mb":4000}
+{"ts":"2026-01-01T00:00:02Z","event":"sample","backend":"mlx","pid":20,"free_pct":7,"swap_used_mb":50,"swap_baseline_mb":50,"rss_mb":4000}
+{"ts":"2026-01-01T00:00:03Z","event":"sample","backend":"mlx","pid":20,"free_pct":7,"swap_used_mb":50,"swap_baseline_mb":50,"rss_mb":4000}
