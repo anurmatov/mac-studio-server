@@ -17,8 +17,9 @@ run_install_backends() {
         mss_save_file=${MSS_SAVE_ENVFILE:-}
         mss_save_user=${MSS_SAVE_USER:-}
     fi
-    # D7: refuse the mlx non-keys before sudo, which would drop them silently,
-    # and pass them on as well, so the root check sees what the user set.
+    # #33 D1: refuse MLX_API_KEY_FILE before sudo, which would drop it
+    # silently, and pass it on as well, so the root check sees what the user
+    # set. MLX_HOST and MLX_ALLOW_FROM are keys, validated by the root check.
     case ",$BACKENDS," in *,mlx,*) mss_mlx_loopback_check || return 1 ;; esac
     sudo env \
         MSS_REPLACE_BACKEND="$mss_replace" \

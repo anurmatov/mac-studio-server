@@ -516,11 +516,17 @@ _mss_pick_backend() {
     case $b in
         llamacpp) P=LLAMACPP; label="llama.cpp llama-server" ;;
         ds4) P=DS4; label="DwarfStar ds4-server" ;;
+        mlx) P=MLX ;;
     esac
 
-    # 2. binary, 3. model (the checksum comes from the catalogue or the user)
-    _mss_pick_binary "$b" "$P" "$label"
-    _mss_pick_model "$b" "$P"
+    # 2. binary, 3. model (the checksum comes from the catalogue or the user).
+    # mlx has its own: a pinned version and a model directory (#1 D8).
+    if [ "$b" = mlx ]; then
+        _mss_pick_mlx
+    else
+        _mss_pick_binary "$b" "$P" "$label"
+        _mss_pick_model "$b" "$P"
+    fi
 
     # 5. LAN access. The default follows the saved host; loopback when none.
     host=$(printenv "${P}_HOST")
@@ -557,9 +563,7 @@ _mss_pick_backend() {
 
     # 6. port: not asked (I6); the saved or default port is kept in backends.env.
     def=$(printenv "${P}_PORT")
-    if [ -z "$def" ]; then
-        [ "$b" = llamacpp ] && def=8080 || def=8000
-    fi
+    [ -n "$def" ] || def=$(mss_default_port "$b")
     _mss_pick_set "${P}_PORT" "$def"
 }
 
@@ -698,9 +702,10 @@ _mss_pick_host_choices() {
 # ── MLX-Serve (#1 D8) ──────────────────────────────────────────────────────────
 # A saved or found mlx-serve is used when it is exactly the pinned version. A
 # different version is named and the path asked; with none found, Homebrew is
-# offered. The model is a native MLX checkpoint directory; the port is kept.
+# offered. The model is a native MLX checkpoint directory. _mss_pick_backend
+# asks the LAN questions and keeps the port, as for ds4 (#33 D2).
 _mss_pick_mlx() {
-    local found bin="" mism=0 def
+    local found bin="" mism=0
     found=$(printenv MLX_BIN)
     [ -n "$found" ] || found=$(command -v mlx-serve 2>/dev/null)
     if [ -n "$found" ]; then
@@ -728,9 +733,6 @@ _mss_pick_mlx() {
     _mss_pick_set MLX_BIN "$bin"
     mss_ask "MLX model directory (config.json and *.safetensors)" "$(printenv MLX_MODEL_DIR)" _mss_pick_mlx_dir_valid
     _mss_pick_set MLX_MODEL_DIR "$MSS_ANSWER"
-    echo "mlx listens on 127.0.0.1 only" >&2
-    def=$(printenv MLX_PORT)
-    _mss_pick_set MLX_PORT "${def:-11234}"
 }
 
 # ── the active optional backend (#1 D8 step 4) ─────────────────────────────────
@@ -776,11 +778,11 @@ _mss_pick_summary() {
     for b in $(mss_optional_backends "$sel"); do
         P=$(mss_prefix "$b")
         [ "$b" = "$active" ] && state=active || state=standby
+        # mlx has a model directory and no sha256; like the others, it shows
+        # its allowed clients when it is LAN-bound.
         if [ "$b" = mlx ]; then
-            echo "  mlx: $state, $(printenv MLX_BIN), $(printenv MLX_MODEL_DIR), 127.0.0.1:$(printenv MLX_PORT)" >&2
-            continue
-        fi
-        if [ "$(printenv MSS_DEFER_MODEL)" = yes ]; then
+            echo "  mlx: $state, $(printenv MLX_BIN), $(printenv MLX_MODEL_DIR), $(printenv MLX_HOST):$(printenv MLX_PORT)" >&2
+        elif [ "$(printenv MSS_DEFER_MODEL)" = yes ]; then
             echo "  $b: $state, $(printenv "${P}_BIN"), model later (scripts/model.sh), $(printenv "${P}_HOST"):$(printenv "${P}_PORT")" >&2
         else
             echo "  $b: $state, $(printenv "${P}_BIN"), $(printenv "${P}_MODEL"), $(printenv "${P}_HOST"):$(printenv "${P}_PORT")" >&2
@@ -827,7 +829,7 @@ mss_picker_run() {
     echo "  1) ollama" >&2
     echo "  2) llama.cpp" >&2
     echo "  3) ds4" >&2
-    echo "  4) mlx (MLX-Serve, loopback only)" >&2
+    echo "  4) mlx (MLX-Serve)" >&2
     mss_ask "Choose" "$def" _mss_pick_menu_valid
     num=$MSS_ANSWER
     sel=$(_mss_pick_num_to_sel "$num")
@@ -863,9 +865,7 @@ mss_picker_run() {
 
     # 3. each optional backend, in menu order
     case ",$sel," in *,ollama,*) _mss_pick_ollama ;; esac
-    for b in $opts; do
-        if [ "$b" = mlx ]; then _mss_pick_mlx; else _mss_pick_backend "$b"; fi
-    done
+    for b in $opts; do _mss_pick_backend "$b"; done
 
     # 4. which optional backend runs now
     if [ "$n" -ge 2 ]; then

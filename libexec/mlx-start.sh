@@ -1,8 +1,9 @@
 #!/bin/sh
 # mlx-start.sh — fail-closed wrapper, then exec mlx-serve (#1 D7).
 # Runs as the service user via com.mac-studio-server.mlx. mlx-serve listens on
-# 0.0.0.0 by default and cannot disable /v1/load-model or /api/pull, so it only
-# ever starts on loopback, with one resident model and no log file of its own.
+# 0.0.0.0 by default, so --host is always passed: 127.0.0.1, or the LAN address
+# in the conf (#33). mlx-serve has no auth, so a LAN bind additionally requires
+# this boot's pf marker below. One resident model, no log file of its own.
 
 set -u
 
@@ -14,21 +15,26 @@ else
     . "$_self_dir/../scripts/lib/mss-common.sh"
 fi
 
-# MSS_STAMP_DIR is a test hook: launchd starts this job with no environment.
+# MSS_STAMP_DIR, MSS_BOOT_MARKER and MSS_MARKER_WAIT are test hooks: launchd
+# starts this job with no environment.
 DB_DIR=${MSS_STAMP_DIR:-/var/db/mac-studio-server}
 TRIP_MARKER="$DB_DIR/guard.tripped"
 STAMP="$DB_DIR/$BACKEND.model.verified"
+BOOT_MARKER=${MSS_BOOT_MARKER:-/var/run/com.mac-studio-server.boot.ok}
+MARKER_WAIT=${MSS_MARKER_WAIT:-120}
 
 refuse() { echo "REFUSE: $1"; exit 78; }
 
 # refuse must run in this shell: inside $(...) it would only exit the subshell.
 [ -r "$(mss_conf_path)" ] || refuse "conf missing ($(mss_conf_path))"
 
-# 1. The conf names the binary, the model directory and the port.
+# 1. The conf names the binary, the model directory, the host and the port.
+#    No MLX_HOST line means loopback (#33 D5).
 BIN=$(mss_conf_get MLX_BIN)
 [ -n "$BIN" ] || refuse "conf missing MLX_BIN"
 MODEL_DIR=$(mss_conf_get MLX_MODEL_DIR)
 [ -n "$MODEL_DIR" ] || refuse "conf missing MLX_MODEL_DIR"
+HOST=$(mss_conf_get MLX_HOST); HOST=${HOST:-127.0.0.1}
 PORT=$(mss_conf_get MLX_PORT)
 [ -n "$PORT" ] || refuse "conf missing MLX_PORT"
 CTX=$(mss_conf_get MLX_CTX)
@@ -62,7 +68,25 @@ fi
 # 7. Guard trip.
 [ ! -e "$TRIP_MARKER" ] || refuse "guard tripped (sudo /usr/local/libexec/mac-studio-server/mss-enable.sh)"
 
-# 8. Wired limit applied (boot race with com.mac-studio-server.gpumemory).
+# 8. A LAN bind (#33 D3). No providers file: allowed clients could spend its
+#    third-party credentials through <model>@<provider>. mlx-serve reads it
+#    from $HOME, or /tmp when HOME is unset; the exec below keeps this
+#    environment, so this is the path it would read. Then this boot's pf
+#    marker, as for ds4: never a LAN bind without the firewall verified.
+if ! mss_is_loopback_host "$HOST"; then
+    _providers="${HOME-/tmp}/.mlx-serve/providers.json"
+    [ ! -e "$_providers" ] || refuse "providers file present ($_providers); a LAN bind would share its credentials"
+    _boot=$(sysctl -n kern.boottime 2>/dev/null || echo unavailable)
+    _waited=0
+    while ! { [ -r "$BOOT_MARKER" ] && [ "$(cat "$BOOT_MARKER" 2>/dev/null)" = "$_boot" ]; }; do
+        [ "$_waited" -ge "$MARKER_WAIT" ] && refuse "pf (no boot marker matching this kern.boottime after ${_waited}s)"
+        sleep 1
+        _waited=$((_waited + 1))
+        _boot=$(sysctl -n kern.boottime 2>/dev/null || echo unavailable)
+    done
+fi
+
+# 9. Wired limit applied (boot race with com.mac-studio-server.gpumemory).
 if [ -n "$WIRED_LIMIT" ]; then
     _waited=0
     while :; do
@@ -74,11 +98,11 @@ if [ -n "$WIRED_LIMIT" ]; then
     done
 fi
 
-set -- "$BIN" --serve --model "$MODEL_DIR" --host 127.0.0.1 --port "$PORT" --max-resident-models 1 --log-file off
+set -- "$BIN" --serve --model "$MODEL_DIR" --host "$HOST" --port "$PORT" --max-resident-models 1 --log-file off
 [ -n "$CTX" ] && set -- "$@" --ctx-size "$CTX"
 # shellcheck disable=SC2086  # validated, whitespace-split allowlist tokens
 [ -n "$ARGS" ] && set -- "$@" $ARGS
 
-echo "START: $(date -u +%Y-%m-%dT%H:%M:%SZ) backend=$BACKEND bin=$BIN model=$MODEL_DIR host=127.0.0.1 port=$PORT ctx=${CTX:-default}"
+echo "START: $(date -u +%Y-%m-%dT%H:%M:%SZ) backend=$BACKEND bin=$BIN model=$MODEL_DIR host=$HOST port=$PORT ctx=${CTX:-default}"
 # exec keeps one PID: launchd's, mlx-serve's and the guard's are the same.
 exec "$@"

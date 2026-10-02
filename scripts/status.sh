@@ -33,12 +33,19 @@ DB_DIR=/var/db/mac-studio-server
 check_backend() {
     _b=$1
     _upper=$(mss_backend_prefix "$_b")
-    if [ "$_b" = mlx ]; then _host=127.0.0.1; else _host=$(conf_get "${_upper}_HOST"); _host=${_host:-127.0.0.1}; fi
+    _host=$(conf_get "${_upper}_HOST"); _host=${_host:-127.0.0.1}
     _port=$(conf_get "${_upper}_PORT"); _port=${_port:-$(mss_default_port "$_b")}
     _label="com.mac-studio-server.$_b"
     _lan=no; mss_is_loopback_host "$_host" || _lan=yes
 
     echo "$_b (host=$_host port=$_port lan-bound=$_lan):"
+    # A LAN-bound mlx names its allowed clients (#33 D4). They live only in
+    # the rendered pf rules; ds4 and llama.cpp keep their 1.7.0 rows.
+    if [ "$_b" = mlx ] && [ "$_lan" = yes ]; then
+        _allow=$(awk -v p="$_port" '$1 == "pass" && $6 == "from" && $10 == "port" && $11 == p { printf "%s%s", s, $7; s = " " }' \
+            "$ETC_DIR/pf.conf" 2>/dev/null)
+        [ -n "$_allow" ] && healthy allowed "$_allow" || unhealthy allowed "no pf allowlist for port $_port"
+    fi
 
     _print=$(launchctl print "system/$_label" 2>/dev/null)
     _state=$(printf '%s\n' "$_print" | sed -n 's/^[[:space:]]*state = \(.*\)$/\1/p' | head -n 1)
@@ -67,7 +74,7 @@ check_backend() {
     # mlx-serve answers /health before its model is resolved: ready is a model
     # row with "state":"ready" in /v1/models; anything else is still loading.
     if [ "$_b" = mlx ]; then
-        _models=$(curl -s --max-time 5 "http://127.0.0.1:$_port/v1/models" 2>/dev/null)
+        _models=$(curl -s --max-time 5 "http://$_host:$_port/v1/models" 2>/dev/null)
         case $_models in
             *'"state":"ready"'*|*'"state": "ready"'*) healthy model "ready" ;;
             *) healthy model "loading" ;;
