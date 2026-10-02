@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.7.1] - 2026-10-02
+
+### Added
+- MLX LAN access with the same address and allowed-clients questions as ds4
+
 ## [1.7.0] - 2026-10-01
 
 ### Added

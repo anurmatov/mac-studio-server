@@ -1,7 +1,7 @@
 # Inference Backends
 
-Reference for the optional inference backends added in 1.3.0, and for 1.7.0's
-MLX-Serve backend and standby backends. The README has the short version;
+Reference for the optional inference backends added in 1.3.0, for 1.7.0's
+MLX-Serve backend and standby backends, and for 1.7.1's MLX LAN access. The README has the short version;
 `config/backends.env.example` lists every variable.
 
 Ollama stays the zero-config default: with `MSS_BACKENDS` unset or `ollama`,
@@ -13,7 +13,7 @@ optional backends; **one** of them runs, the others wait on standby:
 | `ollama` | `/usr/local/bin/ollama serve` | `0.0.0.0:11434` (`OLLAMA_BIND`) | none (unchanged) | zero-config default |
 | `llamacpp` | `llama-server` (any GGUF) | `127.0.0.1:8080` | optional `--api-key-file` | LAN bind needs an allowlist or a key |
 | `ds4` | `ds4-server` (DwarfStar) | `127.0.0.1:8000` | **none** | LAN bind always needs `DS4_ALLOW_FROM` |
-| `mlx` | `mlx-serve` 26.10.1 (MLX-Serve) | `127.0.0.1:11234` | none | loopback only; one native MLX model directory |
+| `mlx` | `mlx-serve` 26.10.1 (MLX-Serve) | `127.0.0.1:11234` | **none** | LAN bind always needs `MLX_ALLOW_FROM`; one native MLX model directory |
 
 `MSS_BACKENDS` is any comma list of distinct names from `ollama`, `llamacpp`,
 `ds4` and `mlx`, in any order. An empty element, an unknown name or a
@@ -37,9 +37,9 @@ freeze the Mac.
   renders pf sub-anchor `com.apple/250.mac-studio-server` rules (loopback +
   your allowlist, then block). A root boot daemon enables pf, loads the anchor
   and verifies pf is enabled, referenced and fully loaded before writing a boot
-  marker; the wrapper refuses to bind LAN without this boot's marker. ds4 always
-  needs an allowlist on a LAN address. llama.cpp may use an API key file
-  instead; then there is no pf policy and the key is the sole protection.
+  marker; the wrapper refuses to bind LAN without this boot's marker. ds4 and
+  mlx always need an allowlist on a LAN address. llama.cpp may use an API key
+  file instead; then there is no pf policy and the key is the sole protection.
 - **Extra args are allowlisted.** `LLAMACPP_EXTRA_ARGS` / `DS4_EXTRA_ARGS`
   accept only reviewed performance flags; anything that serves files, loads
   extra artifacts or persists state is rejected. ds4 also accepts `--mtp`,
@@ -58,16 +58,20 @@ freeze the Mac.
   process named `mlx-serve`, `ds4-server`, `llama-server` or like a configured
   `*_BIN` runs, managed or not: the guard watches one process. The installer
   refuses to start a backend beside such a process first.
-- **mlx is loopback-only.** `mlx-serve` listens on `0.0.0.0` by default and
-  cannot turn off its model-load and pull endpoints, so it always starts with
-  `--host 127.0.0.1`; there is no LAN address, allowlist or key for it, and any
-  `MLX_HOST`, `MLX_ALLOW_FROM` or `MLX_API_KEY_FILE` refuses the install.
+- **mlx defaults to loopback; a LAN address needs an allowlist, and permitted
+  clients reach every engine endpoint, including model load and pull.**
+  `mlx-serve` listens on `0.0.0.0` by default, so the wrapper always passes
+  `--host` (`127.0.0.1`, or `MLX_HOST`). `MLX_HOST` is loopback or one local
+  IPv4 address, never `0.0.0.0`. A LAN bind also refuses while
+  `~/.mlx-serve/providers.json` exists for the service user (`/tmp/.mlx-serve/`
+  without `HOME`), so allowed clients cannot spend its provider credentials.
+  `MLX_API_KEY_FILE` refuses the install: access control is the allowlist.
 
 ## Variables
 
 See `config/backends.env.example` for the full annotated list: `MSS_BACKENDS`,
 `MSS_ACTIVE_BACKEND`, `OLLAMA_BIND`, `<BACKEND>_BIN/_MODEL/_MODEL_SHA256/_HOST/_PORT/_ALLOW_FROM`,
-`MLX_BIN/_MODEL_DIR/_PORT/_CTX/_EXTRA_ARGS`,
+`MLX_BIN/_MODEL_DIR/_HOST/_PORT/_ALLOW_FROM/_CTX/_EXTRA_ARGS`,
 `LLAMACPP_API_KEY_FILE/_CTX/_PARALLEL`, `DS4_CTX/_BATCHED_SESSIONS/_WORKDIR`,
 `<BACKEND>_EXTRA_ARGS`, the host choices (`MSS_GPU_PERCENT`, `MSS_DOCKER_INSTALL`,
 `MSS_DOCKER_AUTOSTART`, `MSS_POWER_AUTORESTART`), and the guard/log knobs
@@ -142,7 +146,7 @@ saved file never removes a backend, and an installed backend missing from
 ## One-line install, model.sh and acquisition variables (1.5.0)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/anurmatov/mac-studio-server/v1.7.0/bootstrap.sh | sh
+curl -fsSL https://raw.githubusercontent.com/anurmatov/mac-studio-server/v1.7.1/bootstrap.sh | sh
 ./scripts/model.sh                                        # menu: starter, more, own file/URL
 ./scripts/model.sh --catalog qwen3-4b                     # or --path FILE --sha256 HEX
 ./scripts/model.sh --url https://… --sha256 HEX [--dest FILE]
@@ -277,7 +281,9 @@ this value.
 |---|---|---|
 | `MLX_BIN` | required | an executable, resolved once; the version probe |
 | `MLX_MODEL_DIR` | required | a native MLX checkpoint directory (below) |
+| `MLX_HOST` | `127.0.0.1` | loopback, or an IPv4 address on a local interface; never `0.0.0.0` |
 | `MLX_PORT` | `11234` | distinct from every other selected port and from Ollama's 11434 |
+| `MLX_ALLOW_FROM` | empty | IPv4 addresses or CIDRs (no `/0`); required when `MLX_HOST` is not loopback; only in pf |
 | `MLX_CTX` | unset | 1..1048576; unset uses the model's own context |
 | `MLX_EXTRA_ARGS` | empty | `--max-concurrent 1..16`, `--prefill-chunk 512..65536`, `--kv-quant off\|4\|8`, `--prefix-cache-mem <n>MB\|<n>GB`, `--timeout <s>`, `--metrics`, `--mtp`, `--no-mtp`, `--no-vision`; everything else is rejected |
 
@@ -287,7 +293,7 @@ ds4). Only names, sizes, inodes and mtimes are read, never file contents: the
 manifest `/var/db/mac-studio-server/mlx.model.verified` lists every file, and
 the wrapper refuses when the directory no longer matches it. The server runs
 as the service user, as
-`mlx-serve --serve --model <dir> --host 127.0.0.1 --port <port> --max-resident-models 1 --log-file off [--ctx-size <n>] [extra args]`,
+`mlx-serve --serve --model <dir> --host <MLX_HOST> --port <port> --max-resident-models 1 --log-file off [--ctx-size <n>] [extra args]`,
 with its output in `/var/log/mac-studio-server/mlx.log`. `MSS_DEFER_MODEL` does
 not apply to mlx. `mlx.distributed` is out of scope.
 
@@ -301,7 +307,7 @@ Upstream also turns speculative drafting on by default and loads a model's
 bundled drafter automatically. Neither is tested here. Neither are upstream's
 speed claims. Not tested on a real
 Mac by this project's CI (it uses a stub): the installed `--version` line,
-loopback-only listening, `"state":"ready"` after a load, SIGTERM releasing the
+listening only on `MLX_HOST`, `"state":"ready"` after a load, SIGTERM releasing the
 label in time, streamed Responses, a forced function call and the cancellation
 counter (the release canary checks these five); `--max-resident-models 1` after
 a local `/v1/load-model`; where `/api/pull` writes under launchd's `UserName`;
@@ -333,12 +339,33 @@ Placeholders: `<checkout>`, `<user>`, `<mlx-serve>`, `<model-dir>`, `<prior vars
   Before checking out an older release, keep at most one optional backend and
   delete `MSS_ACTIVE_BACKEND` and the `MLX_*` lines from `backends.env`: an
   older checkout refuses the new keys.
+- **R6 mlx on the LAN (1.7.1).** Enable: `./scripts/install.sh --configure`,
+  mlx, LAN yes, an address and the allowed clients; mlx restarts once. Verify:
+  `./scripts/status.sh` shows `host=<address>`, `allowed` and `ready`, then
+  `curl http://<address>:11234/v1/models` from an allowed client. Disable:
+  `--configure` again, LAN no; mlx restarts on loopback and pf drops the port.
+- **R7 After a `REFUSE:` line in `/var/log/mac-studio-server/mlx.log`.**
+  `pf (no boot marker …)`: `sudo /usr/local/libexec/mac-studio-server/mss-boot.sh`
+  names the pf problem; fix it and re-run the install. `providers file
+  present`: remove that file or go back to loopback (R6). launchd retries.
+- **R8 Back to 1.7.0.** `--configure` with LAN no; delete the `MLX_HOST` and
+  `MLX_ALLOW_FROM` lines from `backends.env` (1.7.0 refuses them); run the
+  1.7.0 installer; `sudo pfctl -a com.apple/250.mac-studio-server -sr` shows no
+  rule for the mlx port.
+- **R9 Bumping `mlx-serve`.** In the same PR as the version pin, re-audit the
+  upstream route table and the providers and `--lan-share` behaviour, and
+  update R-1 below.
 
 ## Residual risks (1.7.0)
 
-- **R-1** mlx-serve's local `/v1/load-model` and `/api/pull` stay open on
-  loopback; the disk a pull uses, where it writes and which model is loaded are
-  not enforced.
+- **R-1** mlx-serve's `/v1/load-model`, `/v1/unload-model`, `/api/pull`,
+  `/v1/models/rescan`, `/v1/providers*`, stored Responses and its web console
+  are open on loopback, and with `MLX_HOST` to every allowed client (accepted
+  in 1.7.1; pf is the boundary). A pull can fill the disk; a client-loaded
+  model is outside the installer's checks (one resident model, the guard, and
+  a restart returns to the verified one); stored Responses are shared across
+  allowed clients by guessable ids. Binding an address advertises nothing:
+  Bonjour is `--lan-share` only, which stays refused.
 - **R-2** KeepAlive retries a crashing or refusing server every 30 s (existing).
 - **R-3** The mlx manifest misses an in-place write that keeps a file's size,
   inode and mtime.
@@ -377,6 +404,9 @@ Placeholders: `<checkout>`, `<user>`, `<mlx-serve>`, `<model-dir>`, `<prior vars
   kept (deleted only by `uninstall.sh`); `.next` stamps are new. The menu
   numbers changed (multi-select), and an unchanged re-install no longer
   restarts the optional backend.
+- **From 1.7.0 to 1.7.1:** a 1.7.0 `backends.env` has no `MLX_HOST`, so mlx
+  stays on loopback; a plain re-install asks nothing new, renders the same
+  files and restarts nothing. Going back: runbook R8.
 - **`OLLAMA_GPU_PERCENT` and `DOCKER_AUTOSTART` (1.5.0 names):** deprecated but
   still read; the installer migrates them and prints a notice. See
   `docs/options.md`.
