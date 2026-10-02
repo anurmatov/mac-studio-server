@@ -15,13 +15,14 @@ else
     . "$_self_dir/../scripts/lib/mss-common.sh"
 fi
 
-# MSS_STAMP_DIR, MSS_BOOT_MARKER and MSS_MARKER_WAIT are test hooks: launchd
-# starts this job with no environment.
+# MSS_STAMP_DIR, MSS_BOOT_MARKER, MSS_MARKER_WAIT and MSS_HOST_WAIT are test
+# hooks: launchd starts this job with no environment.
 DB_DIR=${MSS_STAMP_DIR:-/var/db/mac-studio-server}
 TRIP_MARKER="$DB_DIR/guard.tripped"
 STAMP="$DB_DIR/$BACKEND.model.verified"
 BOOT_MARKER=${MSS_BOOT_MARKER:-/var/run/com.mac-studio-server.boot.ok}
 MARKER_WAIT=${MSS_MARKER_WAIT:-120}
+HOST_WAIT=${MSS_HOST_WAIT:-120}
 
 refuse() { echo "REFUSE: $1"; exit 78; }
 
@@ -73,16 +74,16 @@ fi
 #    from $HOME, or /tmp when HOME is unset; the exec below keeps this
 #    environment, so this is the path it would read. Then this boot's pf
 #    marker, as for ds4: never a LAN bind without the firewall verified.
+#    The marker holds the boot-session id, not kern.boottime, which moves when
+#    the clock is set after boot.
 if ! mss_is_loopback_host "$HOST"; then
     _providers="${HOME-/tmp}/.mlx-serve/providers.json"
     [ ! -e "$_providers" ] || refuse "providers file present ($_providers); a LAN bind would share its credentials"
-    _boot=$(sysctl -n kern.boottime 2>/dev/null || echo unavailable)
     _waited=0
-    while ! { [ -r "$BOOT_MARKER" ] && [ "$(cat "$BOOT_MARKER" 2>/dev/null)" = "$_boot" ]; }; do
-        [ "$_waited" -ge "$MARKER_WAIT" ] && refuse "pf (no boot marker matching this kern.boottime after ${_waited}s)"
+    until mss_boot_marker_ok "$BOOT_MARKER"; do
+        [ "$_waited" -ge "$MARKER_WAIT" ] && refuse "pf (no boot marker for this boot session after ${_waited}s)"
         sleep 1
         _waited=$((_waited + 1))
-        _boot=$(sysctl -n kern.boottime 2>/dev/null || echo unavailable)
     done
 fi
 
@@ -95,6 +96,19 @@ if [ -n "$WIRED_LIMIT" ]; then
         [ "$_waited" -ge 120 ] && refuse "wired limit $_cur < expected $WIRED_LIMIT"
         sleep 2
         _waited=$((_waited + 2))
+    done
+fi
+
+# 10. The selected address is on an interface (#33). At boot this job can run
+#     before the network has configured MLX_HOST, and mlx-serve would exit
+#     with AddressUnavailable. Wait for it, bounded, then refuse.
+if ! mss_is_loopback_host "$HOST" && ! mss_host_is_local "$HOST"; then
+    echo "WAIT: $HOST is not on any interface yet (up to ${HOST_WAIT}s)"
+    _waited=0
+    until mss_host_is_local "$HOST"; do
+        [ "$_waited" -ge "$HOST_WAIT" ] && refuse "address $HOST is not on any interface after ${_waited}s"
+        sleep 1
+        _waited=$((_waited + 1))
     done
 fi
 

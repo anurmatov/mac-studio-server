@@ -478,6 +478,23 @@ mss_launchd_wait_gone() {
 # Read-only loader for runtime scripts: backends.conf is root:wheel 0644.
 mss_conf_path() { printf '%s\n' "${MSS_CONF:-/usr/local/etc/mac-studio-server/backends.conf}"; }
 
+# mss_boot_id: this boot's identity, the content of the pf boot marker (#33).
+# kern.bootsessionuuid is fixed for the whole boot. kern.boottime is derived
+# from the wall clock and moves when the clock is set after boot, so it cannot
+# prove "this boot". Prints nothing and fails when the kernel has no session id,
+# so a marker can never be written or matched without one.
+mss_boot_id() {
+    _bid=$(sysctl -n kern.bootsessionuuid 2>/dev/null) || return 1
+    mss_match "$_bid" '^[0-9A-Fa-f-]{8,64}$' || return 1
+    printf '%s\n' "$_bid"
+}
+
+# mss_boot_marker_ok <marker>: the marker exists and names this boot.
+mss_boot_marker_ok() {
+    _bmid=$(mss_boot_id) || return 1
+    [ -r "$1" ] && [ "$(cat "$1" 2>/dev/null)" = "$_bmid" ]
+}
+
 mss_conf_get() {
     _key=$1
     _file=$(mss_conf_path)

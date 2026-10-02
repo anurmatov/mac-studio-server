@@ -857,8 +857,7 @@ plist_state() { # plist_state <top> <standby>: "<top|standby|absent> <sha|->"
 LOADED=""
 for _j in llamacpp ds4 mlx guard boot; do loaded "$_j" && LOADED="$LOADED $_j"; done
 _marker=missing
-_bt=$(sysctl -n kern.boottime 2>/dev/null)
-[ -z "$_bt" ] || [ "$(cat "$BOOT_MARKER" 2>/dev/null)" != "$_bt" ] || _marker=ok
+! mss_boot_marker_ok "$BOOT_MARKER" || _marker=ok
 PLAN=$(
     echo "active.cur $I_ACTIVE"
     echo "active.new $NEW_ACTIVE"
@@ -1039,17 +1038,14 @@ for _j in $START_SET; do
     case $_j in
         boot)
             # The backend starts only after boot has written a marker for this
-            # kern.boottime in this run: one left by an earlier install in the
+            # boot session in this run: one left by an earlier install in the
             # same boot would let it start under the old anchor.
             mss_lock_check
             mss_mut rm -f "$BOOT_MARKER" || true
             if ! bootstrap_label boot; then START_FAILED="launchctl bootstrap failed"; FAILED_JOB=boot; continue; fi
-            _boottime=$(sysctl -n kern.boottime 2>/dev/null)
             _n=0; _why=""
             while :; do
-                if [ -n "$_boottime" ] && [ -r "$BOOT_MARKER" ] && [ "$(cat "$BOOT_MARKER" 2>/dev/null)" = "$_boottime" ]; then
-                    break
-                fi
+                mss_boot_marker_ok "$BOOT_MARKER" && break
                 _rc=$(launchctl print "system/$(label boot)" 2>/dev/null \
                     | sed -n 's/^[[:space:]]*last exit code = \([0-9][0-9]*\).*/\1/p' | head -n 1)
                 if [ -n "$_rc" ] && [ "$_rc" != 0 ]; then _why="exit code $_rc"; break; fi

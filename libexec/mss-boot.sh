@@ -47,8 +47,10 @@ rm -f "$MARKER"
 _loaded=$("$MSS_PFCTL" -a "$ANCHOR" -sr | grep -c '[^[:space:]]')
 [ "$_loaded" -eq "$MSS_PF_RULE_COUNT" ] || fail "pf check (c) failed: anchor has $_loaded rules, expected $MSS_PF_RULE_COUNT"
 
-# 4. Only now write this boot's marker.
-sysctl -n kern.boottime > "$MARKER"
+# 4. Only now write this boot's marker: its boot-session id, which stays the
+#    same when the clock is set later in this boot (#33). No id, no marker.
+_id=$(mss_boot_id) || fail "kern.bootsessionuuid is unavailable; no marker written"
+printf '%s\n' "$_id" > "$MARKER" || fail "cannot write $MARKER"
 chown root:wheel "$MARKER"
 chmod 0644 "$MARKER"
 echo "$LABEL: pf verified (enabled, referenced, $_loaded rules); marker written"
