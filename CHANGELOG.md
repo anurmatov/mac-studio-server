@@ -9,6 +9,10 @@ All notable changes to this project will be documented in this file.
 ### Added
 - MLX LAN access with the same address and allowed-clients questions as ds4
 
+### Fixed
+- A LAN-bound backend no longer refuses to start for the rest of a boot once the clock is set
+- A LAN-bound mlx waits for its address at boot instead of failing to bind
+
 ## [1.7.0] - 2026-10-01
 
 ### Added

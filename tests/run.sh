@@ -662,6 +662,34 @@ fi
 echo "== phase A: boot fail-closed with stub pfctl (A11b) =="
 BDIR="$TMP/render-lan"
 mkdir -p "$TMP/stubbin"
+# #33: a sysctl whose kern.boottime moves on every read, as when the clock is
+# set after boot, while kern.bootsessionuuid stays $MSS_STUB_BOOTID (unset: no
+# id). Every read is logged, so a row can show kern.boottime is never used.
+SYSBIN33="$TMP/sysbin33"; mkdir -p "$SYSBIN33"; SYSLOG33="$TMP/sysctl33.log"; : > "$SYSLOG33"
+BOOTID33=6F1C2A3B-4D5E-4F60-8A7B-9C0D1E2F3A4B
+cat > "$SYSBIN33/sysctl" <<STUB
+#!/bin/sh
+echo "\$*" >> '$SYSLOG33'
+case "\$*" in
+    "-n kern.bootsessionuuid") [ -n "\${MSS_STUB_BOOTID:-}" ] || exit 1; echo "\$MSS_STUB_BOOTID" ;;
+    "-n kern.boottime") echo "{ sec = \$(date +%s), usec = \$\$ } \$(date)" ;;
+    *) exec /usr/sbin/sysctl "\$@" ;;
+esac
+STUB
+chmod +x "$SYSBIN33/sysctl"
+cat > "$TMP/stubbin/pfctl-ok33" <<STUB
+#!/bin/sh
+case \${1:-} in
+    -s) echo 'Status: Enabled' ;;
+    -sr) echo 'anchor "com.apple/*" all' ;;
+    -a) case \${3:-} in
+            -f) cp "\$4" '$TMP/pf33.rules' ;;
+            -sr) grep -v -e '^[[:space:]]*\$' -e '^[[:space:]]*#' '$TMP/pf33.rules' ;;
+        esac ;;
+esac
+exit 0
+STUB
+chmod +x "$TMP/stubbin/pfctl-ok33"
 cat > "$TMP/stubbin/pfctl-disabled" <<'STUB'
 #!/bin/sh
 if [ "$1" = "-s" ] && [ "$2" = "info" ]; then echo "Status: Disabled"; exit 0; fi
@@ -678,6 +706,17 @@ if render 'ds4' "$BDIR" DS4_HOST=192.0.2.10 DS4_ALLOW_FROM='192.0.2.99' MSS_IFCO
     else
         fail "boot with disabled pf: rc=$RC marker=$( [ -e "$TMP/boot.marker" ] && echo yes || echo no)"
     fi
+    # #33: the marker is this boot's session id, written after the pf checks;
+    # with no session id there is no marker.
+    sed -e "s|^MSS_PFCTL=.*|MSS_PFCTL=$TMP/stubbin/pfctl-ok33|" "$BDIR/backends.conf" > "$TMP/boot33.conf"
+    PATH="$SYSBIN33:$PATH" MSS_STUB_BOOTID=$BOOTID33 MSS_CONF="$TMP/boot33.conf" PF_CONF="$BDIR/pf.conf" \
+        MARKER="$TMP/boot33.marker" sh "$ROOT/libexec/mss-boot.sh" >"$TMP/boot33.out" 2>&1
+    check "boot writes the boot-session id as the marker (#33)" "$BOOTID33" "$(cat "$TMP/boot33.marker" 2>/dev/null)"
+    grep -q 'kern.boottime' "$SYSLOG33" && fail "boot read kern.boottime (#33)" || ok "boot never reads kern.boottime (#33)"
+    OUT=$(PATH="$SYSBIN33:$PATH" MSS_STUB_BOOTID='' MSS_CONF="$TMP/boot33.conf" PF_CONF="$BDIR/pf.conf" \
+        MARKER="$TMP/boot33n.marker" sh "$ROOT/libexec/mss-boot.sh" 2>&1); RC=$?
+    check "boot without a session id exits 1 and writes no marker (#33)" "1 no yes" \
+        "$RC $([ -e "$TMP/boot33n.marker" ] && echo marker || echo no) $(printf '%s' "$OUT" | grep -q 'kern.bootsessionuuid is unavailable; no marker written' && echo yes || echo no)"
 else
     echo "skip - LAN render needs the stub ifconfig (macOS only)"
 fi
@@ -3268,31 +3307,65 @@ STUB
 chmod +x "$T3/mlx-serve"
 mkdir -p "$T3/w" "$T3/home"
 mss_mlx_manifest "$TMP/fix/mlx/model" > "$T3/w/mlx.model.verified"
+# w33 runs with the sysctl stub (this boot is $BOOTID33, kern.boottime moves on
+# every read), the stub ifconfig (192.0.2.10 is local) and short bounds.
 w33() { # w33 <name> <host|-> [env...]: run the wrapper, print its exit code; output in $T3/<name>.out
     _wn=$1; _wh=$2; shift 2
     { printf 'MSS_GUARD_BACKEND=mlx\nMLX_BIN=%s\nMLX_MODEL_DIR=%s\nMLX_PORT=18235\n' "$T3/mlx-serve" "$TMP/fix/mlx/model"
       [ "$_wh" = - ] || echo "MLX_HOST=$_wh"; } > "$T3/$_wn.conf"
     rm -f "${T3:?}/${_wn:?}.argv"
-    env MSS_CONF="$T3/$_wn.conf" MSS_STAMP_DIR="$T3/w" MSS_STUB_ARGV="$T3/$_wn.argv" HOME="$T3/home" "$@" \
+    env PATH="$SYSBIN33:$PATH" MSS_STUB_BOOTID=$BOOTID33 MSS_IFCONFIG="$LANIF33" MSS_HOST_WAIT=2 \
+        MSS_CONF="$T3/$_wn.conf" MSS_STAMP_DIR="$T3/w" MSS_STUB_ARGV="$T3/$_wn.argv" HOME="$T3/home" "$@" \
         sh "$ROOT/libexec/mlx-start.sh" >"$T3/$_wn.out" 2>&1
     echo $?
 }
-sysctl -n kern.boottime > "$T3/marker" 2>/dev/null
+printf '%s\n' "$BOOTID33" > "$T3/marker"
+# ifconfig stubs: no LAN address at all, and one that gains 192.0.2.10 on its fourth call.
+printf 'lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384\n\tinet 127.0.0.1 netmask 0xff000000\n' > "$T3/ifconfig-none.txt"
+printf '#!/bin/sh\ncat %s\n' "$T3/ifconfig-none.txt" > "$T3/ifconfig-none.sh"; chmod +x "$T3/ifconfig-none.sh"
+cat > "$T3/ifconfig-late.sh" <<STUB
+#!/bin/sh
+_n=\$(( \$(cat '$T3/ifconfig-late.n' 2>/dev/null || echo 0) + 1 )); echo "\$_n" > '$T3/ifconfig-late.n'
+if [ "\$_n" -le 3 ]; then cat '$T3/ifconfig-none.txt'; else exec '$LANIF33'; fi
+STUB
+chmod +x "$T3/ifconfig-late.sh"
 T0=$(date +%s)
-check "AC4 loopback starts with no marker and no wait" "0 yes" \
-    "$(w33 lo - MSS_BOOT_MARKER="$T3/none" MSS_MARKER_WAIT=60) $([ $(( $(date +%s) - T0 )) -le 15 ] && echo yes || echo no)"
+check "AC4 loopback starts with no marker, no address and no wait" "0 yes" \
+    "$(w33 lo - MSS_BOOT_MARKER="$T3/none" MSS_MARKER_WAIT=60 MSS_IFCONFIG="$T3/ifconfig-none.sh" MSS_HOST_WAIT=60) $([ $(( $(date +%s) - T0 )) -le 15 ] && echo yes || echo no)"
+grep -q '^WAIT:' "$T3/lo.out" && fail "AC4 loopback waited for an address" || ok "AC4 loopback never waits for an address"
 check "AC4 loopback argv has --host 127.0.0.1" "--serve --model $TMP/fix/mlx/model --host 127.0.0.1 --port 18235 --max-resident-models 1 --log-file off" \
     "$(cat "$T3/lo.argv" 2>/dev/null)"
+: > "$SYSLOG33"
 check "AC4 LAN with this boot's marker starts" 0 "$(w33 lan 192.0.2.10 MSS_BOOT_MARKER="$T3/marker" MSS_MARKER_WAIT=2)"
+# The regression: kern.boottime moves between the marker's write and this read,
+# the session id does not, and the wrapper never reads kern.boottime.
+check "AC4 the marker check reads the session id, never kern.boottime" "yes 0" \
+    "$(grep -q 'kern.bootsessionuuid' "$SYSLOG33" && echo yes || echo no) $(grep -c 'kern.boottime' "$SYSLOG33")"
 check "AC4 LAN argv has --host 192.0.2.10" "--serve --model $TMP/fix/mlx/model --host 192.0.2.10 --port 18235 --max-resident-models 1 --log-file off" \
     "$(cat "$T3/lan.argv" 2>/dev/null)"
 grep -q "^START: .* backend=mlx .* host=192.0.2.10 port=18235 " "$T3/lan.out" && ok "AC4 START names the LAN host" || fail "AC4 START: $(cat "$T3/lan.out")"
 check "AC4 LAN without a marker refuses after the wait; nothing started" \
-    "78 REFUSE: pf (no boot marker matching this kern.boottime after 2s) no-exec" \
+    "78 REFUSE: pf (no boot marker for this boot session after 2s) no-exec" \
     "$(w33 nomark 192.0.2.10 MSS_BOOT_MARKER="$T3/none" MSS_MARKER_WAIT=2) $(cat "$T3/nomark.out") $([ -e "$T3/nomark.argv" ] && echo exec || echo no-exec)"
 printf 'stale\n' > "$T3/stale-marker"
 check "AC4 LAN with a marker from another boot refuses" "78 no-exec" \
     "$(w33 stale 192.0.2.10 MSS_BOOT_MARKER="$T3/stale-marker" MSS_MARKER_WAIT=1) $([ -e "$T3/stale.argv" ] && echo exec || echo no-exec)"
+check "AC4 LAN with another boot session's marker refuses" "78 no-exec" \
+    "$(w33 other 192.0.2.10 MSS_BOOT_MARKER="$T3/marker" MSS_MARKER_WAIT=1 MSS_STUB_BOOTID=0A1B2C3D-0000-4000-8000-000000000000) $([ -e "$T3/other.argv" ] && echo exec || echo no-exec)"
+: > "$T3/empty-marker"
+check "AC4 LAN with no session id refuses, even against an empty marker" "78 no-exec" \
+    "$(w33 noid 192.0.2.10 MSS_BOOT_MARKER="$T3/empty-marker" MSS_MARKER_WAIT=1 MSS_STUB_BOOTID=) $([ -e "$T3/noid.argv" ] && echo exec || echo no-exec)"
+# The selected address: one that appears late delays the start, then it binds
+# it; one that never appears refuses within the bound with nothing started.
+rm -f "${T3:?}/ifconfig-late.n"; T0=$(date +%s)
+check "AC4 a late LAN address delays the start, then it starts" 0 \
+    "$(w33 late 192.0.2.10 MSS_BOOT_MARKER="$T3/marker" MSS_IFCONFIG="$T3/ifconfig-late.sh" MSS_HOST_WAIT=10)"
+EL=$(( $(date +%s) - T0 ))
+check "AC4 late: WAIT, then START with --host 192.0.2.10, after about 2 s" "WAIT: 192.0.2.10 is not on any interface yet (up to 10s)|--host 192.0.2.10|yes" \
+    "$(sed -n 1p "$T3/late.out")|$(grep -o -- '--host [0-9.]*' "$T3/late.argv" 2>/dev/null)|$([ "$EL" -ge 2 ] && [ "$EL" -le 9 ] && echo yes || echo "no (${EL}s)")"
+check "AC4 an address that never appears refuses within the bound; nothing started" \
+    "78 REFUSE: address 192.0.2.10 is not on any interface after 2s no-exec" \
+    "$(w33 noaddr 192.0.2.10 MSS_BOOT_MARKER="$T3/marker" MSS_IFCONFIG="$T3/ifconfig-none.sh") $(tail -n 1 "$T3/noaddr.out") $([ -e "$T3/noaddr.argv" ] && echo exec || echo no-exec)"
 mkdir -p "$T3/home/.mlx-serve"; : > "$T3/home/.mlx-serve/providers.json"
 check "AC4 LAN with providers.json under HOME refuses; nothing started" \
     "78 REFUSE: providers file present ($T3/home/.mlx-serve/providers.json); a LAN bind would share its credentials no-exec" \
@@ -3304,8 +3377,8 @@ if [ ! -e /tmp/.mlx-serve ]; then
     mkdir -p /tmp/.mlx-serve; : > /tmp/.mlx-serve/providers.json
     printf 'MSS_GUARD_BACKEND=mlx\nMLX_BIN=%s\nMLX_MODEL_DIR=%s\nMLX_PORT=18235\nMLX_HOST=192.0.2.10\n' "$T3/mlx-serve" "$TMP/fix/mlx/model" \
         > "$T3/provtmp.conf"
-    OUT=$( (unset HOME; MSS_CONF="$T3/provtmp.conf" MSS_STAMP_DIR="$T3/w" MSS_STUB_ARGV="$T3/provtmp.argv" MSS_BOOT_MARKER="$T3/marker" \
-        sh "$ROOT/libexec/mlx-start.sh") 2>&1); RC=$?
+    OUT=$( (unset HOME; PATH="$SYSBIN33:$PATH" MSS_STUB_BOOTID=$BOOTID33 MSS_IFCONFIG="$LANIF33" MSS_CONF="$T3/provtmp.conf" \
+        MSS_STAMP_DIR="$T3/w" MSS_STUB_ARGV="$T3/provtmp.argv" MSS_BOOT_MARKER="$T3/marker" sh "$ROOT/libexec/mlx-start.sh") 2>&1); RC=$?
     rm -f /tmp/.mlx-serve/providers.json; rmdir /tmp/.mlx-serve
     check "AC4 LAN with HOME unset and /tmp/.mlx-serve/providers.json refuses" \
         "78 REFUSE: providers file present (/tmp/.mlx-serve/providers.json); a LAN bind would share its credentials" "$RC $OUT"
@@ -4041,7 +4114,7 @@ precedes "$RB/b3-again.log" 'com.mac-studio-server.ds4 stopped after' 'bootstrap
     || fail "B3 re-install stop order: $(grep -E 'stopped after|bootstrapped' "$RB/b3-again.log" | tr '\n' ' ')"
 precedes "$RB/b3-again.log" "$PFV" 'bootstrapped com.mac-studio-server.ds4' && ok "B3 re-install: pf verified before ds4 was bootstrapped" \
     || fail "B3 re-install order: $(grep -E 'pf verified|bootstrapped' "$RB/b3-again.log" | tr '\n' ' ')"
-check "B3 the marker holds this kern.boottime" "$(sysctl -n kern.boottime)" "$(cat "$MARKER" 2>/dev/null)"
+check "B3 the marker holds this boot's session id" "$(sysctl -n kern.bootsessionuuid)" "$(cat "$MARKER" 2>/dev/null)"
 MT=$(stat -f %m "$MARKER" 2>/dev/null || echo 0)
 [ "$MT" -ge "$START" ] && ok "B3 the re-install wrote the marker" || fail "B3 marker mtime $MT is before the re-install ($START)"
 wait_argv "$N" && ok "B3 ds4 started after the re-install" || fail "B3 ds4 did not start after the re-install"
@@ -4161,8 +4234,12 @@ check "MB1 status exits 0" 0 $?
 sudo sh "$ROOT/scripts/uninstall.sh" --all >/dev/null 2>&1
 
 # MB33 (#33): mlx on a LAN address with an allowlist, then back to loopback.
-# pf goes through a copy of pfctl-ok, so the runner's pf is never changed. The
-# stub logs its argv before it binds, which is all a TEST-NET address allows.
+# The address is a TEST-NET alias on lo0 for this row only, so the real
+# ifconfig, the real listener and launchd all see it; pf goes through a copy of
+# pfctl-ok, so the runner's pf is never changed.
+LAN33=192.0.2.10
+lan_alias() { sudo /sbin/ifconfig lo0 alias "$LAN33" netmask 255.255.255.255; }
+lan_unalias() { sudo /sbin/ifconfig lo0 -alias "$LAN33" 2>/dev/null || true; }
 PFMB="$MBD/pfctl-ok"; cp "$ROOT/tests/stubs/pfctl-ok" "$PFMB"; chmod 0755 "$PFMB"
 sudo rm -f /tmp/mss-stub-pf.rules /tmp/mss-stub-pfctl-fail
 mlx_argv_lines() { cat /tmp/mss-stub-mlx-argv 2>/dev/null | wc -l | tr -d ' '; }
@@ -4171,8 +4248,8 @@ mlx_wait_argv() { # mlx_wait_argv <count>: up to 30 s for a line after <count>
     while [ "$(mlx_argv_lines)" -le "$1" ] && [ "$_i" -lt 30 ]; do sleep 1; _i=$((_i + 1)); done
     [ "$(mlx_argv_lines)" -gt "$1" ]
 }
-mlxlan() { _mll=$1; shift; mbi "$_mll" MSS_BACKENDS=mlx MLX_HOST=192.0.2.10 MLX_ALLOW_FROM=192.0.2.99 \
-    MSS_IFCONFIG="$ROOT/tests/stubs/ifconfig-lan" MSS_PFCTL="$PFMB" "$@"; }
+mlxlan() { _mll=$1; shift; mbi "$_mll" MSS_BACKENDS=mlx MLX_HOST="$LAN33" MLX_ALLOW_FROM=192.0.2.99 MSS_PFCTL="$PFMB" "$@"; }
+lan_unalias; lan_alias
 N33=$(mlx_argv_lines)
 mbi "$MBD/mb33a.log" MSS_BACKENDS=mlx MSS_PFCTL="$PFMB"
 check "MB33 loopback install exits 0" 0 $?
@@ -4183,14 +4260,34 @@ precedes "$MBD/mb33.log" 'pf verified by com.mac-studio-server.boot' "bootstrapp
     && ok "MB33 pf verified before mlx was bootstrapped" || fail "MB33 order: $(grep -E 'pf verified|bootstrapped' "$MBD/mb33.log" | tr '\n' ' ')"
 check "MB33 enabling LAN restarts mlx once" 1 "$(grep -c "^bootstrapped $ML\$" "$MBD/mb33.log")"
 grep -q '^hashing' "$MBD/mb33.log" && fail "MB33 enabling LAN hashed something" || ok "MB33 enabling LAN reads no model"
+check "MB33 the marker: this boot's session id, root:wheel 644" "$(sysctl -n kern.bootsessionuuid) root:wheel 644" \
+    "$(cat "$MARKER" 2>/dev/null) $(stat -f '%Su:%Sg %Lp' "$MARKER" 2>/dev/null)"
 mlx_wait_argv "$N33" && ok "MB33 mlx started after the LAN install" || fail "MB33 mlx did not start: $(sudo tail -3 "$LOGB/mlx.log")"
 MB33A=$(tail -n 1 /tmp/mss-stub-mlx-argv 2>/dev/null)
-check "MB33 argv carries the conf host" "--serve --model $MBDP/model --host 192.0.2.10 --port 18234 --max-resident-models 1 --log-file off" "${MB33A#* }"
-sudo grep -q "^START: .* backend=mlx .* host=192.0.2.10 port=18234 " "$LOGB/mlx.log" \
+check "MB33 argv carries the conf host" "--serve --model $MBDP/model --host $LAN33 --port 18234 --max-resident-models 1 --log-file off" "${MB33A#* }"
+sudo grep -q "^START: .* backend=mlx .* host=$LAN33 port=18234 " "$LOGB/mlx.log" \
     && ok "MB33 the wrapper logged START with the LAN host" || fail "MB33 START: $(sudo tail -3 "$LOGB/mlx.log")"
+wait_open_on() { _i=0; while [ "$_i" -lt 30 ]; do nc -z "$1" "$2" >/dev/null 2>&1 && return 0; sleep 1; _i=$((_i + 1)); done; return 1; }
+wait_open_on "$LAN33" 18234 && ok "MB33 mlx listens on $LAN33:18234" || fail "MB33 no listener on $LAN33:18234"
 check "MB33 the loaded pf rules" "pass in quick on lo0 proto tcp to any port 18234
 pass in quick proto tcp from 192.0.2.99 to any port 18234
 block in quick proto tcp to any port 18234" "$(grep -v '^#' /tmp/mss-stub-pf.rules 2>/dev/null)"
+sh "$ROOT/scripts/status.sh" >"$MBD/mb33.status" 2>&1
+check "MB33 status exits 0 on the LAN host" 0 $?
+grep -q "^mlx (host=$LAN33 port=18234 lan-bound=yes):" "$MBD/mb33.status" && grep -q '^  allowed  *192.0.2.99$' "$MBD/mb33.status" \
+    && ok "MB33 status names the LAN host and the allowed client" || fail "MB33 status: $(head -n 8 "$MBD/mb33.status")"
+# A restart before the address is back, as at boot: the wrapper waits within its
+# bound, starts nothing meanwhile, then binds once the address appears.
+lan_unalias
+N33=$(mlx_argv_lines)
+sudo launchctl kickstart -k "system/$ML" >/dev/null 2>&1
+sleep 5
+check "MB33 nothing started while the address is missing" "$N33" "$(mlx_argv_lines)"
+lan_alias
+mlx_wait_argv "$N33" && ok "MB33 mlx started once the address appeared" || fail "MB33 no start after the address appeared: $(sudo tail -3 "$LOGB/mlx.log")"
+sudo grep -q "^WAIT: $LAN33 is not on any interface yet (up to 120s)" "$LOGB/mlx.log" \
+    && ok "MB33 the wrapper logged WAIT for the address" || fail "MB33 no WAIT line: $(sudo tail -3 "$LOGB/mlx.log")"
+check "MB33 after the wait, argv carries the conf host" "--host $LAN33" "$(tail -n 1 /tmp/mss-stub-mlx-argv | grep -o -- '--host [0-9.]*')"
 N33=$(mlx_argv_lines)
 mbi "$MBD/mb33b.log" MSS_BACKENDS=mlx MSS_PFCTL="$PFMB"
 check "MB33 back to loopback exits 0" 0 $?
@@ -4206,10 +4303,12 @@ N33=$(mlx_argv_lines)
 mlxlan "$MBD/mb33c.log" && fail "MB33 a LAN install passed with pf failing" \
     || { grep -q 'pf boot check failed' "$MBD/mb33c.log" && ok "MB33 a LAN install stops at the pf boot check" || fail "MB33 pf fail: $(tail -3 "$MBD/mb33c.log")"; }
 ! loaded "$ML" && ok "MB33 mlx is not loaded after the failed pf check" || fail "MB33 labels: $(daemons)"
+[ ! -e "$MARKER" ] && ok "MB33 no marker after the failed pf check" || fail "MB33 a marker exists after the failed pf check"
 sleep 2
 check "MB33 mlx did not start (no new argv line)" "$N33" "$(mlx_argv_lines)"
 sudo rm -f /tmp/mss-stub-pfctl-fail /tmp/mss-stub-pf.rules
 sudo sh "$ROOT/scripts/uninstall.sh" --all >/dev/null 2>&1
+lan_unalias
 
 # MB14: ds4, then mlx added on standby: neither the backend nor the guard restarts.
 mbi "$MBD/mb14a.log" MSS_BACKENDS=ds4

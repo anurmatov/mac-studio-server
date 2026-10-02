@@ -37,7 +37,8 @@ freeze the Mac.
   renders pf sub-anchor `com.apple/250.mac-studio-server` rules (loopback +
   your allowlist, then block). A root boot daemon enables pf, loads the anchor
   and verifies pf is enabled, referenced and fully loaded before writing a boot
-  marker; the wrapper refuses to bind LAN without this boot's marker. ds4 and
+  marker (this boot's `kern.bootsessionuuid`, which does not move when the
+  clock is set); the wrapper refuses to bind LAN without it. ds4 and
   mlx always need an allowlist on a LAN address. llama.cpp may use an API key
   file instead; then there is no pf policy and the key is the sole protection.
 - **Extra args are allowlisted.** `LLAMACPP_EXTRA_ARGS` / `DS4_EXTRA_ARGS`
@@ -347,7 +348,9 @@ Placeholders: `<checkout>`, `<user>`, `<mlx-serve>`, `<model-dir>`, `<prior vars
 - **R7 After a `REFUSE:` line in `/var/log/mac-studio-server/mlx.log`.**
   `pf (no boot marker …)`: `sudo /usr/local/libexec/mac-studio-server/mss-boot.sh`
   names the pf problem; fix it and re-run the install. `providers file
-  present`: remove that file or go back to loopback (R6). launchd retries.
+  present`: remove that file or go back to loopback (R6). `address <ip> is not
+  on any interface`: the network did not configure `MLX_HOST` within 120 s
+  (a `WAIT:` line comes first); fix the network or the address. launchd retries.
 - **R8 Back to 1.7.0.** `--configure` with LAN no; delete the `MLX_HOST` and
   `MLX_ALLOW_FROM` lines from `backends.env` (1.7.0 refuses them); run the
   1.7.0 installer; `sudo pfctl -a com.apple/250.mac-studio-server -sr` shows no
