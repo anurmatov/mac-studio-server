@@ -7,7 +7,7 @@ a memory guard, and firewalled LAN access.
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/anurmatov/mac-studio-server/v1.7.0/bootstrap.sh | sh
+curl -fsSL https://raw.githubusercontent.com/anurmatov/mac-studio-server/v1.7.1/bootstrap.sh | sh
 ```
 
 Or clone it yourself: `git clone https://github.com/anurmatov/mac-studio-server.git && cd mac-studio-server && ./scripts/install.sh`.
@@ -21,7 +21,7 @@ Every question has a default; press Enter to take it. Installs and downloads hap
 3. Which backends (several numbers, e.g. `1,3`), whether to remove one you left out, and which runs now.
 4. Missing Homebrew, Ollama, `llama-server`, `ds4-server` or `mlx-serve`: install or build it? (default no)
 5. A model: the starter (the default, downloaded right away), another one, your own file or URL, or later.
-6. LAN access for llama.cpp or ds4 (default no; yes asks for an address and allowed clients).
+6. LAN access for llama.cpp, ds4 or MLX (default no; yes asks for an address and allowed clients).
 7. Headless macOS tweaks: no sleep, Spotlight, Time Machine or auto-updates (default no).
 8. GPU memory percent for every backend (1-100 or system), restart after a power failure
    (default off), installing Colima and the Docker CLI, and starting Colima at boot.
@@ -43,9 +43,9 @@ Logs: `~/mac-studio-server/logs/` (Ollama, install) and `/var/log/mac-studio-ser
 
 Ollama listens on all interfaces (0.0.0.0) by default and has no password; set OLLAMA_BIND=127.0.0.1 to keep it on this Mac.
 
-- **LAN access for llama.cpp or ds4:** answer yes in the installer. A macOS firewall (pf) allowlist
+- **LAN access for llama.cpp, ds4 or MLX:** answer yes in the installer. A macOS firewall (pf) allowlist
   guards the port; llama.cpp can use an API key file instead. See [docs/backends.md](docs/backends.md).
-- **MLX-Serve:** exactly `mlx-serve` 26.10.1 with a native MLX model directory, on this Mac only (no LAN); needs macOS 26.2 or later.
+- **MLX-Serve:** exactly `mlx-serve` 26.10.1 with a native MLX model directory; needs macOS 26.2 or later.
   See [docs/backends.md](docs/backends.md).
 - **GPU memory:** set `MSS_GPU_PERCENT=80` in `backends.env` to let Metal use 80% of RAM
   for every backend. See [docs/options.md](docs/options.md).
@@ -65,12 +65,12 @@ Ollama listens on all interfaces (0.0.0.0) by default and has no password; set O
 
 ## Updates
 
-- **1.7.0** MLX-Serve, several backends at once (one running, the rest on standby), `backend.sh`.
+- **1.7.0, 1.7.1** MLX-Serve (LAN access in 1.7.1), several backends at once (one running), `backend.sh`.
 - **1.6.0** GPU memory, Docker and restart-after-power-failure choices in the installer.
 - **1.5.0** One-line install, guided downloads and builds, and `model.sh`.
 - **1.3.0, 1.4.0** Optional llama.cpp and DwarfStar backends; the interactive picker and saved answers.
 
-Current version: 1.7.0 (semver). History: [CHANGELOG.md](CHANGELOG.md).
+Current version: 1.7.1 (semver). History: [CHANGELOG.md](CHANGELOG.md).
 
 ## Contributing
 

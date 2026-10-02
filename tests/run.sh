@@ -662,6 +662,34 @@ fi
 echo "== phase A: boot fail-closed with stub pfctl (A11b) =="
 BDIR="$TMP/render-lan"
 mkdir -p "$TMP/stubbin"
+# #33: a sysctl whose kern.boottime moves on every read, as when the clock is
+# set after boot, while kern.bootsessionuuid stays $MSS_STUB_BOOTID (unset: no
+# id). Every read is logged, so a row can show kern.boottime is never used.
+SYSBIN33="$TMP/sysbin33"; mkdir -p "$SYSBIN33"; SYSLOG33="$TMP/sysctl33.log"; : > "$SYSLOG33"
+BOOTID33=6F1C2A3B-4D5E-4F60-8A7B-9C0D1E2F3A4B
+cat > "$SYSBIN33/sysctl" <<STUB
+#!/bin/sh
+echo "\$*" >> '$SYSLOG33'
+case "\$*" in
+    "-n kern.bootsessionuuid") [ -n "\${MSS_STUB_BOOTID:-}" ] || exit 1; echo "\$MSS_STUB_BOOTID" ;;
+    "-n kern.boottime") echo "{ sec = \$(date +%s), usec = \$\$ } \$(date)" ;;
+    *) exec /usr/sbin/sysctl "\$@" ;;
+esac
+STUB
+chmod +x "$SYSBIN33/sysctl"
+cat > "$TMP/stubbin/pfctl-ok33" <<STUB
+#!/bin/sh
+case \${1:-} in
+    -s) echo 'Status: Enabled' ;;
+    -sr) echo 'anchor "com.apple/*" all' ;;
+    -a) case \${3:-} in
+            -f) cp "\$4" '$TMP/pf33.rules' ;;
+            -sr) grep -v -e '^[[:space:]]*\$' -e '^[[:space:]]*#' '$TMP/pf33.rules' ;;
+        esac ;;
+esac
+exit 0
+STUB
+chmod +x "$TMP/stubbin/pfctl-ok33"
 cat > "$TMP/stubbin/pfctl-disabled" <<'STUB'
 #!/bin/sh
 if [ "$1" = "-s" ] && [ "$2" = "info" ]; then echo "Status: Disabled"; exit 0; fi
@@ -678,6 +706,17 @@ if render 'ds4' "$BDIR" DS4_HOST=192.0.2.10 DS4_ALLOW_FROM='192.0.2.99' MSS_IFCO
     else
         fail "boot with disabled pf: rc=$RC marker=$( [ -e "$TMP/boot.marker" ] && echo yes || echo no)"
     fi
+    # #33: the marker is this boot's session id, written after the pf checks;
+    # with no session id there is no marker.
+    sed -e "s|^MSS_PFCTL=.*|MSS_PFCTL=$TMP/stubbin/pfctl-ok33|" "$BDIR/backends.conf" > "$TMP/boot33.conf"
+    PATH="$SYSBIN33:$PATH" MSS_STUB_BOOTID=$BOOTID33 MSS_CONF="$TMP/boot33.conf" PF_CONF="$BDIR/pf.conf" \
+        MARKER="$TMP/boot33.marker" sh "$ROOT/libexec/mss-boot.sh" >"$TMP/boot33.out" 2>&1
+    check "boot writes the boot-session id as the marker (#33)" "$BOOTID33" "$(cat "$TMP/boot33.marker" 2>/dev/null)"
+    grep -q 'kern.boottime' "$SYSLOG33" && fail "boot read kern.boottime (#33)" || ok "boot never reads kern.boottime (#33)"
+    OUT=$(PATH="$SYSBIN33:$PATH" MSS_STUB_BOOTID='' MSS_CONF="$TMP/boot33.conf" PF_CONF="$BDIR/pf.conf" \
+        MARKER="$TMP/boot33n.marker" sh "$ROOT/libexec/mss-boot.sh" 2>&1); RC=$?
+    check "boot without a session id exits 1 and writes no marker (#33)" "1 no yes" \
+        "$RC $([ -e "$TMP/boot33n.marker" ] && echo marker || echo no) $(printf '%s' "$OUT" | grep -q 'kern.bootsessionuuid is unavailable; no marker written' && echo yes || echo no)"
 else
     echo "skip - LAN render needs the stub ifconfig (macOS only)"
 fi
@@ -2414,21 +2453,49 @@ else
     chmod +x "$PK/mlxold/mlx-serve"
     MLXD="$TMP/fix/mlx/model"
     MLX_DIR_Q="(config.json and *.safetensors): ${T}$MLXD"
+    # #33 D2: mlx gets the ds4 LAN question; these rows keep it on loopback.
+    MLX_LAN_NO="LAN access to mlx? [y/N]: ${T}@ENTER"
 
     # MP1: fresh, ollama and mlx: no active question, no MSS_ACTIVE_BACKEND.
-    DRIVE_PATH="$PK/mlxbin" drive mp1 "Choose [1]: ${T}1,4" "$MLX_DIR_Q" "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" \
-        "$DA_ENTER" "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/mp1.env"
+    DRIVE_PATH="$PK/mlxbin" drive mp1 "Choose [1]: ${T}1,4" "$MLX_DIR_Q" "$MLX_LAN_NO" "auto-updates)? ${T}@ENTER" "$G_ENTER" \
+        "$P_ENTER" "$DA_ENTER" "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/mp1.env"
     check "MP1 fresh 1,4 completes" 0 $?
     tr_of mp1 | grep -q 'Which optional backend' && fail "MP1 asked the active question" || ok "MP1 no active question"
     check "MP1 saved" "ollama,mlx|$PK/mlxbin/mlx-serve|$MLXD|11234|" \
         "$(saved mp1.env MSS_BACKENDS)|$(saved mp1.env MLX_BIN)|$(saved mp1.env MLX_MODEL_DIR)|$(saved mp1.env MLX_PORT)|$(saved mp1.env MSS_ACTIVE_BACKEND)"
     tr_of mp1 | grep -qx "  mlx: active, $PK/mlxbin/mlx-serve, $MLXD, 127.0.0.1:11234" && ok "MP1 the summary says mlx: active on 127.0.0.1:11234" \
         || fail "MP1 summary: $(tr_of mp1 | grep '  mlx:')"
-    tr_of mp1 | grep -q '^mlx listens on 127.0.0.1 only' && ok "MP1 says loopback only" || fail "MP1 no loopback line"
+    # #33 AC3: "no" saves loopback, and the summary has no allowed: line.
+    check "MP1 LAN no saves MLX_HOST=127.0.0.1 and no allowlist" "127.0.0.1|" "$(saved mp1.env MLX_HOST)|$(saved mp1.env MLX_ALLOW_FROM)"
+    tr_of mp1 | grep -q '^    allowed:' && fail "MP1 a loopback mlx shows allowed:" || ok "MP1 no allowed: line on loopback"
+    tr_of mp1 | grep -q 'listens on 127.0.0.1 only\|loopback only' && fail "MP1 still says loopback only" || ok "MP1 no loopback-only line"
+    tr_of mp1 | grep -qx '  4) mlx (MLX-Serve)' && ok "MP1 the menu entry is mlx (MLX-Serve)" || fail "MP1 menu: $(tr_of mp1 | grep '4) mlx')"
+
+    # MP7 (#33 AC3): LAN yes for mlx asks the ds4 questions. An invalid and an
+    # empty allowlist are asked again; the summary shows the address, then allowed:.
+    DRIVE_PATH="$PK/mlxbin" drive mp7 "Choose [1]: ${T}4" "$MLX_DIR_Q" "LAN access to mlx? [y/N]: ${T}y" \
+        "listen on [192.0.2.10]: ${T}@ENTER" "(space-separated): ${T}192.0.2.0/0" "(space-separated): ${T}@ENTER" \
+        "(space-separated): ${T}192.0.2.0/24" "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" "$DA_ENTER" \
+        "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/mp7.env"
+    check "MP7 mlx LAN yes completes" 0 $?
+    check "MP7 saved" "mlx|192.0.2.10|192.0.2.0/24|11234" \
+        "$(saved mp7.env MSS_BACKENDS)|$(saved mp7.env MLX_HOST)|$(saved mp7.env MLX_ALLOW_FROM)|$(saved mp7.env MLX_PORT)"
+    check "MP7 file mode 0600" 600 "$(stat -f '%Lp' "$PK/mp7.env" 2>/dev/null)"
+    check "MP7 the allowlist was asked three times" 3 "$(tr_of mp7 | grep -c 'Allowed client addresses or CIDRs (space-separated): ')"
+    check "MP7 the summary shows the LAN address, then allowed:" \
+        "  mlx: active, $PK/mlxbin/mlx-serve, $MLXD, 192.0.2.10:11234|    allowed: 192.0.2.0/24" \
+        "$(tr_of mp7 | grep -A1 '^  mlx: ' | tr '\n' '|' | sed 's/|$//')"
+    grep -q 'API key file' "$PK/mp7.transcript" && fail "MP7 asked for a key file" || ok "MP7 no key-file question"
+    # A saved LAN answer is the next run's default; "no" goes back to loopback.
+    DRIVE_PATH="$PK/mlxbin" drive mp7n "Choose [4]: ${T}@ENTER" "(config.json and *.safetensors) [$MLXD]: ${T}@ENTER" \
+        "LAN access to mlx? [Y/n]: ${T}n" "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" "$DA_ENTER" \
+        "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/mp7.env"
+    check "MP7 a saved LAN mlx defaults to Y, and n completes" 0 $?
+    check "MP7 n saves MLX_HOST=127.0.0.1" "127.0.0.1" "$(saved mp7.env MLX_HOST)"
 
     # MP2: ds4 and mlx, mlx active; the ds4 model menu has no "later".
     DRIVE_PATH="$PK/mlxbin" drive mp2 "Choose [1]: ${T}3,4" "own file/URL: ${T}3" "path or https URL: ${T}$DS4M" \
-        "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" "LAN access to ds4? [y/N]: ${T}@ENTER" "$MLX_DIR_Q" \
+        "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" "LAN access to ds4? [y/N]: ${T}@ENTER" "$MLX_DIR_Q" "$MLX_LAN_NO" \
         "1) ds4 2) mlx 3) none [1]: ${T}2" "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" "$DA_ENTER" \
         "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/mp2.env" DS4_BIN="$DS4B"
     check "MP2 3,4 with mlx active completes" 0 $?
@@ -2443,7 +2510,7 @@ else
     envfile mp3.env "MSS_BACKENDS=ollama,ds4\nMSS_TUNE_MACOS=no\nDS4_BIN=$DS4B\nDS4_MODEL=$DS4M\nDS4_MODEL_SHA256=$DS4S\n"
     DRIVE_PATH="$PK/mlxbin" drive mp3n "Choose [1,3]: ${T}1,4" "saved answers are kept. [y/N]: ${T}@ENTER" \
         "(.gguf) path [$DS4M]: ${T}@ENTER" "c computes it now) [$DS4S]: ${T}@ENTER" "LAN access to ds4? [y/N]: ${T}@ENTER" \
-        "$MLX_DIR_Q" "1) ds4 2) mlx 3) none [1]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" "$DA_ENTER" \
+        "$MLX_DIR_Q" "$MLX_LAN_NO" "1) ds4 2) mlx 3) none [1]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" "$DA_ENTER" \
         "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/mp3.env" MSS_CONF="$PK/mp3.conf"
     check "MP3 N keeps ds4 and completes" 0 $?
     tr_of mp3n | grep -q '^ds4 is installed. Remove it now with sudo scripts/uninstall.sh --backend ds4? Its model files and saved answers are kept. \[y/N\]: ' \
@@ -2459,7 +2526,7 @@ echo "SWITCH=[$MSS_SWITCH_FROM] REPLACE=[$MSS_PICKER_REPLACE]"
 PICK
     envfile mp3y.env "MSS_BACKENDS=ollama,ds4\nMSS_TUNE_MACOS=no\nDS4_BIN=$DS4B\nDS4_MODEL=$DS4M\nDS4_MODEL_SHA256=$DS4S\n"
     : > "$PK/mp3y.steps"
-    for st in "Choose [1,3]: ${T}1,4" "saved answers are kept. [y/N]: ${T}y" "$MLX_DIR_Q" "auto-updates)? ${T}@ENTER" \
+    for st in "Choose [1,3]: ${T}1,4" "saved answers are kept. [y/N]: ${T}y" "$MLX_DIR_Q" "$MLX_LAN_NO" "auto-updates)? ${T}@ENTER" \
         "$G_ENTER" "$P_ENTER" "$DA_ENTER" "Install with these settings? [Y/n]: ${T}@ENTER"; do
         printf '%s\n' "$st" >> "$PK/mp3y.steps"
     done
@@ -2482,7 +2549,7 @@ PICK
 
     # MP5: another mlx-serve version on PATH: named, then the path is asked.
     DRIVE_PATH="$PK/mlxold" drive mp5 "Choose [1]: ${T}4" "mlx-serve 26.10.1 binary path: ${T}$PK/mlxbin/mlx-serve" "$MLX_DIR_Q" \
-        "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" "$DA_ENTER" "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/mp5.env"
+        "$MLX_LAN_NO" "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" "$DA_ENTER" "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/mp5.env"
     check "MP5 a mismatched mlx-serve, then a good path, completes" 0 $?
     _mm=$(tr_of mp5 | grep -n 'mlx-serve 26.9.6 is installed; this release supports 26.10.1 only' | head -n 1 | cut -d: -f1)
     _mq=$(tr_of mp5 | grep -n 'mlx-serve 26.10.1 binary path: ' | head -n 1 | cut -d: -f1)
@@ -2697,11 +2764,37 @@ ma8 no-config "MLX_MODEL_DIR: $PTMP/i1/m8-nocfg has no top-level config.json" ML
 ma8 no-safetensors "MLX_MODEL_DIR: $PTMP/i1/m8-nost has no top-level *.safetensors file" MLX_MODEL_DIR="$T1/m8-nost"
 ma8 nested-gguf "MLX_MODEL_DIR: $PTMP/i1/m8-gguf contains a GGUF file" MLX_MODEL_DIR="$T1/m8-gguf"
 ma8 space "MLX_MODEL_DIR: '$PTMP/i1/m8 space' must be an absolute path without spaces" MLX_MODEL_DIR="$T1/m8 space"
-ma8 host "MLX_HOST: mlx is loopback-only in this release" MLX_HOST=0.0.0.0
-ma8 allow "MLX_ALLOW_FROM: mlx is loopback-only in this release" MLX_ALLOW_FROM=192.0.2.0/24
-ma8 key "MLX_API_KEY_FILE: mlx is loopback-only in this release" MLX_API_KEY_FILE=/tmp/k
-# The same three through the entry points. sudo resets the environment, so the
-# root check above never sees them: they are refused before sudo. The shim
+# #33 AC2: the ds4 bind rules, and the key file still refused.
+LANIF="MSS_IFCONFIG=$ROOT/tests/stubs/ifconfig-lan"
+ma8 host-any "MLX_HOST: 0.0.0.0 would listen on every interface" MLX_HOST=0.0.0.0 "$LANIF"
+ma8 host-nonlocal "MLX_HOST: '198.51.100.7' is neither loopback nor assigned to a local interface" MLX_HOST=198.51.100.7 "$LANIF"
+ma8 host-v6 "MLX_HOST: IPv6 is not supported" MLX_HOST=::1
+ma8 lan-noallow "MLX_ALLOW_FROM is required: mlx has no authentication and MLX_HOST is not loopback" MLX_HOST=192.0.2.10 "$LANIF"
+ma8 allow-0 "MLX_ALLOW_FROM: invalid IPv4/CIDR entry '0.0.0.0/0'" MLX_HOST=192.0.2.10 MLX_ALLOW_FROM=0.0.0.0/0 "$LANIF"
+ma8 key "MLX_API_KEY_FILE: mlx LAN access uses an allowlist; MLX_API_KEY_FILE is not supported" MLX_API_KEY_FILE=/tmp/k
+# The same refusals in --check-only, the pass install.sh runs first: exit 1,
+# naming the variable, and no stamp or file anywhere.
+ma33c() { # ma33c <name> <expected text> <env...>
+    _cn=$1; _ct=$2; shift 2
+    env MSS_BACKENDS=mlx OLLAMA_USER="$TUSER" MLX_BIN="$TMP/fix/mlx/mlx-serve" MLX_MODEL_DIR="$TMP/fix/mlx/model" "$@" \
+        sh "$ROOT/scripts/install-backends.sh" --check-only >"$T1/ma33c-$_cn.out" 2>&1; _cr=$?
+    if [ "$_cr" = 1 ] && grep -qF -- "$_ct" "$T1/ma33c-$_cn.out"; then
+        ok "AC2 --check-only refuses $_cn"
+    else
+        fail "AC2 --check-only $_cn (rc $_cr): $(cat "$T1/ma33c-$_cn.out")"
+    fi
+}
+ma33c empty-allowlist "MLX_ALLOW_FROM is required: mlx has no authentication and MLX_HOST is not loopback" MLX_HOST=192.0.2.10 "$LANIF"
+ma33c any "MLX_HOST: 0.0.0.0 would listen on every interface" MLX_HOST=0.0.0.0 "$LANIF"
+ma33c non-local "MLX_HOST: '198.51.100.7' is neither loopback nor assigned to a local interface" MLX_HOST=198.51.100.7 "$LANIF"
+ma33c ipv6 "MLX_HOST: IPv6 is not supported" MLX_HOST=fe80::1
+ma33c slash-0 "MLX_ALLOW_FROM: invalid IPv4/CIDR entry '192.0.2.0/0'" MLX_HOST=192.0.2.10 MLX_ALLOW_FROM=192.0.2.0/0 "$LANIF"
+ma33c key "MLX_API_KEY_FILE: mlx LAN access uses an allowlist" MLX_API_KEY_FILE=/tmp/k
+env MSS_BACKENDS=mlx OLLAMA_USER="$TUSER" MLX_BIN="$TMP/fix/mlx/mlx-serve" MLX_MODEL_DIR="$TMP/fix/mlx/model" \
+    MLX_HOST=192.0.2.10 MLX_ALLOW_FROM=192.0.2.0/24 "$LANIF" sh "$ROOT/scripts/install-backends.sh" --check-only >"$T1/ma33c-ok.out" 2>&1
+check "AC2 a LAN mlx with an allowlist passes --check-only" 0 $?
+# MLX_API_KEY_FILE through the entry points. sudo resets the environment, so
+# the root check above never sees it: it is refused before sudo. The shim
 # records each root pass and runs none, so a refusal records nothing.
 MA8E=$T1/ma8e; mkdir -p "$MA8E/bin" "$MA8E/home" "$MA8E/base"; ln -sf "$ROOT/config" "$MA8E/base/config"
 cat > "$MA8E/bin/sudo" <<SHIM
@@ -2725,7 +2818,7 @@ ma8e_run() { # ma8e_run <name> <env... command...>: output in $MA8E/<name>.out, 
 ma8e() { # ma8e <name> <variable> <env... command...>: exits 1 naming it, before any root pass
     _en=$1; _ev=$2; shift 2
     ma8e_run "$_en" "$@"; _er=$?
-    if [ "$_er" = 1 ] && grep -q "^ERROR: $_ev: mlx is loopback-only in this release" "$MA8E/$_en.out" && [ ! -s "$MA8E/root" ]; then
+    if [ "$_er" = 1 ] && grep -q "^ERROR: $_ev: mlx LAN access uses an allowlist; MLX_API_KEY_FILE is not supported" "$MA8E/$_en.out" && [ ! -s "$MA8E/root" ]; then
         ok "MA8 $_en refuses $_ev before sudo"
     else
         fail "MA8 $_en (rc $_er, $(wc -l < "$MA8E/root" | tr -d ' ') root passes): $(tail -n 3 "$MA8E/$_en.out")"
@@ -2734,22 +2827,25 @@ ma8e() { # ma8e <name> <variable> <env... command...>: exits 1 naming it, before
 MA8I="MSS_BACKENDS=mlx MSS_TUNE_MACOS=no MLX_BIN=$TMP/fix/mlx/mlx-serve MLX_MODEL_DIR=$TMP/fix/mlx/model"
 # The control: with none of them set, install.sh reaches both root passes and
 # passes the three on (empty), so the refusals below are not the harness failing.
+# MLX_HOST and MLX_ALLOW_FROM are keys now (#33): set, they reach both passes.
 # shellcheck disable=SC2086  # MA8I is a word list of assignments
 ma8e_run install-none $MA8I /bin/bash "$ROOT/scripts/install.sh"
 check "MA8 control: install.sh with none set runs both root passes" 2 "$(wc -l < "$MA8E/root" | tr -d ' ')"
 grep -v -- '--check-only' "$MA8E/root" | grep -q ' MLX_HOST= MLX_ALLOW_FROM= MLX_API_KEY_FILE= ' \
     && ok "MA8 the root pass is given all three" || fail "MA8 root passes: $(cat "$MA8E/root") / $(tail -n 3 "$MA8E/install-none.out")"
 # shellcheck disable=SC2086
-ma8e install-host MLX_HOST $MA8I MLX_HOST=0.0.0.0 /bin/bash "$ROOT/scripts/install.sh"
-# shellcheck disable=SC2086
-ma8e install-allow MLX_ALLOW_FROM $MA8I MLX_ALLOW_FROM=192.0.2.0/24 /bin/bash "$ROOT/scripts/install.sh"
+ma8e_run install-lan $MA8I MLX_HOST=192.0.2.10 MLX_ALLOW_FROM=192.0.2.0/24 /bin/bash "$ROOT/scripts/install.sh"
+check "MA8 install.sh passes MLX_HOST and MLX_ALLOW_FROM to both root passes" 2 \
+    "$(grep -c ' MLX_HOST=192.0.2.10 MLX_ALLOW_FROM=192.0.2.0/24 ' "$MA8E/root")"
 # shellcheck disable=SC2086
 ma8e install-key MLX_API_KEY_FILE $MA8I MLX_API_KEY_FILE=/tmp/k /bin/bash "$ROOT/scripts/install.sh"
 # backend.sh loads backends.env, which the loader refuses unless this user owns it.
 if [ "$(id -u)" -ne 0 ]; then
     ma8e_run backend-none /bin/bash "$ROOT/scripts/backend.sh" activate mlx
     check "MA8 control: backend.sh activate mlx with none set runs both root passes" 2 "$(wc -l < "$MA8E/root" | tr -d ' ')"
-    ma8e backend-host MLX_HOST MLX_HOST=0.0.0.0 /bin/bash "$ROOT/scripts/backend.sh" activate mlx
+    ma8e_run backend-lan MLX_HOST=192.0.2.10 MLX_ALLOW_FROM=192.0.2.0/24 /bin/bash "$ROOT/scripts/backend.sh" activate mlx
+    check "MA8 backend.sh passes MLX_HOST and MLX_ALLOW_FROM to both root passes" 2 \
+        "$(grep -c ' MLX_HOST=192.0.2.10 MLX_ALLOW_FROM=192.0.2.0/24 ' "$MA8E/root")"
     ma8e backend-key MLX_API_KEY_FILE MLX_API_KEY_FILE=/tmp/k /bin/bash "$ROOT/scripts/backend.sh" activate mlx
 else
     echo "skip - MA8 backend.sh rows need a non-root user (the loader refuses a file it does not own)"
@@ -3107,6 +3203,227 @@ mkdir -p "$T1/rootid"; printf '#!/bin/sh\n[ "$1" = -u ] && { echo 0; exit 0; }\n
 OUT=$(PATH="$T1/rootid:$PATH" MSS_CONF="$T1/ma25.conf" sh "$ESET" "$T1/ma25.env" "$(mss_file_sha "$T1/ma25.conf")" 2>&1); RC=$?
 check "MA25 root is refused" "1 same" "$RC $(cmp -s "$T1/ma25.orig" "$T1/ma25.env" && echo same || echo changed)"
 printf '%s' "$OUT" | grep -q 'refusing to write .* as root' && ok "MA25 says root" || fail "MA25 root: $OUT"
+
+echo "== phase A: #33 MLX LAN access (AC1, AC4-AC8) =="
+T3=$TMP/i33; mkdir -p "$T3"
+LANIF33="$ROOT/tests/stubs/ifconfig-lan"
+# AC1: a LAN mlx renders the ds4 shape: lo0 pass, one pass per allowed entry,
+# block, the matching count and the boot job. The conf carries MLX_HOST and no
+# allowlist, and nothing under the model directory is read (AC7).
+cp "$AUDIT_LOG" "$AUDIT_LOG.ac1"
+if render mlx "$T3/ac1" MLX_HOST=192.0.2.10 MLX_ALLOW_FROM=192.0.2.0/24 MSS_IFCONFIG="$LANIF33" >"$T3/ac1.out" 2>&1; then
+    check "AC1 pf rules for port 11234" "pass in quick on lo0 proto tcp to any port 11234
+pass in quick proto tcp from 192.0.2.0/24 to any port 11234
+block in quick proto tcp to any port 11234" "$(grep -v '^#' "$T3/ac1/pf.conf")"
+    check "AC1 MSS_PF_RULE_COUNT" "MSS_PF_RULE_COUNT=3" "$(grep '^MSS_PF_RULE_COUNT=' "$T3/ac1/backends.conf")"
+    [ -e "$T3/ac1/com.mac-studio-server.boot.plist" ] && ok "AC1 the boot plist is rendered" || fail "AC1 no boot plist"
+    check "AC1 the mlx conf lines" \
+        "MLX_BIN=$PTMP/fix/mlx/mlx-serve|MLX_MODEL_DIR=$PTMP/fix/mlx/model|MLX_HOST=192.0.2.10|MLX_PORT=11234|MLX_CTX=|MLX_ARGS=" \
+        "$(grep '^MLX_' "$T3/ac1/backends.conf" | tr '\n' '|' | sed 's/|$//')"
+    grep -q 'ALLOW' "$T3/ac1/backends.conf" && fail "AC1 the conf carries an allowlist" || ok "AC1 no allowlist in the conf"
+    cmp -s "$T3/ac1/com.mac-studio-server.mlx.plist" "$ROOT/tests/golden/com.mac-studio-server.mlx.plist" \
+        && ok "AC1 the mlx plist is unchanged" || fail "AC1 mlx plist differs from the golden file"
+    check "AC7 no file under the model directory was read" "" "$(diff "$AUDIT_LOG.ac1" "$AUDIT_LOG" | grep -F "fix/mlx/model" || true)"
+else
+    fail "AC1 render LAN mlx: $(cat "$T3/ac1.out")"
+fi
+# Two entries: two pass rules, count 4.
+if render mlx "$T3/ac1b" MLX_HOST=192.0.2.10 MLX_ALLOW_FROM='192.0.2.0/24 198.51.100.7' MSS_IFCONFIG="$LANIF33" >"$T3/ac1b.out" 2>&1; then
+    check "AC1 two allowed entries" "MSS_PF_RULE_COUNT=4 2" \
+        "$(grep '^MSS_PF_RULE_COUNT=' "$T3/ac1b/backends.conf") $(grep -c '^pass in quick proto tcp from ' "$T3/ac1b/pf.conf")"
+else
+    fail "AC1 render two entries: $(cat "$T3/ac1b.out")"
+fi
+# A loopback mlx (unset, or the picker's saved 127.0.0.1): no MLX_HOST line, no pf, no boot job.
+for _h in unset 127.0.0.1; do
+    if [ "$_h" = unset ]; then render mlx "$T3/lo-$_h" >"$T3/lo-$_h.out" 2>&1; else render mlx "$T3/lo-$_h" MLX_HOST="$_h" >"$T3/lo-$_h.out" 2>&1; fi
+    check "AC1 loopback ($_h): no MLX_HOST line, no pf rule, no boot job" "0 MSS_PF_RULE_COUNT=0 no" \
+        "$(grep -c '^MLX_HOST=' "$T3/lo-$_h/backends.conf") $(grep '^MSS_PF_RULE_COUNT=' "$T3/lo-$_h/backends.conf") $([ -e "$T3/lo-$_h/com.mac-studio-server.boot.plist" ] && echo boot || echo no)"
+done
+# pf follows the active backend: a LAN mlx on standby has no pf policy yet.
+if render ds4,mlx "$T3/sb" MSS_ACTIVE_BACKEND=ds4 MLX_HOST=192.0.2.10 MLX_ALLOW_FROM=192.0.2.0/24 MSS_IFCONFIG="$LANIF33" >"$T3/sb.out" 2>&1; then
+    check "AC1 a LAN mlx on standby: MLX_HOST kept, no pf rule" "MLX_HOST=192.0.2.10 MSS_PF_RULE_COUNT=0" \
+        "$(grep '^MLX_HOST=' "$T3/sb/backends.conf") $(grep '^MSS_PF_RULE_COUNT=' "$T3/sb/backends.conf")"
+else
+    fail "AC1 render standby LAN mlx: $(cat "$T3/sb.out")"
+fi
+
+# AC6: 1.7.0 saved answers (no MLX_HOST) and a fresh "no" (MLX_HOST=127.0.0.1)
+# render every file byte-identically to v1.7.0; only the scripts differ.
+V17=cd8addd09414eea6b562ff2ee986995c8509506b
+if git -C "$ROOT" cat-file -e "$V17^{commit}" 2>/dev/null; then
+    mkdir -p "$TMP/v170"; git -C "$ROOT" archive "$V17" | tar -x -C "$TMP/v170"
+    for case in mlx ollama,mlx ds4,mlx:ds4 ds4,mlx:mlx llamacpp,ds4,mlx:none; do
+        sel=${case%:*}; act=""; [ "$case" = "$sel" ] || act=${case#*:}
+        tag=$(echo "$case" | tr ,: --)
+        for tree in old new no; do
+            if [ "$tree" = old ]; then src="$TMP/v170"; else src="$ROOT"; fi
+            host=""; [ "$tree" != no ] || host=127.0.0.1
+            d="$TMP/p17-$tree-$tag"
+            env MSS_BACKENDS="$sel" MSS_ACTIVE_BACKEND="$act" OLLAMA_USER=testuser DS4_BATCHED_SESSIONS=1 \
+                LLAMACPP_BIN="$TMP/fix/llamacpp/llamacpp-server" LLAMACPP_MODEL="$TMP/fix/llamacpp/model.gguf" \
+                LLAMACPP_MODEL_SHA256="$(cat "$TMP/fix/llamacpp/model.sha")" \
+                DS4_BIN="$TMP/fix/ds4/ds4-server" DS4_MODEL="$TMP/fix/ds4/model.gguf" \
+                DS4_MODEL_SHA256="$(cat "$TMP/fix/ds4/model.sha")" \
+                MLX_BIN="$TMP/fix/mlx/mlx-serve" MLX_MODEL_DIR="$TMP/fix/mlx/model" MLX_HOST="$host" \
+                sh "$src/scripts/install-backends.sh" --render-only "$d" >/dev/null 2>&1
+            echo $? > "$d.rc"
+        done
+        check "AC6 '$case' exits 0 at v1.7.0, at head and with LAN no" "0 0 0" \
+            "$(cat "$TMP/p17-old-$tag.rc") $(cat "$TMP/p17-new-$tag.rc") $(cat "$TMP/p17-no-$tag.rc")"
+        for tree in new no; do
+            if diff -r -x '*.sh' "$TMP/p17-old-$tag" "$TMP/p17-$tree-$tag" >/dev/null 2>&1 \
+                && [ "$(cd "$TMP/p17-old-$tag" && ls -A)" = "$(cd "$TMP/p17-$tree-$tag" && ls -A)" ]; then
+                ok "AC6 '$case' ($tree) renders byte-identically to v1.7.0"
+            else
+                fail "AC6 '$case' ($tree) differs from v1.7.0: $(diff -r -x '*.sh' "$TMP/p17-old-$tag" "$TMP/p17-$tree-$tag" 2>&1 | head -5)"
+            fi
+        done
+    done
+else
+    fail "AC6 needs commit $V17 (fetch full history)"
+fi
+
+# AC8: the two keys load and save in the example's order; a 1.7.0 file loads unchanged.
+printf 'MSS_BACKENDS=mlx\nMLX_HOST=192.0.2.10\nMLX_ALLOW_FROM=192.0.2.0/24 198.51.100.7\n' > "$T3/ac8.env"; chmod 600 "$T3/ac8.env"
+check "AC8 MLX_HOST and MLX_ALLOW_FROM load" "0 192.0.2.10|192.0.2.0/24 198.51.100.7" \
+    "$( ( unset MSS_BACKENDS MLX_HOST MLX_ALLOW_FROM; mss_envfile_load "$T3/ac8.env"; printf '%s %s|%s' "$?" "${MLX_HOST:-}" "${MLX_ALLOW_FROM:-}" ) 2>&1)"
+cp "$ROOT/tests/fixtures/envfile/multi.env" "$T3/ac8-170.env"; chmod 600 "$T3/ac8-170.env"
+check "AC8 a 1.7.0 file loads, with no MLX_HOST" "0 -" \
+    "$( ( unset MSS_BACKENDS MLX_HOST MLX_ALLOW_FROM; mss_envfile_load "$T3/ac8-170.env"; printf '%s %s' "$?" "${MLX_HOST:--}" ) 2>&1)"
+( unset MSS_BACKENDS MLX_BIN MLX_MODEL_DIR MLX_HOST MLX_PORT MLX_ALLOW_FROM MLX_CTX MLX_EXTRA_ARGS
+  export MSS_BACKENDS=mlx MLX_BIN=/x/mlx-serve MLX_MODEL_DIR=/x/model MLX_HOST=192.0.2.10 MLX_PORT=11234 MLX_ALLOW_FROM=192.0.2.0/24
+  mss_envfile_write "$T3/ac8w.env" )
+check "AC8 the writer keeps the example's order" "MLX_BIN=/x/mlx-serve|MLX_MODEL_DIR=/x/model|MLX_HOST=192.0.2.10|MLX_PORT=11234|MLX_ALLOW_FROM=192.0.2.0/24" \
+    "$(grep '^MLX_' "$T3/ac8w.env" | tr '\n' '|' | sed 's/|$//')"
+
+# AC4: the wrapper. A stub that answers --version and records its argv, so a
+# start ends at once. The marker path and the wait are its test hooks.
+cat > "$T3/mlx-serve" <<'STUB'
+#!/bin/sh
+if [ "${1:-}" = --version ]; then echo "mlx-serve 26.10.1"; exit 0; fi
+printf '%s\n' "$*" > "${MSS_STUB_ARGV:?}"
+STUB
+chmod +x "$T3/mlx-serve"
+mkdir -p "$T3/w" "$T3/home"
+mss_mlx_manifest "$TMP/fix/mlx/model" > "$T3/w/mlx.model.verified"
+# w33 runs with the sysctl stub (this boot is $BOOTID33, kern.boottime moves on
+# every read), the stub ifconfig (192.0.2.10 is local) and short bounds.
+w33() { # w33 <name> <host|-> [env...]: run the wrapper, print its exit code; output in $T3/<name>.out
+    _wn=$1; _wh=$2; shift 2
+    { printf 'MSS_GUARD_BACKEND=mlx\nMLX_BIN=%s\nMLX_MODEL_DIR=%s\nMLX_PORT=18235\n' "$T3/mlx-serve" "$TMP/fix/mlx/model"
+      [ "$_wh" = - ] || echo "MLX_HOST=$_wh"; } > "$T3/$_wn.conf"
+    rm -f "${T3:?}/${_wn:?}.argv"
+    env PATH="$SYSBIN33:$PATH" MSS_STUB_BOOTID=$BOOTID33 MSS_IFCONFIG="$LANIF33" MSS_HOST_WAIT=2 \
+        MSS_CONF="$T3/$_wn.conf" MSS_STAMP_DIR="$T3/w" MSS_STUB_ARGV="$T3/$_wn.argv" HOME="$T3/home" "$@" \
+        sh "$ROOT/libexec/mlx-start.sh" >"$T3/$_wn.out" 2>&1
+    echo $?
+}
+printf '%s\n' "$BOOTID33" > "$T3/marker"
+# ifconfig stubs: no LAN address at all, and one that gains 192.0.2.10 on its fourth call.
+printf 'lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384\n\tinet 127.0.0.1 netmask 0xff000000\n' > "$T3/ifconfig-none.txt"
+printf '#!/bin/sh\ncat %s\n' "$T3/ifconfig-none.txt" > "$T3/ifconfig-none.sh"; chmod +x "$T3/ifconfig-none.sh"
+cat > "$T3/ifconfig-late.sh" <<STUB
+#!/bin/sh
+_n=\$(( \$(cat '$T3/ifconfig-late.n' 2>/dev/null || echo 0) + 1 )); echo "\$_n" > '$T3/ifconfig-late.n'
+if [ "\$_n" -le 3 ]; then cat '$T3/ifconfig-none.txt'; else exec '$LANIF33'; fi
+STUB
+chmod +x "$T3/ifconfig-late.sh"
+T0=$(date +%s)
+check "AC4 loopback starts with no marker, no address and no wait" "0 yes" \
+    "$(w33 lo - MSS_BOOT_MARKER="$T3/none" MSS_MARKER_WAIT=60 MSS_IFCONFIG="$T3/ifconfig-none.sh" MSS_HOST_WAIT=60) $([ $(( $(date +%s) - T0 )) -le 15 ] && echo yes || echo no)"
+grep -q '^WAIT:' "$T3/lo.out" && fail "AC4 loopback waited for an address" || ok "AC4 loopback never waits for an address"
+check "AC4 loopback argv has --host 127.0.0.1" "--serve --model $TMP/fix/mlx/model --host 127.0.0.1 --port 18235 --max-resident-models 1 --log-file off" \
+    "$(cat "$T3/lo.argv" 2>/dev/null)"
+: > "$SYSLOG33"
+check "AC4 LAN with this boot's marker starts" 0 "$(w33 lan 192.0.2.10 MSS_BOOT_MARKER="$T3/marker" MSS_MARKER_WAIT=2)"
+# The regression: kern.boottime moves between the marker's write and this read,
+# the session id does not, and the wrapper never reads kern.boottime.
+check "AC4 the marker check reads the session id, never kern.boottime" "yes 0" \
+    "$(grep -q 'kern.bootsessionuuid' "$SYSLOG33" && echo yes || echo no) $(grep -c 'kern.boottime' "$SYSLOG33")"
+check "AC4 LAN argv has --host 192.0.2.10" "--serve --model $TMP/fix/mlx/model --host 192.0.2.10 --port 18235 --max-resident-models 1 --log-file off" \
+    "$(cat "$T3/lan.argv" 2>/dev/null)"
+grep -q "^START: .* backend=mlx .* host=192.0.2.10 port=18235 " "$T3/lan.out" && ok "AC4 START names the LAN host" || fail "AC4 START: $(cat "$T3/lan.out")"
+check "AC4 LAN without a marker refuses after the wait; nothing started" \
+    "78 REFUSE: pf (no boot marker for this boot session after 2s) no-exec" \
+    "$(w33 nomark 192.0.2.10 MSS_BOOT_MARKER="$T3/none" MSS_MARKER_WAIT=2) $(cat "$T3/nomark.out") $([ -e "$T3/nomark.argv" ] && echo exec || echo no-exec)"
+printf 'stale\n' > "$T3/stale-marker"
+check "AC4 LAN with a marker from another boot refuses" "78 no-exec" \
+    "$(w33 stale 192.0.2.10 MSS_BOOT_MARKER="$T3/stale-marker" MSS_MARKER_WAIT=1) $([ -e "$T3/stale.argv" ] && echo exec || echo no-exec)"
+check "AC4 LAN with another boot session's marker refuses" "78 no-exec" \
+    "$(w33 other 192.0.2.10 MSS_BOOT_MARKER="$T3/marker" MSS_MARKER_WAIT=1 MSS_STUB_BOOTID=0A1B2C3D-0000-4000-8000-000000000000) $([ -e "$T3/other.argv" ] && echo exec || echo no-exec)"
+: > "$T3/empty-marker"
+check "AC4 LAN with no session id refuses, even against an empty marker" "78 no-exec" \
+    "$(w33 noid 192.0.2.10 MSS_BOOT_MARKER="$T3/empty-marker" MSS_MARKER_WAIT=1 MSS_STUB_BOOTID=) $([ -e "$T3/noid.argv" ] && echo exec || echo no-exec)"
+# The selected address: one that appears late delays the start, then it binds
+# it; one that never appears refuses within the bound with nothing started.
+rm -f "${T3:?}/ifconfig-late.n"; T0=$(date +%s)
+check "AC4 a late LAN address delays the start, then it starts" 0 \
+    "$(w33 late 192.0.2.10 MSS_BOOT_MARKER="$T3/marker" MSS_IFCONFIG="$T3/ifconfig-late.sh" MSS_HOST_WAIT=10)"
+EL=$(( $(date +%s) - T0 ))
+check "AC4 late: WAIT, then START with --host 192.0.2.10, after about 2 s" "WAIT: 192.0.2.10 is not on any interface yet (up to 10s)|--host 192.0.2.10|yes" \
+    "$(sed -n 1p "$T3/late.out")|$(grep -o -- '--host [0-9.]*' "$T3/late.argv" 2>/dev/null)|$([ "$EL" -ge 2 ] && [ "$EL" -le 9 ] && echo yes || echo "no (${EL}s)")"
+check "AC4 an address that never appears refuses within the bound; nothing started" \
+    "78 REFUSE: address 192.0.2.10 is not on any interface after 2s no-exec" \
+    "$(w33 noaddr 192.0.2.10 MSS_BOOT_MARKER="$T3/marker" MSS_IFCONFIG="$T3/ifconfig-none.sh") $(tail -n 1 "$T3/noaddr.out") $([ -e "$T3/noaddr.argv" ] && echo exec || echo no-exec)"
+mkdir -p "$T3/home/.mlx-serve"; : > "$T3/home/.mlx-serve/providers.json"
+check "AC4 LAN with providers.json under HOME refuses; nothing started" \
+    "78 REFUSE: providers file present ($T3/home/.mlx-serve/providers.json); a LAN bind would share its credentials no-exec" \
+    "$(w33 prov 192.0.2.10 MSS_BOOT_MARKER="$T3/marker") $(cat "$T3/prov.out") $([ -e "$T3/prov.argv" ] && echo exec || echo no-exec)"
+check "AC4 loopback with providers.json starts (the refusal is LAN only)" 0 "$(w33 provlo - MSS_BOOT_MARKER="$T3/none")"
+rm -rf "${T3:?}/home/.mlx-serve"
+# HOME unset: mlx-serve reads /tmp/.mlx-serve/providers.json. Only when nothing is there already.
+if [ ! -e /tmp/.mlx-serve ]; then
+    mkdir -p /tmp/.mlx-serve; : > /tmp/.mlx-serve/providers.json
+    printf 'MSS_GUARD_BACKEND=mlx\nMLX_BIN=%s\nMLX_MODEL_DIR=%s\nMLX_PORT=18235\nMLX_HOST=192.0.2.10\n' "$T3/mlx-serve" "$TMP/fix/mlx/model" \
+        > "$T3/provtmp.conf"
+    OUT=$( (unset HOME; PATH="$SYSBIN33:$PATH" MSS_STUB_BOOTID=$BOOTID33 MSS_IFCONFIG="$LANIF33" MSS_CONF="$T3/provtmp.conf" \
+        MSS_STAMP_DIR="$T3/w" MSS_STUB_ARGV="$T3/provtmp.argv" MSS_BOOT_MARKER="$T3/marker" sh "$ROOT/libexec/mlx-start.sh") 2>&1); RC=$?
+    rm -f /tmp/.mlx-serve/providers.json; rmdir /tmp/.mlx-serve
+    check "AC4 LAN with HOME unset and /tmp/.mlx-serve/providers.json refuses" \
+        "78 REFUSE: providers file present (/tmp/.mlx-serve/providers.json); a LAN bind would share its credentials" "$RC $OUT"
+else
+    echo "skip - AC4 /tmp/.mlx-serve exists on this Mac; the HOME-unset row would change it"
+fi
+
+# AC5: status with a LAN mlx. Stubs answer only on 192.0.2.10:11234 and log every
+# URL; the guard sample and launchd state are stubbed so the exit code is the probe's.
+AC5=$T3/ac5; mkdir -p "$AC5/etc" "$AC5/bin" "$AC5/state" "$AC5/sysroot"
+cp "$T3/ac1/backends.conf" "$T3/ac1/pf.conf" "$AC5/etc/"
+: > "$AC5/state/loaded-com.mac-studio-server.mlx"
+cp "$ROOT/tests/stubs/launchctl-state" "$AC5/bin/launchctl"; chmod +x "$AC5/bin/launchctl"
+cat > "$AC5/bin/curl" <<STUB
+#!/bin/sh
+_u=""; _w=0
+for _a in "\$@"; do case \$_a in http://*) _u=\$_a ;; -w) _w=1 ;; esac; done
+echo "\$_u" >> '$AC5/curl.log'
+case \$_u in http://192.0.2.10:11234/*) ;; *) exit 7 ;; esac
+[ ! -e '$AC5/down' ] || exit 7
+if [ "\$_w" = 1 ]; then printf 200; else printf '{"object":"list","data":[{"id":"m","state":"ready"}]}'; fi
+STUB
+printf '#!/bin/sh\nexit 0\n' > "$AC5/bin/lsof"
+cat > "$AC5/bin/tail" <<'STUB'
+#!/bin/sh
+case " $* " in *" /var/log/mac-studio-server/guard.jsonl "*) echo '{"event":"sample"}'; exit 0 ;; esac
+exec /usr/bin/tail "$@"
+STUB
+chmod +x "$AC5/bin/curl" "$AC5/bin/lsof" "$AC5/bin/tail"
+ac5() { ( export PATH="$AC5/bin:$PATH" MSS_CONF="$AC5/etc/backends.conf" MSS_STUB_STATE="$AC5/state" \
+              MSS_TEST_SYSROOT="$AC5/sysroot" MSS_PMSET="$ROOT/tests/stubs/pmset-autorestart-0"
+          sh "$ROOT/scripts/status.sh" 2>&1; echo "rc=$?" ) > "$AC5/$1.out"; }
+: > "$AC5/curl.log"; ac5 up
+grep -qx 'mlx (host=192.0.2.10 port=11234 lan-bound=yes):' "$AC5/up.out" && ok "AC5 the header names the LAN host" \
+    || fail "AC5 header: $(head -n 3 "$AC5/up.out")"
+grep -q '^  allowed  *192.0.2.0/24$' "$AC5/up.out" && ok "AC5 prints allowed:" || fail "AC5 allowed: $(cat "$AC5/up.out")"
+grep -q '^  listener  *listening on 192.0.2.10:11234$' "$AC5/up.out" && grep -q '^  health  *HTTP 200 (/health)$' "$AC5/up.out" \
+    && grep -q '^  model  *ready$' "$AC5/up.out" && ok "AC5 listener, /health and model ready from MLX_HOST:MLX_PORT" \
+    || fail "AC5 rows: $(cat "$AC5/up.out")"
+check "AC5 healthy exits 0" "rc=0" "$(tail -n 1 "$AC5/up.out")"
+check "AC5 no request to 127.0.0.1; /health and /v1/models on 192.0.2.10" "0 2" \
+    "$(grep -c '127\.0\.0\.1' "$AC5/curl.log") $(grep -c '^http://192\.0\.2\.10:11234/' "$AC5/curl.log")"
+: > "$AC5/down"; ac5 down; rm -f "${AC5:?}/down"
+check "AC5 a failed probe exits 1" "rc=1" "$(tail -n 1 "$AC5/down.out")"
+grep -q '^  health  *no response on /health$' "$AC5/down.out" && ok "AC5 names the failed probe" || fail "AC5 down: $(cat "$AC5/down.out")"
 
 echo "== phase A: an installed Mac and the hashing locale (#21) =="
 # D7 against a fixture conf: MSS_CONF decides in a non-root pass.
@@ -3797,7 +4114,7 @@ precedes "$RB/b3-again.log" 'com.mac-studio-server.ds4 stopped after' 'bootstrap
     || fail "B3 re-install stop order: $(grep -E 'stopped after|bootstrapped' "$RB/b3-again.log" | tr '\n' ' ')"
 precedes "$RB/b3-again.log" "$PFV" 'bootstrapped com.mac-studio-server.ds4' && ok "B3 re-install: pf verified before ds4 was bootstrapped" \
     || fail "B3 re-install order: $(grep -E 'pf verified|bootstrapped' "$RB/b3-again.log" | tr '\n' ' ')"
-check "B3 the marker holds this kern.boottime" "$(sysctl -n kern.boottime)" "$(cat "$MARKER" 2>/dev/null)"
+check "B3 the marker holds this boot's session id" "$(sysctl -n kern.bootsessionuuid)" "$(cat "$MARKER" 2>/dev/null)"
 MT=$(stat -f %m "$MARKER" 2>/dev/null || echo 0)
 [ "$MT" -ge "$START" ] && ok "B3 the re-install wrote the marker" || fail "B3 marker mtime $MT is before the re-install ($START)"
 wait_argv "$N" && ok "B3 ds4 started after the re-install" || fail "B3 ds4 did not start after the re-install"
@@ -3915,6 +4232,83 @@ sudo grep -q "^START: .* backend=mlx bin=$MBDP/mlx-serve model=$MBDP/model host=
 sh "$ROOT/scripts/status.sh" >"$MBD/mb1.status" 2>&1
 check "MB1 status exits 0" 0 $?
 sudo sh "$ROOT/scripts/uninstall.sh" --all >/dev/null 2>&1
+
+# MB33 (#33): mlx on a LAN address with an allowlist, then back to loopback.
+# The address is a TEST-NET alias on lo0 for this row only, so the real
+# ifconfig, the real listener and launchd all see it; pf goes through a copy of
+# pfctl-ok, so the runner's pf is never changed.
+LAN33=192.0.2.10
+lan_alias() { sudo /sbin/ifconfig lo0 alias "$LAN33" netmask 255.255.255.255; }
+lan_unalias() { sudo /sbin/ifconfig lo0 -alias "$LAN33" 2>/dev/null || true; }
+PFMB="$MBD/pfctl-ok"; cp "$ROOT/tests/stubs/pfctl-ok" "$PFMB"; chmod 0755 "$PFMB"
+sudo rm -f /tmp/mss-stub-pf.rules /tmp/mss-stub-pfctl-fail
+mlx_argv_lines() { cat /tmp/mss-stub-mlx-argv 2>/dev/null | wc -l | tr -d ' '; }
+mlx_wait_argv() { # mlx_wait_argv <count>: up to 30 s for a line after <count>
+    _i=0
+    while [ "$(mlx_argv_lines)" -le "$1" ] && [ "$_i" -lt 30 ]; do sleep 1; _i=$((_i + 1)); done
+    [ "$(mlx_argv_lines)" -gt "$1" ]
+}
+mlxlan() { _mll=$1; shift; mbi "$_mll" MSS_BACKENDS=mlx MLX_HOST="$LAN33" MLX_ALLOW_FROM=192.0.2.99 MSS_PFCTL="$PFMB" "$@"; }
+lan_unalias; lan_alias
+N33=$(mlx_argv_lines)
+mbi "$MBD/mb33a.log" MSS_BACKENDS=mlx MSS_PFCTL="$PFMB"
+check "MB33 loopback install exits 0" 0 $?
+mlx_wait_argv "$N33" >/dev/null; N33=$(mlx_argv_lines)
+mlxlan "$MBD/mb33.log"
+check "MB33 LAN install exits 0" 0 $?
+precedes "$MBD/mb33.log" 'pf verified by com.mac-studio-server.boot' "bootstrapped $ML" \
+    && ok "MB33 pf verified before mlx was bootstrapped" || fail "MB33 order: $(grep -E 'pf verified|bootstrapped' "$MBD/mb33.log" | tr '\n' ' ')"
+check "MB33 enabling LAN restarts mlx once" 1 "$(grep -c "^bootstrapped $ML\$" "$MBD/mb33.log")"
+grep -q '^hashing' "$MBD/mb33.log" && fail "MB33 enabling LAN hashed something" || ok "MB33 enabling LAN reads no model"
+check "MB33 the marker: this boot's session id, root:wheel 644" "$(sysctl -n kern.bootsessionuuid) root:wheel 644" \
+    "$(cat "$MARKER" 2>/dev/null) $(stat -f '%Su:%Sg %Lp' "$MARKER" 2>/dev/null)"
+mlx_wait_argv "$N33" && ok "MB33 mlx started after the LAN install" || fail "MB33 mlx did not start: $(sudo tail -3 "$LOGB/mlx.log")"
+MB33A=$(tail -n 1 /tmp/mss-stub-mlx-argv 2>/dev/null)
+check "MB33 argv carries the conf host" "--serve --model $MBDP/model --host $LAN33 --port 18234 --max-resident-models 1 --log-file off" "${MB33A#* }"
+sudo grep -q "^START: .* backend=mlx .* host=$LAN33 port=18234 " "$LOGB/mlx.log" \
+    && ok "MB33 the wrapper logged START with the LAN host" || fail "MB33 START: $(sudo tail -3 "$LOGB/mlx.log")"
+wait_open_on() { _i=0; while [ "$_i" -lt 30 ]; do nc -z "$1" "$2" >/dev/null 2>&1 && return 0; sleep 1; _i=$((_i + 1)); done; return 1; }
+wait_open_on "$LAN33" 18234 && ok "MB33 mlx listens on $LAN33:18234" || fail "MB33 no listener on $LAN33:18234"
+check "MB33 the loaded pf rules" "pass in quick on lo0 proto tcp to any port 18234
+pass in quick proto tcp from 192.0.2.99 to any port 18234
+block in quick proto tcp to any port 18234" "$(grep -v '^#' /tmp/mss-stub-pf.rules 2>/dev/null)"
+sh "$ROOT/scripts/status.sh" >"$MBD/mb33.status" 2>&1
+check "MB33 status exits 0 on the LAN host" 0 $?
+grep -q "^mlx (host=$LAN33 port=18234 lan-bound=yes):" "$MBD/mb33.status" && grep -q '^  allowed  *192.0.2.99$' "$MBD/mb33.status" \
+    && ok "MB33 status names the LAN host and the allowed client" || fail "MB33 status: $(head -n 8 "$MBD/mb33.status")"
+# A restart before the address is back, as at boot: the wrapper waits within its
+# bound, starts nothing meanwhile, then binds once the address appears.
+lan_unalias
+N33=$(mlx_argv_lines)
+sudo launchctl kickstart -k "system/$ML" >/dev/null 2>&1
+sleep 5
+check "MB33 nothing started while the address is missing" "$N33" "$(mlx_argv_lines)"
+lan_alias
+mlx_wait_argv "$N33" && ok "MB33 mlx started once the address appeared" || fail "MB33 no start after the address appeared: $(sudo tail -3 "$LOGB/mlx.log")"
+sudo grep -q "^WAIT: $LAN33 is not on any interface yet (up to 120s)" "$LOGB/mlx.log" \
+    && ok "MB33 the wrapper logged WAIT for the address" || fail "MB33 no WAIT line: $(sudo tail -3 "$LOGB/mlx.log")"
+check "MB33 after the wait, argv carries the conf host" "--host $LAN33" "$(tail -n 1 /tmp/mss-stub-mlx-argv | grep -o -- '--host [0-9.]*')"
+N33=$(mlx_argv_lines)
+mbi "$MBD/mb33b.log" MSS_BACKENDS=mlx MSS_PFCTL="$PFMB"
+check "MB33 back to loopback exits 0" 0 $?
+check "MB33 disabling LAN restarts mlx once" 1 "$(grep -c "^bootstrapped $ML\$" "$MBD/mb33b.log")"
+grep -q '^hashing' "$MBD/mb33b.log" && fail "MB33 disabling LAN hashed something" || ok "MB33 disabling LAN reads no model"
+mlx_wait_argv "$N33" >/dev/null
+check "MB33 argv is loopback again" "--host 127.0.0.1" "$(tail -n 1 /tmp/mss-stub-mlx-argv | grep -o -- '--host [0-9.]*')"
+check "MB33 no pf rule and no MLX_HOST in the conf" "MSS_PF_RULE_COUNT=0 0 0" \
+    "$(grep '^MSS_PF_RULE_COUNT=' "$CONFB") $(grep -c '^MLX_HOST=' "$CONFB") $(grep -c 'port 18234' "$ETCB/pf.conf")"
+# pf fails to enable: the LAN install stops at the boot check and mlx stays down.
+touch /tmp/mss-stub-pfctl-fail
+N33=$(mlx_argv_lines)
+mlxlan "$MBD/mb33c.log" && fail "MB33 a LAN install passed with pf failing" \
+    || { grep -q 'pf boot check failed' "$MBD/mb33c.log" && ok "MB33 a LAN install stops at the pf boot check" || fail "MB33 pf fail: $(tail -3 "$MBD/mb33c.log")"; }
+! loaded "$ML" && ok "MB33 mlx is not loaded after the failed pf check" || fail "MB33 labels: $(daemons)"
+[ ! -e "$MARKER" ] && ok "MB33 no marker after the failed pf check" || fail "MB33 a marker exists after the failed pf check"
+sleep 2
+check "MB33 mlx did not start (no new argv line)" "$N33" "$(mlx_argv_lines)"
+sudo rm -f /tmp/mss-stub-pfctl-fail /tmp/mss-stub-pf.rules
+sudo sh "$ROOT/scripts/uninstall.sh" --all >/dev/null 2>&1
+lan_unalias
 
 # MB14: ds4, then mlx added on standby: neither the backend nor the guard restarts.
 mbi "$MBD/mb14a.log" MSS_BACKENDS=ds4

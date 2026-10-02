@@ -68,13 +68,11 @@ fi
 #    without an allowlist is only accepted at install with an API key.
 PF_RULE_COUNT=$(mss_conf_get MSS_PF_RULE_COUNT); PF_RULE_COUNT=${PF_RULE_COUNT:-0}
 if ! mss_is_loopback_host "$HOST" && { [ "$PF_RULE_COUNT" != 0 ] || [ -z "$API_KEY_FILE" ]; }; then
-    _boot=$(sysctl -n kern.boottime 2>/dev/null || echo unavailable)
     _waited=0
-    while ! { [ -r "$BOOT_MARKER" ] && [ "$(cat "$BOOT_MARKER" 2>/dev/null)" = "$_boot" ]; }; do
-        [ "$_waited" -ge 120 ] && refuse "pf (no boot marker matching this kern.boottime after ${_waited}s)"
+    until mss_boot_marker_ok "$BOOT_MARKER"; do
+        [ "$_waited" -ge 120 ] && refuse "pf (no boot marker for this boot session after ${_waited}s)"
         sleep 1
         _waited=$((_waited + 1))
-        _boot=$(sysctl -n kern.boottime 2>/dev/null || echo unavailable)
     done
 fi
 

@@ -53,17 +53,15 @@ mss_validate_selection() {
 
 mss_backend_selected() { case ",${MSS_BACKENDS:-ollama}," in *",$1,"*) return 0 ;; esac; return 1; }
 
-# mss_mlx_loopback_check: MLX_HOST, MLX_ALLOW_FROM and MLX_API_KEY_FILE are not
-# keys (#1 D7); any non-empty one refuses. The root check and run_install_backends
-# both call it, because sudo would drop them before the root check sees them.
+# mss_mlx_loopback_check: MLX_API_KEY_FILE is not a key (#33 D1); a non-empty
+# one refuses. MLX_HOST and MLX_ALLOW_FROM are keys, validated like ds4's. The
+# root check and run_install_backends both call it, because sudo would drop it
+# before the root check sees it.
 mss_mlx_loopback_check() {
-    for _ml_var in MLX_HOST MLX_ALLOW_FROM MLX_API_KEY_FILE; do
-        eval "_ml_val=\${$_ml_var:-}"
-        [ -z "$_ml_val" ] || {
-            mss_error "$_ml_var: mlx is loopback-only in this release (mlx-serve cannot disable /v1/load-model or /api/pull)"
-            return 1
-        }
-    done
+    [ -z "${MLX_API_KEY_FILE:-}" ] || {
+        mss_error "MLX_API_KEY_FILE: mlx LAN access uses an allowlist; MLX_API_KEY_FILE is not supported"
+        return 1
+    }
     return 0
 }
 
@@ -294,7 +292,7 @@ mss_flag_kind() {
         esac
     elif [ "$_backend" = mlx ]; then
         # #1 D7: nothing here can widen the one-model memory bound, the
-        # loopback bind or the log file. Every other flag is rejected.
+        # bind address or the log file. Every other flag is rejected.
         case $_flag in
             --max-concurrent|--prefill-chunk|--kv-quant|--prefix-cache-mem|--timeout) echo value; return ;;
             --metrics|--mtp|--no-mtp|--no-vision) echo novalue; return ;;
@@ -480,6 +478,23 @@ mss_launchd_wait_gone() {
 # Read-only loader for runtime scripts: backends.conf is root:wheel 0644.
 mss_conf_path() { printf '%s\n' "${MSS_CONF:-/usr/local/etc/mac-studio-server/backends.conf}"; }
 
+# mss_boot_id: this boot's identity, the content of the pf boot marker (#33).
+# kern.bootsessionuuid is fixed for the whole boot. kern.boottime is derived
+# from the wall clock and moves when the clock is set after boot, so it cannot
+# prove "this boot". Prints nothing and fails when the kernel has no session id,
+# so a marker can never be written or matched without one.
+mss_boot_id() {
+    _bid=$(sysctl -n kern.bootsessionuuid 2>/dev/null) || return 1
+    mss_match "$_bid" '^[0-9A-Fa-f-]{8,64}$' || return 1
+    printf '%s\n' "$_bid"
+}
+
+# mss_boot_marker_ok <marker>: the marker exists and names this boot.
+mss_boot_marker_ok() {
+    _bmid=$(mss_boot_id) || return 1
+    [ -r "$1" ] && [ "$(cat "$1" 2>/dev/null)" = "$_bmid" ]
+}
+
 mss_conf_get() {
     _key=$1
     _file=$(mss_conf_path)
@@ -515,7 +530,7 @@ mss_envfile_keys() {
         LLAMACPP_EXTRA_ARGS \
         DS4_BIN DS4_MODEL DS4_MODEL_SHA256 DS4_HOST DS4_PORT DS4_ALLOW_FROM DS4_CTX \
         DS4_BATCHED_SESSIONS DS4_WORKDIR DS4_EXTRA_ARGS \
-        MLX_BIN MLX_MODEL_DIR MLX_PORT MLX_CTX MLX_EXTRA_ARGS \
+        MLX_BIN MLX_MODEL_DIR MLX_HOST MLX_PORT MLX_ALLOW_FROM MLX_CTX MLX_EXTRA_ARGS \
         MSS_GUARD_FREE_PCT MSS_GUARD_SWAP_HEADROOM_MB MSS_GUARD_STREAK MSS_LOG_MAX_MB
 }
 

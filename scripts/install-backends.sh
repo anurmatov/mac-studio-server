@@ -95,7 +95,9 @@ DS4_WORKDIR=${DS4_WORKDIR:-}
 DS4_EXTRA_ARGS=${DS4_EXTRA_ARGS:-}
 MLX_BIN=${MLX_BIN:-}
 MLX_MODEL_DIR=${MLX_MODEL_DIR:-}
+MLX_HOST=${MLX_HOST:-127.0.0.1}
 MLX_PORT=${MLX_PORT:-11234}
+MLX_ALLOW_FROM=${MLX_ALLOW_FROM:-}
 MLX_CTX=${MLX_CTX:-}
 MLX_EXTRA_ARGS=${MLX_EXTRA_ARGS:-}
 MSS_GUARD_FREE_PCT=${MSS_GUARD_FREE_PCT:-10}
@@ -518,7 +520,8 @@ validate_optional_backend() {
     esac
 }
 
-# The mlx branch (D7): loopback only, one model, the pinned version.
+# The mlx branch (D7): one model, the pinned version, and the ds4 bind rules
+# (#33 D1).
 validate_mlx() {
     mss_mlx_loopback_check || exit 1
     [ -n "$MLX_BIN" ] || mss_die "MLX_BIN is required when 'mlx' is selected"
@@ -534,7 +537,18 @@ validate_mlx() {
     MLX_MODEL_DIR_RESOLVED=$(mss_resolve_path "$MLX_MODEL_DIR" 2>/dev/null) \
         || mss_die "MLX_MODEL_DIR: '$MLX_MODEL_DIR' does not exist"
     mss_mlx_check_dir MLX_MODEL_DIR "$MLX_MODEL_DIR_RESOLVED" || exit 1
+    mss_validate_host MLX_HOST "$MLX_HOST" || exit 1
+    # mlx-serve's own default; it would listen on every interface.
+    [ "$MLX_HOST" != 0.0.0.0 ] || mss_die "MLX_HOST: 0.0.0.0 would listen on every interface; choose one local address"
+    if ! mss_is_loopback_host "$MLX_HOST"; then
+        mss_host_is_local "$MLX_HOST" || mss_die "MLX_HOST: '$MLX_HOST' is neither loopback nor assigned to a local interface"
+    fi
     mss_validate_port MLX_PORT "$MLX_PORT" || exit 1
+    mss_validate_allowlist MLX_ALLOW_FROM "$MLX_ALLOW_FROM" || exit 1
+    # LAN bind policy: as for ds4, an allowlist is the only protection.
+    if ! mss_is_loopback_host "$MLX_HOST"; then
+        [ -n "$MLX_ALLOW_FROM" ] || mss_die "MLX_ALLOW_FROM is required: mlx has no authentication and MLX_HOST is not loopback"
+    fi
     [ -z "$MLX_CTX" ] || mss_validate_uint MLX_CTX "$MLX_CTX" 1 1048576 || exit 1
     MLX_ARGS=$(mss_validate_extra_args mlx "$MLX_EXTRA_ARGS" MLX_EXTRA_ARGS) || exit 1
 }
@@ -690,6 +704,7 @@ PF_SPECS=""
 case $NEW_ACTIVE in
     llamacpp) _oh=$LLAMACPP_HOST; _op=$LLAMACPP_PORT; _oa=$LLAMACPP_ALLOW_FROM ;;
     ds4)      _oh=$DS4_HOST; _op=$DS4_PORT; _oa=$DS4_ALLOW_FROM ;;
+    mlx)      _oh=$MLX_HOST; _op=$MLX_PORT; _oa=$MLX_ALLOW_FROM ;;
     *)        _oh=127.0.0.1; _op=""; _oa="" ;;
 esac
 # pf applies only with an allowlist. llama.cpp on a LAN address with only an
@@ -769,6 +784,9 @@ render_state() {
         if mss_backend_selected mlx; then
             echo "MLX_BIN=$MLX_BIN_RESOLVED"
             echo "MLX_MODEL_DIR=$MLX_MODEL_DIR_RESOLVED"
+            # #33 D5: the default host is not written, so a loopback install
+            # renders 1.7.0's conf byte for byte. The allowlist lives only in pf.
+            [ "$MLX_HOST" = 127.0.0.1 ] || echo "MLX_HOST=$MLX_HOST"
             echo "MLX_PORT=$MLX_PORT"
             echo "MLX_CTX=$MLX_CTX"
             echo "MLX_ARGS=$MLX_ARGS"
@@ -839,8 +857,7 @@ plist_state() { # plist_state <top> <standby>: "<top|standby|absent> <sha|->"
 LOADED=""
 for _j in llamacpp ds4 mlx guard boot; do loaded "$_j" && LOADED="$LOADED $_j"; done
 _marker=missing
-_bt=$(sysctl -n kern.boottime 2>/dev/null)
-[ -z "$_bt" ] || [ "$(cat "$BOOT_MARKER" 2>/dev/null)" != "$_bt" ] || _marker=ok
+! mss_boot_marker_ok "$BOOT_MARKER" || _marker=ok
 PLAN=$(
     echo "active.cur $I_ACTIVE"
     echo "active.new $NEW_ACTIVE"
@@ -1021,17 +1038,14 @@ for _j in $START_SET; do
     case $_j in
         boot)
             # The backend starts only after boot has written a marker for this
-            # kern.boottime in this run: one left by an earlier install in the
+            # boot session in this run: one left by an earlier install in the
             # same boot would let it start under the old anchor.
             mss_lock_check
             mss_mut rm -f "$BOOT_MARKER" || true
             if ! bootstrap_label boot; then START_FAILED="launchctl bootstrap failed"; FAILED_JOB=boot; continue; fi
-            _boottime=$(sysctl -n kern.boottime 2>/dev/null)
             _n=0; _why=""
             while :; do
-                if [ -n "$_boottime" ] && [ -r "$BOOT_MARKER" ] && [ "$(cat "$BOOT_MARKER" 2>/dev/null)" = "$_boottime" ]; then
-                    break
-                fi
+                mss_boot_marker_ok "$BOOT_MARKER" && break
                 _rc=$(launchctl print "system/$(label boot)" 2>/dev/null \
                     | sed -n 's/^[[:space:]]*last exit code = \([0-9][0-9]*\).*/\1/p' | head -n 1)
                 if [ -n "$_rc" ] && [ "$_rc" != 0 ]; then _why="exit code $_rc"; break; fi

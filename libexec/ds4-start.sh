@@ -62,16 +62,14 @@ fi
 # 4. Guard trip.
 [ ! -e "$TRIP_MARKER" ] || refuse "guard tripped (sudo /usr/local/libexec/mac-studio-server/mss-enable.sh)"
 
-# 5. pf marker from this boot (ds4 has no auth; a LAN bind never starts
-#    without the firewall verified this boot).
+# 5. pf marker from this boot session (ds4 has no auth; a LAN bind never
+#    starts without the firewall verified this boot).
 if ! mss_is_loopback_host "$HOST"; then
-    _boot=$(sysctl -n kern.boottime 2>/dev/null || echo unavailable)
     _waited=0
-    while ! { [ -r "$BOOT_MARKER" ] && [ "$(cat "$BOOT_MARKER" 2>/dev/null)" = "$_boot" ]; }; do
-        [ "$_waited" -ge 120 ] && refuse "pf (no boot marker matching this kern.boottime after ${_waited}s)"
+    until mss_boot_marker_ok "$BOOT_MARKER"; do
+        [ "$_waited" -ge 120 ] && refuse "pf (no boot marker for this boot session after ${_waited}s)"
         sleep 1
         _waited=$((_waited + 1))
-        _boot=$(sysctl -n kern.boottime 2>/dev/null || echo unavailable)
     done
 fi
 
