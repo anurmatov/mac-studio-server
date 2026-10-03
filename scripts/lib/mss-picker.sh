@@ -6,7 +6,8 @@
 # step lists them). Prompts go to stderr, answers come from stdin. Every answer
 # goes through the same validators the installer uses; backends.env is written
 # only after the summary is confirmed. Installs, builds and downloads run only
-# after a y (the model menu's starter is the one default-yes), as the user.
+# after a y (the model menu's starter is the one default-yes), as the user. The
+# MLX model chooser's starter asks its own y/N, with N the default (#35).
 #
 # Results, as exported variables for the rest of install.sh:
 #   MSS_BACKENDS, MSS_ACTIVE_BACKEND (two or more optional backends),
@@ -157,9 +158,9 @@ _mss_pick_allow_valid() {
     mss_validate_allowlist "allowlist" "$1"
 }
 
-# A menu answer between 1 and MSS_PICK_MENU_MAX.
+# A menu answer between 1 and MSS_PICK_MENU_MAX (the MLX chooser has up to 11).
 _mss_pick_num_valid() {
-    case $1 in [1-9]) [ "$1" -le "$MSS_PICK_MENU_MAX" ] && return 0 ;; esac
+    case $1 in [1-9]|[1-9][0-9]) [ "$1" -le "$MSS_PICK_MENU_MAX" ] && return 0 ;; esac
     mss_error "choose a number from 1 to $MSS_PICK_MENU_MAX"
     return 1
 }
@@ -702,8 +703,9 @@ _mss_pick_host_choices() {
 # ── MLX-Serve (#1 D8) ──────────────────────────────────────────────────────────
 # A saved or found mlx-serve is used when it is exactly the pinned version. A
 # different version is named and the path asked; with none found, Homebrew is
-# offered. The model is a native MLX checkpoint directory. _mss_pick_backend
-# asks the LAN questions and keeps the port, as for ds4 (#33 D2).
+# offered. The model is a native MLX checkpoint directory, from the MLX model
+# chooser (#35). _mss_pick_backend asks the LAN questions and keeps the port,
+# as for ds4 (#33 D2).
 _mss_pick_mlx() {
     local found bin="" mism=0
     found=$(printenv MLX_BIN)
@@ -731,8 +733,96 @@ _mss_pick_mlx() {
         bin=$MSS_ANSWER
     fi
     _mss_pick_set MLX_BIN "$bin"
-    mss_ask "MLX model directory (config.json and *.safetensors)" "$(printenv MLX_MODEL_DIR)" _mss_pick_mlx_dir_valid
-    _mss_pick_set MLX_MODEL_DIR "$MSS_ANSWER"
+    _mss_pick_mlx_model
+}
+
+# The MLX model chooser (#35): the saved directory, the pinned starter download,
+# complete checkpoints found on disk, or any directory. Enter keeps a usable
+# saved directory and takes the starter only when nothing else exists; with
+# checkpoints found there is no default, so Enter never downloads. A declined
+# or failed download comes back here. Nothing here runs mlx-serve, loads a
+# model or touches a service.
+_mss_pick_mlx_model() {
+    local saved reason starter="" out line found="" skipped=0 total=0 more=0 n=0 def="" choice i
+    local keep_n=0 dl_n=0 dir_n first_n rows="" path tab
+    tab=$(printf '\t')
+    saved=$(printenv MLX_MODEL_DIR)
+    if [ -n "$saved" ] && ! reason=$(_mss_pick_mlx_dir_valid "$saved" 2>&1 >/dev/null); then
+        reason=$(printf '%s\n' "$reason" | head -n 1)
+        echo "saved MLX_MODEL_DIR $saved is not usable: ${reason#ERROR: }" >&2
+        saved=""
+    fi
+    mss_mlx_catalog_check && starter=$(mss_mlx_catalog_ids starter | head -n 1)
+    # Found checkpoints, each once (the saved one is the keep row), shown as
+    # found, sorted by that and capped at 8 rows; a row saves the resolved path.
+    out=$(mss_mlx_find_models)
+    while IFS= read -r line; do
+        case $line in
+            "found "*)
+                path=${line#found }; path=${path%% *}
+                if [ -n "$saved" ] && [ "$path" = "$(mss_resolve_path "$saved" 2>/dev/null)" ]; then continue; fi
+                found="$found$(_mss_pick_tilde "${line#found "$path" }")$tab$path
+" ;;
+            "skipped "*) skipped=${line#skipped } ;;
+        esac
+    done <<MSS_FOUND_EOF
+$out
+MSS_FOUND_EOF
+    found=$(printf '%s' "$found" | LC_ALL=C sort -t "$tab" -k 1,1)
+    [ -z "$found" ] || total=$(printf '%s\n' "$found" | grep -c .)
+    [ "$total" -le 8 ] || { more=$((total - 8)); found=$(printf '%s\n' "$found" | head -n 8); }
+    [ "$skipped" = 0 ] || echo "skipped $skipped unusable checkpoint directories" >&2
+
+    if [ -n "$saved" ]; then
+        n=$((n + 1)); keep_n=$n; def=$n
+        rows="$rows  $n) keep $(_mss_pick_tilde "$saved") (saved)
+"
+    fi
+    if [ -n "$starter" ]; then
+        n=$((n + 1)); dl_n=$n
+        rows="$rows  $n) download $starter, $(mss_human_size "$(mss_mlx_catalog_total "$starter")") (small starter: checks the install, not for production use)
+"
+        [ -n "$def" ] || [ -n "$found" ] || def=$n
+    fi
+    first_n=$((n + 1))
+    while IFS=$tab read -r line path; do
+        [ -n "$path" ] || continue
+        n=$((n + 1))
+        rows="$rows  $n) $line (found)
+"
+    done <<MSS_FOUND_EOF
+$found
+MSS_FOUND_EOF
+    [ "$more" = 0 ] || rows="$rows  $more more found: use \"another directory\"
+"
+    n=$((n + 1)); dir_n=$n
+    rows="$rows  $n) another directory
+"
+    while :; do
+        echo "mlx model (a native MLX checkpoint directory):" >&2
+        printf '%s' "$rows" >&2
+        MSS_PICK_MENU_MAX=$n
+        mss_ask "mlx model" "$def" _mss_pick_num_valid
+        choice=$MSS_ANSWER
+        if [ "$choice" = "$keep_n" ]; then
+            _mss_pick_set MLX_MODEL_DIR "$saved"
+            return 0
+        elif [ "$choice" = "$dl_n" ]; then
+            if mss_acquire_mlx_model "$starter"; then
+                _mss_pick_set MLX_MODEL_DIR "$MSS_MLX_ACQUIRED"
+                return 0
+            fi
+        elif [ "$choice" = "$dir_n" ]; then
+            mss_ask "MLX model directory (config.json and *.safetensors)" "$(printenv MLX_MODEL_DIR)" _mss_pick_mlx_dir_valid
+            _mss_pick_set MLX_MODEL_DIR "$MSS_ANSWER"
+            return 0
+        else
+            i=$((choice - first_n + 1))
+            path=$(printf '%s\n' "$found" | sed -n "${i}p" | cut -f 2)
+            _mss_pick_set MLX_MODEL_DIR "$path"
+            return 0
+        fi
+    done
 }
 
 # ── the active optional backend (#1 D8 step 4) ─────────────────────────────────
