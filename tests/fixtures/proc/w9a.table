@@ -1,0 +1,6 @@
+# w9a: the parent is ollama run x: check 4
+# #35 worker identity fixture. Tab-separated: pid ppid uid lstart lsof comm exe args.
+# tests/run.sh substitutes @D@ (Ollama's directory), @T@ (its parent), @U@ (the
+# owner's uid), @O@ (another uid) and @BLOB@ (a 300-character --model path).
+99100	1	@U@	Thu_Oct__2_10:00:00_2026	ok	@D@/ollama	@D@/ollama	@D@/ollama run x
+99101	99100	@U@	Thu_Oct__2_10:00:05_2026	ok	@D@/llama-server	@D@/llama-server	@D@/llama-server --model @BLOB@ --port 51234 --host 127.0.0.1 --no-webui --offline -c 8192 -np 1 --embedding

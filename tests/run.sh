@@ -121,7 +121,7 @@ echo "== phase A: static =="
 if command -v shellcheck >/dev/null 2>&1; then
     if shellcheck -S warning -s sh "$ROOT"/libexec/*.sh "$ROOT"/scripts/lib/mss-common.sh "$ROOT"/scripts/lib/mss-host.sh "$ROOT"/scripts/install-backends.sh "$ROOT"/scripts/status.sh "$ROOT"/scripts/uninstall.sh "$ROOT"/scripts/lib/mss-envfile-set.sh "$ROOT"/tests/expect/host-steps.sh \
         "$ROOT"/tests/stubs/fake-mlx-serve.sh "$ROOT"/tests/stubs/hold-lock.sh "$ROOT"/tests/stubs/hold-mut-ex.sh \
-        "$ROOT"/tests/stubs/mv-kill/mv "$ROOT"/tests/stubs/mv-slow/mv "$ROOT"/tests/stubs/*/launchctl; then
+        "$ROOT"/tests/stubs/mv-kill/mv "$ROOT"/tests/stubs/mv-slow/mv "$ROOT"/tests/stubs/*/launchctl "$ROOT"/tests/stubs/proc-table/*; then
         ok "shellcheck -s sh"
     else
         fail "shellcheck -s sh"
@@ -2452,12 +2452,15 @@ else
     printf '#!/bin/sh\nMSS_STUB_MLX_VERSION=26.9.6 exec "%s" "$@"\n' "$ROOT/tests/stubs/fake-mlx-serve.sh" > "$PK/mlxold/mlx-serve"
     chmod +x "$PK/mlxold/mlx-serve"
     MLXD="$TMP/fix/mlx/model"
+    # #35: the MLX model chooser comes first. Nothing is saved or found here,
+    # so the starter is [1] and "another directory" is 2, then today's prompt.
+    MLX_MENU_DIR="mlx model [1]: ${T}2"
     MLX_DIR_Q="(config.json and *.safetensors): ${T}$MLXD"
     # #33 D2: mlx gets the ds4 LAN question; these rows keep it on loopback.
     MLX_LAN_NO="LAN access to mlx? [y/N]: ${T}@ENTER"
 
     # MP1: fresh, ollama and mlx: no active question, no MSS_ACTIVE_BACKEND.
-    DRIVE_PATH="$PK/mlxbin" drive mp1 "Choose [1]: ${T}1,4" "$MLX_DIR_Q" "$MLX_LAN_NO" "auto-updates)? ${T}@ENTER" "$G_ENTER" \
+    DRIVE_PATH="$PK/mlxbin" drive mp1 "Choose [1]: ${T}1,4" "$MLX_MENU_DIR" "$MLX_DIR_Q" "$MLX_LAN_NO" "auto-updates)? ${T}@ENTER" "$G_ENTER" \
         "$P_ENTER" "$DA_ENTER" "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/mp1.env"
     check "MP1 fresh 1,4 completes" 0 $?
     tr_of mp1 | grep -q 'Which optional backend' && fail "MP1 asked the active question" || ok "MP1 no active question"
@@ -2473,7 +2476,7 @@ else
 
     # MP7 (#33 AC3): LAN yes for mlx asks the ds4 questions. An invalid and an
     # empty allowlist are asked again; the summary shows the address, then allowed:.
-    DRIVE_PATH="$PK/mlxbin" drive mp7 "Choose [1]: ${T}4" "$MLX_DIR_Q" "LAN access to mlx? [y/N]: ${T}y" \
+    DRIVE_PATH="$PK/mlxbin" drive mp7 "Choose [1]: ${T}4" "$MLX_MENU_DIR" "$MLX_DIR_Q" "LAN access to mlx? [y/N]: ${T}y" \
         "listen on [192.0.2.10]: ${T}@ENTER" "(space-separated): ${T}192.0.2.0/0" "(space-separated): ${T}@ENTER" \
         "(space-separated): ${T}192.0.2.0/24" "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" "$DA_ENTER" \
         "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/mp7.env"
@@ -2487,7 +2490,7 @@ else
         "$(tr_of mp7 | grep -A1 '^  mlx: ' | tr '\n' '|' | sed 's/|$//')"
     grep -q 'API key file' "$PK/mp7.transcript" && fail "MP7 asked for a key file" || ok "MP7 no key-file question"
     # A saved LAN answer is the next run's default; "no" goes back to loopback.
-    DRIVE_PATH="$PK/mlxbin" drive mp7n "Choose [4]: ${T}@ENTER" "(config.json and *.safetensors) [$MLXD]: ${T}@ENTER" \
+    DRIVE_PATH="$PK/mlxbin" drive mp7n "Choose [4]: ${T}@ENTER" "mlx model [1]: ${T}3" "(config.json and *.safetensors) [$MLXD]: ${T}@ENTER" \
         "LAN access to mlx? [Y/n]: ${T}n" "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" "$DA_ENTER" \
         "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/mp7.env"
     check "MP7 a saved LAN mlx defaults to Y, and n completes" 0 $?
@@ -2495,7 +2498,7 @@ else
 
     # MP2: ds4 and mlx, mlx active; the ds4 model menu has no "later".
     DRIVE_PATH="$PK/mlxbin" drive mp2 "Choose [1]: ${T}3,4" "own file/URL: ${T}3" "path or https URL: ${T}$DS4M" \
-        "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" "LAN access to ds4? [y/N]: ${T}@ENTER" "$MLX_DIR_Q" "$MLX_LAN_NO" \
+        "[Y/n]: ${T}@ENTER" "[Y/n]: ${T}@ENTER" "LAN access to ds4? [y/N]: ${T}@ENTER" "$MLX_MENU_DIR" "$MLX_DIR_Q" "$MLX_LAN_NO" \
         "1) ds4 2) mlx 3) none [1]: ${T}2" "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" "$DA_ENTER" \
         "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/mp2.env" DS4_BIN="$DS4B"
     check "MP2 3,4 with mlx active completes" 0 $?
@@ -2510,7 +2513,7 @@ else
     envfile mp3.env "MSS_BACKENDS=ollama,ds4\nMSS_TUNE_MACOS=no\nDS4_BIN=$DS4B\nDS4_MODEL=$DS4M\nDS4_MODEL_SHA256=$DS4S\n"
     DRIVE_PATH="$PK/mlxbin" drive mp3n "Choose [1,3]: ${T}1,4" "saved answers are kept. [y/N]: ${T}@ENTER" \
         "(.gguf) path [$DS4M]: ${T}@ENTER" "c computes it now) [$DS4S]: ${T}@ENTER" "LAN access to ds4? [y/N]: ${T}@ENTER" \
-        "$MLX_DIR_Q" "$MLX_LAN_NO" "1) ds4 2) mlx 3) none [1]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" "$DA_ENTER" \
+        "$MLX_MENU_DIR" "$MLX_DIR_Q" "$MLX_LAN_NO" "1) ds4 2) mlx 3) none [1]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" "$DA_ENTER" \
         "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/mp3.env" MSS_CONF="$PK/mp3.conf"
     check "MP3 N keeps ds4 and completes" 0 $?
     tr_of mp3n | grep -q '^ds4 is installed. Remove it now with sudo scripts/uninstall.sh --backend ds4? Its model files and saved answers are kept. \[y/N\]: ' \
@@ -2526,7 +2529,7 @@ echo "SWITCH=[$MSS_SWITCH_FROM] REPLACE=[$MSS_PICKER_REPLACE]"
 PICK
     envfile mp3y.env "MSS_BACKENDS=ollama,ds4\nMSS_TUNE_MACOS=no\nDS4_BIN=$DS4B\nDS4_MODEL=$DS4M\nDS4_MODEL_SHA256=$DS4S\n"
     : > "$PK/mp3y.steps"
-    for st in "Choose [1,3]: ${T}1,4" "saved answers are kept. [y/N]: ${T}y" "$MLX_DIR_Q" "$MLX_LAN_NO" "auto-updates)? ${T}@ENTER" \
+    for st in "Choose [1,3]: ${T}1,4" "saved answers are kept. [y/N]: ${T}y" "$MLX_MENU_DIR" "$MLX_DIR_Q" "$MLX_LAN_NO" "auto-updates)? ${T}@ENTER" \
         "$G_ENTER" "$P_ENTER" "$DA_ENTER" "Install with these settings? [Y/n]: ${T}@ENTER"; do
         printf '%s\n' "$st" >> "$PK/mp3y.steps"
     done
@@ -2548,7 +2551,7 @@ PICK
     check "MP4 the menu was asked three times" 3 "$(tr_of mp4 | grep -c 'Choose \[1\]: ')"
 
     # MP5: another mlx-serve version on PATH: named, then the path is asked.
-    DRIVE_PATH="$PK/mlxold" drive mp5 "Choose [1]: ${T}4" "mlx-serve 26.10.1 binary path: ${T}$PK/mlxbin/mlx-serve" "$MLX_DIR_Q" \
+    DRIVE_PATH="$PK/mlxold" drive mp5 "Choose [1]: ${T}4" "mlx-serve 26.10.1 binary path: ${T}$PK/mlxbin/mlx-serve" "$MLX_MENU_DIR" "$MLX_DIR_Q" \
         "$MLX_LAN_NO" "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" "$DA_ENTER" "Save? [Y/n]: ${T}@ENTER" -- MSS_ENV_FILE="$PK/mp5.env"
     check "MP5 a mismatched mlx-serve, then a good path, completes" 0 $?
     _mm=$(tr_of mp5 | grep -n 'mlx-serve 26.9.6 is installed; this release supports 26.10.1 only' | head -n 1 | cut -d: -f1)
@@ -3424,6 +3427,364 @@ check "AC5 no request to 127.0.0.1; /health and /v1/models on 192.0.2.10" "0 2" 
 : > "$AC5/down"; ac5 down; rm -f "${AC5:?}/down"
 check "AC5 a failed probe exits 1" "rc=1" "$(tail -n 1 "$AC5/down.out")"
 grep -q '^  health  *no response on /health$' "$AC5/down.out" && ok "AC5 names the failed probe" || fail "AC5 down: $(cat "$AC5/down.out")"
+
+echo "== phase A: #35 MLX model chooser (MX1-MX12) =="
+MX=$TMP/mx35; mkdir -p "$MX"
+# MX1: the shipped catalogue.
+mss_mlx_catalog_check && ok "MX1 config/mlx.catalog passes its check" || fail "MX1 config/mlx.catalog is refused"
+check "MX1 the starter: 652027143 bytes (652 MB), 10 files" "qwen3.5-0.8b-4bit 652027143 652 MB 10" \
+    "$(mss_mlx_catalog_ids starter) $(mss_mlx_catalog_total qwen3.5-0.8b-4bit) $(mss_human_size 652027143) $(mss_mlx_catalog_files qwen3.5-0.8b-4bit | grep -c .)"
+check "MX1 the test id is test-only, 147874605 bytes" "smollm2-135m-8bit 147874605" \
+    "$(mss_mlx_catalog_ids test) $(mss_mlx_catalog_total smollm2-135m-8bit)"
+check "MX1 the starter's repo and revision" "mlx-community/Qwen3.5-0.8B-MLX-4bit 5d894f8cc4ef3e6c88537bf3746ed262f549da6a" \
+    "$(mss_mlx_catalog_get qwen3.5-0.8b-4bit repo) $(mss_mlx_catalog_get qwen3.5-0.8b-4bit revision)"
+# MX2: each invalid catalogue is refused with its named error.
+for _c in "dotdot|path \"../model.safetensors\" is not a relative name (no .., no leading . or /, at most one /)" \
+    "absolute|path \"/model.safetensors\" is not a relative name (no .., no leading . or /, at most one /)" \
+    "mixed-revision|m rows disagree on repo, revision, role or license" "no-config|m has no top-level config.json" \
+    "dup-path|m lists config.json twice" "two-starters|more than one starter (a, b)"; do
+    _cf=${_c%%|*}; _ce=${_c#*|}
+    _co=$(MSS_MLX_CATALOG="$ROOT/tests/fixtures/mlx-catalog/$_cf.tsv" mss_mlx_catalog_check 2>&1); _cr=$?
+    if [ "$_cr" = 1 ] && printf '%s\n' "$_co" | grep -qF -- "$_ce; no download is offered"; then ok "MX2 $_cf is refused: $_ce"
+    else fail "MX2 $_cf (rc $_cr): $_co"; fi
+done
+for _cf in bad-sha size-plus-one; do
+    MSS_MLX_CATALOG="$ROOT/tests/fixtures/mlx-catalog/$_cf.tsv" mss_mlx_catalog_check \
+        && ok "MX2 the MXN fixture $_cf is a valid catalogue" || fail "MX2 $_cf is refused"
+done
+# MX4: discovery by name. mlx-serve's <org>/<repo> and ~/models/<name>; three
+# incomplete leaves are counted, never an <org> parent, a GGUF folder or an empty one.
+mxmodel() { mkdir -p "$1"; printf '{}\n' > "$1/config.json"; printf 'w' > "$1/model.safetensors"; }
+H4=$MX/h4; mkdir -p "$H4"; H4P=$(cd "$H4" && pwd -P)
+mxmodel "$H4/.mlx-serve/models/mlx-community/beta"; mxmodel "$H4/.mlx-serve/models/mlx-community/alpha"
+mxmodel "$H4/models/partial"; : > "$H4/models/partial/model.safetensors.partial"
+mxmodel "$H4/models/withgguf"; : > "$H4/models/withgguf/model.gguf"
+mxmodel "$H4/models/badindex"; printf '{"weight_map":{"a":"model-00002-of-00002.safetensors"}}' > "$H4/models/badindex/model.safetensors.index.json"
+mkdir -p "$H4/models/ggufonly" "$H4/models/empty"; : > "$H4/models/ggufonly/m.gguf"
+ln -s "$H4/.mlx-serve/models/mlx-community/alpha" "$H4/models/alpha-link"
+mxmodel "$H4/.mlx-serve/models/.mss-staging/mlx-community/gamma"
+check "MX4 discovery: the two complete ones, once each, and 3 skipped" \
+    "found $H4P/.mlx-serve/models/mlx-community/alpha $H4/.mlx-serve/models/mlx-community/alpha|found $H4P/.mlx-serve/models/mlx-community/beta $H4/.mlx-serve/models/mlx-community/beta|skipped 3" \
+    "$(HOME=$H4 mss_mlx_find_models 2>&1 | LC_ALL=C sort | tr '\n' '|' | sed 's/|$//')"
+
+if [ "$(id -u)" -eq 0 ] || ! command -v expect >/dev/null 2>&1; then
+    echo "skip - the MLX chooser drives need expect and a non-root user"
+else
+    # Every drive: the stub mlx-serve, no model server (an empty process table)
+    # and 500 GiB free, unless a row says otherwise. HOME is the row's own.
+    PT="$ROOT/tests/stubs/proc-table"
+    printf '# no processes\n' > "$MX/empty.table"
+    printf '#!/bin/sh\necho "Filesystem 1024-blocks Used Available Capacity Mounted on"\necho "/dev/disk3s1 1048576000 524288000 524288000 50%% /"\n' \
+        > "$MX/dfbig"; chmod +x "$MX/dfbig"
+    MXENV="MSS_PROC_TABLE=$MX/empty.table MSS_DF=$MX/dfbig"
+    MXPATH="$PK/mlxbin:$PT"
+    MXHEAD='mlx model (a native MLX checkpoint directory):'
+    MXSTART='download qwen3.5-0.8b-4bit, 652 MB (small starter: checks the install, not for production use)'
+    MXDEST='~/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit'
+
+    # MX3: a fresh run shows A.2's menu with the starter as [1]; n at the
+    # consent goes back to the menu and creates nothing.
+    mkdir -p "$MX/h3"
+    # shellcheck disable=SC2086  # MXENV is a word list of assignments
+    DRIVE_PATH=$MXPATH drive mx3 "Choose [1]: ${T}4" "mlx model [1]: ${T}@ENTER" "free)? [y/N]: ${T}n" "mlx model [1]: ${T}2" \
+        "(config.json and *.safetensors): ${T}@INTR" -- MSS_ENV_FILE="$MX/mx3.env" HOME="$MX/h3" $MXENV
+    check "MX3 the menu, byte for byte" "$MXHEAD|  1) $MXSTART|  2) another directory|mlx model [1]: " \
+        "$(tr_of mx3 | grep -A3 -m1 -xF "$MXHEAD" | tr '\n' '|' | sed 's/|$//')"
+    tr_of mx3 | grep -qxF "Download qwen3.5-0.8b-4bit (652 MB, 10 files) to $MXDEST (500 GiB free)? [y/N]: n" \
+        && ok "MX3 the consent names the size, 10 files, the destination and the free space" \
+        || fail "MX3 consent: $(tr_of mx3 | grep '^Download')"
+    check "MX3 n went back to the menu" 2 "$(tr_of mx3 | grep -cxF "$MXHEAD")"
+    [ ! -e "$MX/h3/.mlx-serve" ] && ok "MX3 nothing was created (no ~/.mlx-serve)" || fail "MX3 created $(find "$MX/h3/.mlx-serve" | head -3)"
+    [ ! -e "$MX/mx3.env" ] && ok "MX3 nothing was saved" || fail "MX3 saved a file"
+
+    # MX2: a refused catalogue: no download row, "another directory" still there.
+    mkdir -p "$MX/h2"
+    # shellcheck disable=SC2086
+    DRIVE_PATH=$MXPATH drive mx2 "Choose [1]: ${T}4" "mlx model: ${T}@INTR" -- MSS_ENV_FILE="$MX/mx2.env" HOME="$MX/h2" $MXENV \
+        MSS_MLX_CATALOG="$ROOT/tests/fixtures/mlx-catalog/two-starters.tsv"
+    check "MX2 a refused catalogue: the menu is another directory only, no default" "$MXHEAD|  1) another directory|mlx model: " \
+        "$(tr_of mx2 | grep -A2 -m1 -xF "$MXHEAD" | sed 's/\^C$//' | tr '\n' '|' | sed 's/|$//')"
+    tr_of mx2 | grep -q '^ERROR: mlx catalogue .*: more than one starter (a, b); no download is offered$' \
+        && ok "MX2 the menu names the catalogue error" || fail "MX2: $(tr_of mx2 | grep ERROR)"
+
+    # MX4: found checkpoints are listed sorted, a symlink once, no default; a
+    # found row is saved by its resolved path.
+    # shellcheck disable=SC2086
+    DRIVE_PATH=$MXPATH drive mx4 "Choose [1]: ${T}4" "mlx model: ${T}3" "LAN access to mlx? [y/N]: ${T}@ENTER" \
+        "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" "$DA_ENTER" "Save? [Y/n]: ${T}@ENTER" -- \
+        MSS_ENV_FILE="$MX/mx4.env" HOME="$H4" $MXENV
+    check "MX4 completes" 0 $?
+    check "MX4 the menu" "$MXHEAD|  1) $MXSTART|  2) ~/.mlx-serve/models/mlx-community/alpha (found)|  3) ~/.mlx-serve/models/mlx-community/beta (found)|  4) another directory|mlx model: 3" \
+        "$(tr_of mx4 | grep -A5 -m1 -xF "$MXHEAD" | tr '\n' '|' | sed 's/|$//')"
+    check "MX4 exactly one skipped line: 3" 1 "$(tr_of mx4 | grep -cx 'skipped 3 unusable checkpoint directories')"
+    check "MX4 no ERROR: line from discovery" 0 "$(tr_of mx4 | grep -c '^ERROR:')"
+    check "MX4 saved the resolved found path" "$H4P/.mlx-serve/models/mlx-community/beta" "$(sed -n 's/^MLX_MODEL_DIR=//p' "$MX/mx4.env" 2>/dev/null)"
+    # 9 complete checkpoints: 8 rows and "1 more found".
+    for _i in 1 2 3 4 5 6 7 8 9; do mxmodel "$MX/h4b/models/m$_i"; done
+    # shellcheck disable=SC2086
+    DRIVE_PATH=$MXPATH drive mx4b "Choose [1]: ${T}4" "mlx model: ${T}@INTR" -- MSS_ENV_FILE="$MX/mx4b.env" HOME="$MX/h4b" $MXENV
+    check "MX4 nine found: rows m1-m8, then 1 more found" "m1 m2 m3 m4 m5 m6 m7 m8|  1 more found: use \"another directory\"|  10) another directory" \
+        "$(tr_of mx4b | sed -n 's|^  [0-9]*) ~/models/\(m[0-9]\) (found)$|\1|p' | tr '\n' ' ' | sed 's/ $//')|$(tr_of mx4b | grep -x '  1 more found.*')|$(tr_of mx4b | grep -x '  10) another directory')"
+
+    # MX5: a saved, valid directory is kept by Enter; the saved answers are unchanged.
+    mkdir -p "$MX/h5"
+    # shellcheck disable=SC2086
+    DRIVE_PATH=$MXPATH drive mx5a "Choose [1]: ${T}4" "mlx model [1]: ${T}2" "(config.json and *.safetensors): ${T}$MLXD" \
+        "LAN access to mlx? [y/N]: ${T}@ENTER" "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" "$DA_ENTER" "Save? [Y/n]: ${T}@ENTER" -- \
+        MSS_ENV_FILE="$MX/mx5.env" HOME="$MX/h5" $MXENV
+    grep -v '^#' "$MX/mx5.env" > "$MX/mx5.before" 2>/dev/null
+    # shellcheck disable=SC2086
+    DRIVE_PATH=$MXPATH drive mx5b "Choose [4]: ${T}@ENTER" "mlx model [1]: ${T}@ENTER" "LAN access to mlx? [y/N]: ${T}@ENTER" \
+        "auto-updates)? ${T}@ENTER" "$G_ENTER" "$P_ENTER" "$DA_ENTER" "Save? [Y/n]: ${T}@ENTER" -- \
+        MSS_ENV_FILE="$MX/mx5.env" HOME="$MX/h5" $MXENV
+    check "MX5 --configure with a saved directory completes" 0 $?
+    tr_of mx5b | grep -A1 -m1 -xF "$MXHEAD" | grep -qxF "  1) keep $MLXD (saved)" && ok "MX5 the keep row is 1) and the default" \
+        || fail "MX5 menu: $(tr_of mx5b | grep -A3 -xF "$MXHEAD")"
+    [ -s "$MX/mx5.before" ] && grep -v '^#' "$MX/mx5.env" | cmp -s - "$MX/mx5.before" \
+        && ok "MX5 Enter at keep saves the same answers" || fail "MX5 saved answers changed: $(grep -v '^#' "$MX/mx5.env" | diff "$MX/mx5.before" - )"
+
+    # MX6: a saved directory that is no longer usable: named once, no keep row.
+    mkdir -p "$MX/h6"
+    printf 'MSS_BACKENDS=mlx\nMLX_BIN=%s\nMLX_MODEL_DIR=%s\n' "$PK/mlxbin/mlx-serve" "$MX/gone" > "$MX/mx6.env"; chmod 600 "$MX/mx6.env"
+    # shellcheck disable=SC2086
+    DRIVE_PATH=$MXPATH drive mx6 "Choose [4]: ${T}@ENTER" "mlx model [1]: ${T}@INTR" -- MSS_ENV_FILE="$MX/mx6.env" HOME="$MX/h6" $MXENV
+    check "MX6 the saved directory is named once as not usable" 1 \
+        "$(tr_of mx6 | grep -c "^saved MLX_MODEL_DIR $MX/gone is not usable: ")"
+    tr_of mx6 | grep -q ') keep ' && fail "MX6 offered keep" || ok "MX6 no keep row"
+
+    # MX7: a running ollama, llama-server or mlx-serve (a copied sleep): the
+    # starter prints why and goes back to the menu; nothing is staged.
+    mkdir -p "$MX/h7" "$MX/sl"
+    for _n in ollama llama-server mlx-serve; do
+        cp /bin/sleep "$MX/sl/$_n"; "$MX/sl/$_n" 60 & _sp=$!
+        sleep 0.5
+        DRIVE_PATH="$PK/mlxbin" drive "mx7-$_n" "Choose [1]: ${T}4" "mlx model [1]: ${T}@ENTER" "mlx model [1]: ${T}@INTR" -- \
+            MSS_ENV_FILE="$MX/mx7.env" HOME="$MX/h7" MSS_DF="$MX/dfbig"
+        tr_of "mx7-$_n" | grep -qxF "$_n (pid $_sp) is running; a download is checked by reading it, and nothing is read while Ollama or a model server runs. Stop it, or choose \"another directory\"" \
+            && ok "MX7 a running $_n blocks the starter" || fail "MX7 $_n: $(tr_of "mx7-$_n" | grep -i 'running' | head -n 2)"
+        kill "$_sp" 2>/dev/null; wait "$_sp" 2>/dev/null
+    done
+    [ ! -e "$MX/h7/.mlx-serve" ] && ok "MX7 no .mss-staging was created" || fail "MX7 created $(find "$MX/h7/.mlx-serve" | head -3)"
+
+    # MX8: not enough space: refused before anything is created.
+    mkdir -p "$MX/h8"
+    DRIVE_PATH=$MXPATH drive mx8 "Choose [1]: ${T}4" "mlx model [1]: ${T}@ENTER" "mlx model [1]: ${T}@INTR" -- \
+        MSS_ENV_FILE="$MX/mx8.env" HOME="$MX/h8" MSS_PROC_TABLE="$MX/empty.table" MSS_DF="$ROOT/tests/stubs/df-low"
+    tr_of mx8 | grep -qxF 'not enough space: needs 1.7 GB, 1.1 GB free' && ok "MX8 not enough space" \
+        || fail "MX8: $(tr_of mx8 | grep -i space)"
+    [ ! -e "$MX/h8/.mlx-serve" ] && ok "MX8 nothing was created" || fail "MX8 created ~/.mlx-serve"
+
+    # MX10: a plain install.sh with saved answers asks nothing, the chooser included.
+    mkdir -p "$MX/mx10"
+    printf 'MSS_BACKENDS=mlx\nMSS_TUNE_MACOS=no\nMLX_BIN=%s\nMLX_MODEL_DIR=%s\n' "$PK/mlxbin/mlx-serve" "$MLXD" > "$MX/mx10/backends.env"
+    chmod 600 "$MX/mx10/backends.env"; : > "$PK/mp6.root"
+    ( export MSS_TEST_SYSROOT=$TMP/h27r/sysroot MSS_STUB_STATE=$HR_STATE MSS_LAUNCHD_TIMEOUT=1 MSS_SUDO=$PK/mp6bin/sudo \
+          MSS_SYSCTL="$TMP/h27r-bin/sysctl" PATH="$PK/mp6bin:$TMP/h27r-bin:$PATH" MSS_INSTALL_SANDBOX=1 \
+          OLLAMA_BASE_DIR="$TMP/h27r/base-mp6" HOME="$MX/mx10" MSS_ENV_FILE="$MX/mx10/backends.env" \
+          OLLAMA_USER="$(id -un)" MSS_CONF="$TMP/h27r/none.conf"
+      unset MSS_BACKENDS
+      expect "$ROOT/tests/expect/drive.exp" /dev/null "$PK/mx10.transcript" /bin/bash "$ROOT/scripts/install.sh" ) \
+        >/dev/null 2>"$PK/mx10.err"
+    check "MX10 loaded mode with a saved mlx exits 0" 0 $?
+    tr_of mx10 | grep -q 'mlx model' && fail "MX10 the chooser ran" || ok "MX10 no mlx model prompt"
+    [ ! -e "$MX/mx10/.mlx-serve" ] && ok "MX10 nothing staged" || fail "MX10 created ~/.mlx-serve"
+    rm -f "${HSD_R:?}/"*.plist
+
+    # MX11: an existing destination is refused and left exactly as it was.
+    H11=$MX/h11; mxmodel "$H11/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit"
+    MX11M=$(mss_mlx_manifest "$H11/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit")
+    # shellcheck disable=SC2086
+    DRIVE_PATH=$MXPATH drive mx11 "Choose [1]: ${T}4" "mlx model: ${T}1" "mlx model: ${T}@INTR" -- \
+        MSS_ENV_FILE="$MX/mx11.env" HOME="$H11" $MXENV
+    tr_of mx11 | grep -qxF "$MXDEST exists; choose it from the list or another directory" \
+        && ok "MX11 an existing destination is refused" || fail "MX11: $(tr_of mx11 | grep -i exists)"
+    check "MX11 its manifest is unchanged" "$MX11M" "$(mss_mlx_manifest "$H11/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit")"
+    [ ! -e "$H11/.mlx-serve/models/.mss-staging" ] && ok "MX11 nothing staged" || fail "MX11 staged"
+
+    # MX12: <dest> appears during the final rename (mv-slow makes it): the
+    # nested move is undone, staging is kept and <dest> is left alone. A tiny
+    # catalogue whose files are already staged: no network.
+    H12=$MX/h12; ST12=$H12/.mlx-serve/models/.mss-staging/org/Tiny; D12=$H12/.mlx-serve/models/org/Tiny
+    mkdir -p "$ST12"; printf '{"t":1}\n' > "$ST12/config.json"; printf 'tiny-weights' > "$ST12/model.safetensors"
+    : > "$MX/mx12.tsv"
+    for _f in config.json model.safetensors; do
+        printf 'tiny\torg/Tiny\t%s\t%s\t%s\t%s\tstarter\tapache-2.0\n' 0123456789abcdef0123456789abcdef01234567 "$_f" \
+            "$(wc -c < "$ST12/$_f" | tr -d ' ')" "$(mss_shasum256 "$ST12/$_f" | awk '{ print $1 }')" >> "$MX/mx12.tsv"
+    done
+    rm -f /tmp/mss-stub-mv-slow.log
+    # shellcheck disable=SC2086
+    DRIVE_PATH="$ROOT/tests/stubs/mv-slow:$MXPATH" drive mx12 "Choose [1]: ${T}4" "mlx model [1]: ${T}@ENTER" "free)? [y/N]: ${T}y" \
+        "mlx model [1]: ${T}@INTR" -- MSS_ENV_FILE="$MX/mx12.env" HOME="$H12" $MXENV MSS_MLX_CATALOG="$MX/mx12.tsv" \
+        MSS_STUB_SLOW_DEST="$D12" MSS_STUB_SLOW_MKDIR="$D12"
+    tr_of mx12 | grep -qxF '~/.mlx-serve/models/org/Tiny appeared during the download; the verified download is kept in staging' \
+        && ok "MX12 the message" || fail "MX12: $(tr_of mx12 | tail -n 5)"
+    [ -s /tmp/mss-stub-mv-slow.log ] && ok "MX12 the final rename ran (into the new <dest>)" || fail "MX12 mv-slow never ran"
+    check "MX12 <dest> holds only what made it" "sentinel" "$(ls -A "$D12" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')"
+    check "MX12 staging is kept, both files" "config.json model.safetensors" "$(ls -A "$ST12" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')"
+    rm -f /tmp/mss-stub-mv-slow.log
+fi
+
+# MX9: without a terminal nothing changes: no MLX_MODEL_DIR fails as 1.7.1
+# does, and with it there is no chooser and nothing staged.
+mkdir -p "$MX/mx9home"
+_x9() { env -u MLX_MODEL_DIR MSS_BACKENDS=mlx OLLAMA_USER="$TUSER" MLX_BIN="$TMP/fix/mlx/mlx-serve" HOME="$MX/mx9home" \
+    sh "$1/scripts/install-backends.sh" --check-only 2>&1; echo "rc=$?"; }
+if git -C "$ROOT" rev-parse -q --verify 'v1.7.1^{commit}' >/dev/null 2>&1; then
+    mkdir -p "$MX/v171"; git -C "$ROOT" archive v1.7.1 | tar -x -C "$MX/v171"
+    check "MX9 no MLX_MODEL_DIR: the message and exit code are 1.7.1's" "$(_x9 "$MX/v171")" "$(_x9 "$ROOT")"
+else
+    echo "skip - MX9 1.7.1 comparison needs the v1.7.1 tag"
+fi
+check "MX9 no MLX_MODEL_DIR" "ERROR: MLX_MODEL_DIR is required when 'mlx' is selected|rc=1" "$(_x9 "$ROOT" | tr '\n' '|' | sed 's/|$//')"
+# shellcheck disable=SC2086  # MA8I is a word list of assignments
+ma8e_run mx9 $MA8I /bin/bash "$ROOT/scripts/install.sh"
+check "MX9 MLX_MODEL_DIR set: install.sh runs both root passes" 2 "$(wc -l < "$MA8E/root" | tr -d ' ')"
+grep -q 'mlx model' "$MA8E/mx9.out" && fail "MX9 the chooser ran without a terminal" || ok "MX9 no chooser without a terminal"
+[ ! -e "$MA8E/home/.mlx-serve" ] && ok "MX9 nothing staged" || fail "MX9 created ~/.mlx-serve"
+
+echo "== phase A: #35 Ollama's embedding worker (W1-W14, W17) =="
+# Table-driven: pgrep, ps and lsof answer from tests/fixtures/proc/<case>.table,
+# so every row below is about these processes only. Ollama's directory and
+# every executable a table names are real files; nothing is started.
+PT="$ROOT/tests/stubs/proc-table"
+TW=$TMP/w35; WT=$TW/t; WD=$WT/bin
+mkdir -p "$WD/lib/ollama" "$WT/lib/ollama" "$WT/opt/homebrew/bin" "$WD/build/lib/ollama" "$TW/stamps"
+for _f in "$WD/ollama" "$WD/ollama-dev" "$WD/llama-server" "$WD/lib/ollama/llama-server" "$WT/lib/ollama/llama-server" \
+    "$WT/opt/homebrew/bin/llama-server" "$WD/build/lib/ollama/llama-server"; do : > "$_f"; done
+WD=$(cd "$WD" && pwd -P); WT=$(cd "$WT" && pwd -P)
+WBLOB=$(printf '/var/ollama/models/blobs/sha256-%0300d' 0 | cut -c 1-300)
+WME=$(id -u); WOTHER=$((WME + 4242))
+# ptab <case> [owner uid]: a fresh copy of the fixture, placeholders filled
+# (a fresh copy, so an A|B column starts at A again).
+ptab() {
+    _pt=$(mktemp "$TW/$1.XXXXXX")
+    sed -e "s|@D@|$WD|g" -e "s|@T@|$WT|g" -e "s|@U@|${2:-$WME}|g" -e "s|@O@|$WOTHER|g" -e "s|@BLOB@|$WBLOB|g" \
+        "$ROOT/tests/fixtures/proc/$1.table" > "$_pt"
+    printf '%s\n' "$_pt"
+}
+# wk <case> [owner uid] [env...]: "rc|reason" of the helper on the worker, 99101.
+wk() {
+    _wc=$1; _wo=${2:-$WME}; [ $# -lt 2 ] || shift; shift
+    ( PATH="$PT:$PATH" MSS_PROC_TABLE=$(ptab "$_wc" "$_wo"); export PATH MSS_PROC_TABLE
+      [ $# -eq 0 ] || export "$@"
+      mss_ollama_embed_worker 99101 "$WME"; printf '%s|%s\n' "$?" "$MSS_WORKER_REASON" )
+}
+# wsite <case> <owner uid> <what>: the call site's answer as this user: blocker
+# (the wrappers), unmanaged (the install check's) or refusal (its message).
+wsite() {
+    ( PATH="$PT:$PATH" MSS_PROC_TABLE=$(ptab "$1" "$2"); export PATH MSS_PROC_TABLE
+      case $3 in
+          blocker) mss_start_blocker "$WME"; echo "rc=$?" ;;
+          unmanaged) mss_unmanaged_server "$WME"; echo "rc=$?" ;;
+          refusal) _u=$(mss_unmanaged_server "$WME"); [ -z "$_u" ] || mss_unmanaged_refusal "$_u" ;;
+      esac ) | tr '\n' ' ' | sed 's/ $//'
+}
+# wwrap <case> <owner uid> <backend>: the wrapper's exit code and REFUSE line.
+# The conf names the mlx fixture and an empty stamp directory: a wrapper past
+# step 3 stops at "model not verified" (mlx) or "conf missing" (ds4, llama.cpp).
+printf 'MSS_GUARD_BACKEND=mlx\nMLX_BIN=%s\nMLX_MODEL_DIR=%s\nMLX_PORT=18234\n' "$TMP/fix/mlx/mlx-serve" "$TMP/fix/mlx/model" > "$TW/mlx.conf"
+printf 'MSS_GUARD_BACKEND=ds4\n' > "$TW/ds4.conf"; printf 'MSS_GUARD_BACKEND=llamacpp\n' > "$TW/llamacpp.conf"
+wwrap() {
+    ( PATH="$PT:$PATH" MSS_PROC_TABLE=$(ptab "$1" "$2") MSS_CONF="$TW/$3.conf" MSS_STAMP_DIR="$TW/stamps"
+      export PATH MSS_PROC_TABLE MSS_CONF MSS_STAMP_DIR
+      _o=$(sh "$ROOT/libexec/$3-start.sh" 2>&1); echo "$? $(printf '%s\n' "$_o" | grep '^REFUSE' | head -n 1)" )
+}
+# wstat <case> <owner uid>: status.sh's servers lines, run as this user.
+printf 'MSS_BACKENDS=mlx\nMSS_GUARD_BACKEND=mlx\nMSS_SERVICE_USER=%s\n' "$TUSER" > "$TW/status.conf"
+wstat() {
+    ( PATH="$PT:$PATH" MSS_PROC_TABLE=$(ptab "$1" "$2") MSS_CONF="$TW/status.conf" MSS_STUB_STATE="$TW/state" \
+          MSS_PMSET="$ROOT/tests/stubs/pmset-autorestart-0"
+      export PATH MSS_PROC_TABLE MSS_CONF MSS_STUB_STATE MSS_PMSET
+      sh "$ROOT/scripts/status.sh" 2>&1 | grep -E '^  (worker|unmanaged) ' )
+}
+MLXPAST="78 REFUSE: model not verified (manifest missing)"
+REFUSE171="78 REFUSE: model server already running (llama-server pid 99101)"
+
+# W1: the app layout. Verified; the install check, the wrappers and status agree.
+check "W1 D/ollama serve -> D/llama-server --embedding is verified" "0|" "$(wk w1)"
+check "W1 the install check's view: no unmanaged server" "rc=0" "$(wsite w1 "$WME" unmanaged)"
+check "W1 mss_start_blocker is empty" "rc=0" "$(wsite w1 "$WME" blocker)"
+check "W1 mlx-start.sh gets past step 3" "$MLXPAST" "$(wwrap w1 "$WME" mlx)"
+check "W1 ds4-start.sh gets past its server check" "78 REFUSE: conf missing DS4_BIN" "$(wwrap w1 "$WME" ds4)"
+check "W1 llamacpp-start.sh gets past its server check" "78 REFUSE: conf missing LLAMACPP_BIN" "$(wwrap w1 "$WME" llamacpp)"
+check "W1 status prints the worker line" "  worker     ollama embedding worker pid 99101 (part of Ollama)" "$(wstat w1 "$WME")"
+# B.4: the worker is still inference, so the chooser's read check still stops.
+check "W1 a verified worker still blocks the starter's reads" \
+    "1 llama-server (pid 99101) is running; a download is checked by reading it, and nothing is read while Ollama or a model server runs. Stop it, or choose \"another directory\"" \
+    "$( ( PATH="$PT:$PATH" MSS_PROC_TABLE=$(ptab w1); export PATH MSS_PROC_TABLE; _o=$(_mss_mlx_read_blocker 2>&1); echo "$? $_o" ) )"
+# W1t: the truncating stub would hide --embedding from a ps without -ww, or
+# with COLUMNS set; the helper unsets COLUMNS and passes -ww.
+W1T=$(ptab w1)
+check "W1t the ps stub cuts at 79 columns without -ww" 79 \
+    "$(PATH="$PT:$PATH" MSS_PROC_TABLE=$W1T ps -o args= -p 99101 | awk '{ print length($0) }')"
+check "W1t the ps stub cuts at 79 columns with COLUMNS set" 79 \
+    "$(COLUMNS=200 PATH="$PT:$PATH" MSS_PROC_TABLE=$W1T ps -ww -o args= -p 99101 | awk '{ print length($0) }')"
+( unset COLUMNS; PATH="$PT:$PATH" MSS_PROC_TABLE=$W1T ps -ww -o args= -p 99101 ) | grep -q -- '--embedding$' \
+    && ok "W1t with -ww and no COLUMNS the whole argv is seen" || fail "W1t the stub hides --embedding"
+check "W1t the helper verifies with COLUMNS=80 exported" "0|" "$(wk w1 "$WME" COLUMNS=80)"
+
+# W2-W13: each layout and each failed check.
+check "W2 the D/lib/ollama/llama-server layout is verified" "0|" "$(wk w2)"
+check "W3 the D/../lib/ollama/llama-server layout is verified" "0|" "$(wk w3)"
+check "W4 a chat worker (no --embedding)" "3|check 8: not an embedding worker (no --embedding)" "$(wk w4)"
+check "W4 the wrapper refuses it with the 1.7.1 text" "$REFUSE171" "$(wwrap w4 "$WME" mlx)"
+check "W4 the install refusal is 1.7.1's plus the reason" \
+    "unmanaged model server running (llama-server pid 99101); stop it first (not a verified Ollama embedding worker: check 8: not an embedding worker (no --embedding))" \
+    "$(wsite w4 "$WME" refusal)"
+check "W4 status names it unmanaged, with the reason" \
+    "  unmanaged  unmanaged llama-server pid 99101 (not guarded) (not a verified Ollama embedding worker: check 8: not an embedding worker (no --embedding))" \
+    "$(wstat w4 "$WME")"
+check "W5 --host 0.0.0.0" "3|check 8: not bound to 127.0.0.1" "$(wk w5a)"
+check "W5 no --host" "3|check 8: not bound to 127.0.0.1" "$(wk w5b)"
+check "W5 the wrapper refuses" "$REFUSE171" "$(wwrap w5a "$WME" mlx)"
+check "W6 /opt/homebrew/bin/llama-server under ollama" "3|check 6: executable is not in Ollama's own layout" "$(wk w6)"
+check "W6 the wrapper refuses" "$REFUSE171" "$(wwrap w6 "$WME" mlx)"
+check "W7 a build-tree layout" "3|check 6: executable is not in Ollama's own layout" "$(wk w7)"
+check "W8 a grandchild of ollama serve is not Ollama-related" "1|" "$(wk w8)"
+check "W8 the wrapper refuses" "$REFUSE171" "$(wwrap w8 "$WME" mlx)"
+check "W8 the install refusal has no reason" "unmanaged model server running (llama-server pid 99101); stop it first" "$(wsite w8 "$WME" refusal)"
+check "W9 ollama run x" "3|check 4: parent is not exactly 'ollama serve'" "$(wk w9a)"
+check "W9 ollama serve --extra" "3|check 4: parent is not exactly 'ollama serve'" "$(wk w9b)"
+check "W10 a renamed parent (ollama-dev) is not Ollama-related" "1|" "$(wk w10)"
+check "W10 the wrapper refuses" "$REFUSE171" "$(wwrap w10 "$WME" mlx)"
+check "W11 a uid mismatch (checker root)" "3|check 7: worker and ollama serve run as different users" "$(wk w11 "$WME" MSS_PROC_AS_UID=0)"
+check "W12 lsof fails" "3|check 2: process not readable" "$(wk w12a)"
+check "W12 lsof prints nothing" "3|check 2: process not readable" "$(wk w12c)"
+T0=$(ms_now)
+check "W12 lsof hangs: the 5 s bound fires" "3|check 2: lsof timed out" "$(wk w12b)"
+EL=$(( $(ms_now) - T0 ))
+check "W12 the hung lsof is stopped within 9 s" yes "$([ "$EL" -le 9000 ] && echo yes || echo "no (${EL} ms)")"
+check "W13 the start time changes during the check" "3|check 9: the process changed during the check" "$(wk w13a)"
+check "W13 the ppid changes during the check" "3|check 9: the process changed during the check" "$(wk w13b)"
+check "W13 the wrapper refuses" "$REFUSE171" "$(wwrap w13a "$WME" mlx)"
+
+# W14: a missing pgrep refuses as in 1.7.1; of two workers, the unverified one blocks.
+mkdir -p "$TW/nopgrep"
+for _t in sh dirname basename awk sed grep cat head tr mktemp rm sleep id env sort cut ps lsof stat find kill; do
+    _tp=$(command -v "$_t" 2>/dev/null) && case $_tp in /*) ln -sf "$_tp" "$TW/nopgrep/$_t" ;; esac
+done
+# The search path is replaced on purpose, in subshells (the exempt form).
+check "W14 no pgrep: mss_start_blocker returns 2" 2 "$( PATH="$TW/nopgrep"; export PATH; mss_start_blocker "$WME" >/dev/null; echo $?)"
+check "W14 no pgrep: mss_unmanaged_server returns 2" 2 "$( PATH="$TW/nopgrep"; export PATH; mss_unmanaged_server "$WME" >/dev/null; echo $?)"
+for w in mlx ds4 llamacpp; do
+    _o=$( PATH="$TW/nopgrep"; export PATH; MSS_CONF="$TW/$w.conf" MSS_STAMP_DIR="$TW/stamps" /bin/sh "$ROOT/libexec/$w-start.sh" 2>&1)
+    check "W14 no pgrep: $w-start.sh refuses as in 1.7.1" "78 REFUSE: pgrep is missing; cannot check for other model servers" "$? $_o"
+done
+check "W14 two workers: the chat worker blocks a start" "llama-server 99104 rc=0" "$(wsite w14 "$WME" blocker)"
+check "W14 two workers: the install check names the chat worker" \
+    "llama-server 99104 check 8: not an embedding worker (no --embedding) rc=0" "$(wsite w14 "$WME" unmanaged)"
+
+# W17: another uid's tree, without root: lsof cannot read it, so check 2, and
+# everything refuses as in 1.7.1.
+check "W17 another uid's tree, non-root" "3|check 2: process not readable" "$(wk w1 "$WOTHER")"
+check "W17 the wrapper refuses with the 1.7.1 text" "$REFUSE171" "$(wwrap w1 "$WOTHER" mlx)"
+check "W17 status names it unmanaged, check 2" \
+    "  unmanaged  unmanaged llama-server pid 99101 (not guarded) (not a verified Ollama embedding worker: check 2: process not readable)" \
+    "$(wstat w1 "$WOTHER")"
+# An empty expected uid (sudo status.sh with no service user) always fails check 7.
+check "W20 (helper) no expected uid: check 7, service user unknown" "3|check 7: service user unknown" \
+    "$( ( PATH="$PT:$PATH" MSS_PROC_TABLE=$(ptab w1); export PATH MSS_PROC_TABLE
+          mss_ollama_embed_worker 99101 ""; printf '%s|%s\n' "$?" "$MSS_WORKER_REASON" ) )"
 
 echo "== phase A: an installed Mac and the hashing locale (#21) =="
 # D7 against a fixture conf: MSS_CONF decides in a non-root pass.
@@ -4941,6 +5302,68 @@ STUB
     # shellcheck disable=SC2086  # our own list of stub paths
     [ -z "$B2STUBS" ] || sudo rm -f $B2STUBS
 fi
+
+echo "== phase B: #35 the root install check and sudo status.sh (W18a-W22) =="
+# The install check runs only as root. pgrep, ps and lsof are the table stubs
+# (tests/fixtures/proc/w1.table: Ollama's own layout); the checker is root, so
+# lsof reads every row and check 7 decides. The tree's owner and the input
+# user are set per row. Nothing is installed; the conf rows write only
+# MSS_SERVICE_USER into the installed conf, then remove it.
+sudo sh "$ROOT/scripts/uninstall.sh" --all >/dev/null 2>&1
+PT="$ROOT/tests/stubs/proc-table"; CONFW=/usr/local/etc/mac-studio-server/backends.conf
+WB=$TMP/w35b; mkdir -p "$WB/t/bin"; : > "$WB/t/bin/ollama"; : > "$WB/t/bin/llama-server"
+WBD=$(cd "$WB/t/bin" && pwd -P); WBT=$(cd "$WB/t" && pwd -P)
+WBLOB=$(printf '/var/ollama/models/blobs/sha256-%0300d' 0 | cut -c 1-300)
+WB_ME=$(id -u); WB_ME_N=$(id -un); WB_A=$(id -u daemon)
+btab() { # btab <owner uid>: W1's tree, owned by <owner uid>
+    _bt=$(mktemp "$WB/w1.XXXXXX")
+    sed -e "s|@D@|$WBD|g" -e "s|@T@|$WBT|g" -e "s|@U@|$1|g" -e "s|@BLOB@|$WBLOB|g" "$ROOT/tests/fixtures/proc/w1.table" > "$_bt"
+    chmod 644 "$_bt"; printf '%s\n' "$_bt"
+}
+wroot() { # wroot <log> <owner uid> [env...]: the root --check-only for mlx, input user this runner
+    _wl=$1; _wt=$(btab "$2"); shift 2
+    sudo env PATH="$PT:$PATH" MSS_PROC_TABLE="$_wt" MSS_BACKENDS=mlx OLLAMA_USER="$WB_ME_N" \
+        MLX_BIN="$MLXB" MLX_MODEL_DIR="$MLXM" MLX_PORT=18234 "$@" sh "$ROOT/scripts/install-backends.sh" --check-only >"$_wl" 2>&1
+}
+wsudostat() { # wsudostat <conf> <owner uid>: sudo status.sh's worker or unmanaged line
+    sudo env PATH="$PT:$PATH" MSS_PROC_TABLE="$(btab "$2")" MSS_CONF="$1" sh "$ROOT/scripts/status.sh" 2>&1 \
+        | grep -E '^  (worker|unmanaged) '
+}
+WREF="ERROR: unmanaged model server running (llama-server pid 99101); stop it first (not a verified Ollama embedding worker: check 7: not owned by the service user)"
+WOK="  worker     ollama embedding worker pid 99101 (part of Ollama)"
+sed "s/@USER@/$WB_ME_N/" "$ROOT/tests/fixtures/proc/installed-user.conf" > "$WB/installed-user.conf"
+
+# W19, W20: a fresh root install check (no installed conf), input user = owner.
+sudo test ! -e "$CONFW" && ok "W20 no installed conf before the fresh check" || fail "W20 a conf is installed: $(sudo cat "$CONFW")"
+wroot "$WB/w19.log" "$WB_ME"
+check "W19/W20 the fresh root install check passes beside the verified worker" 0 $?
+grep -q 'unmanaged model server' "$WB/w19.log" && fail "W19: $(cat "$WB/w19.log")" || ok "W19 no unmanaged-server refusal"
+# W18a: the input user is not the tree's owner.
+wroot "$WB/w18a.log" "$WB_A"
+check "W18a input user other than the owner exits 1" 1 $?
+grep -qxF "$WREF" "$WB/w18a.log" && ok "W18a refused with the 1.7.1 text and check 7" || fail "W18a: $(tail -n 3 "$WB/w18a.log")"
+# W18b, W20, W21: sudo status.sh follows the installed conf's service user.
+check "W18b sudo status.sh, conf user other than the owner: unmanaged, check 7" \
+    "  unmanaged  unmanaged llama-server pid 99101 (not guarded) (not a verified Ollama embedding worker: check 7: not owned by the service user)" \
+    "$(wsudostat "$ROOT/tests/fixtures/proc/installed-other.conf" "$WB_ME")"
+check "W20 sudo status.sh, no service user in the conf: check 7, service user unknown" \
+    "  unmanaged  unmanaged llama-server pid 99101 (not guarded) (not a verified Ollama embedding worker: check 7: service user unknown)" \
+    "$(wsudostat "$ROOT/tests/fixtures/proc/installed-nokey.conf" "$WB_ME")"
+check "W21 sudo status.sh once the conf names the owner: verified" "$WOK" "$(wsudostat "$WB/installed-user.conf" "$WB_ME")"
+# W21: the installed conf names user A (daemon), the run's input is B (this runner).
+sudo mkdir -p "$(dirname "$CONFW")"; printf 'MSS_SERVICE_USER=daemon\n' | sudo tee "$CONFW" >/dev/null
+wroot "$WB/w21b.log" "$WB_ME"
+check "W21 conf A, input B, B owns the tree: the install check verifies (it uses B)" 0 $?
+wroot "$WB/w21a.log" "$WB_A"
+check "W21 conf A, input B, A owns the tree: exits 1" 1 $?
+grep -qxF "$WREF" "$WB/w21a.log" && ok "W21 refused with check 7" || fail "W21: $(tail -n 3 "$WB/w21a.log")"
+# W22: a poisoned conf (nobody) changes nothing: the input decides.
+printf 'MSS_SERVICE_USER=nobody\n' | sudo tee "$CONFW" >/dev/null
+wroot "$WB/w22.log" "$WB_ME"
+check "W22 a poisoned conf: the install check still verifies" 0 $?
+grep -q 'unmanaged model server' "$WB/w22.log" && fail "W22: $(cat "$WB/w22.log")" || ok "W22 no refusal"
+sudo rm -f "$CONFW"
+sudo sh "$ROOT/scripts/uninstall.sh" --all >/dev/null 2>&1
 
 sudo sh "$ROOT/scripts/uninstall.sh" --all >/dev/null 2>&1
 

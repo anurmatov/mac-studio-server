@@ -1,0 +1,62 @@
+#!/bin/sh
+# ps stub (#35 W1-W22): answers `ps [-w|-ww] -o <field>= -p <pid>` for the
+# processes in $MSS_PROC_TABLE, one tab-separated row per process:
+#   pid ppid uid lstart lsof comm exe args...
+# (lsof is the lsof stub's mode: ok, fail, empty or sleep). A ppid or lstart
+# written "A|B" reads A the first time and B after that, per pid, so a check
+# can see a process change between its first and last read. Like macOS ps
+# without a tty, every line is cut to 79 columns unless -ww is given and
+# COLUMNS is unset. Any other process or form goes to the real ps.
+_self=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+_real() {
+    _ifs=$IFS; IFS=:
+    for _d in $PATH; do
+        [ "$_d" != "$_self" ] && [ -x "$_d/$1" ] && { IFS=$_ifs; printf '%s\n' "$_d/$1"; return 0; }
+    done
+    IFS=$_ifs; return 1
+}
+_w=0; _field=""; _pid=""; _ok=1; _prev=""
+for _a in "$@"; do
+    case $_prev in
+        -o) _field=${_a%=}; _prev=""; continue ;;
+        -p) _pid=$_a; _prev=""; continue ;;
+    esac
+    case $_a in
+        -ww) _w=2 ;;
+        -w) [ "$_w" = 2 ] || _w=$((_w + 1)) ;;
+        -o|-p) _prev=$_a ;;
+        *) _ok=0 ;;
+    esac
+done
+_row=""
+if [ "$_ok" = 1 ] && [ -n "$_field" ] && [ -n "$_pid" ] && [ -n "${MSS_PROC_TABLE:-}" ]; then
+    _row=$(awk -F'\t' -v p="$_pid" '$0 !~ /^#/ && $1 == p { print; exit }' "$MSS_PROC_TABLE")
+fi
+if [ -z "$_row" ]; then
+    _r=$(_real ps) || { echo "ps stub: no real ps" >&2; exit 1; }
+    exec "$_r" "$@"
+fi
+# _pick <A|B> <field>: A on the first read of this pid's field, then B.
+_pick() {
+    case $1 in
+        *'|'*)
+            _f="$MSS_PROC_TABLE.reads.$_pid.$2"
+            if [ -e "$_f" ]; then printf '%s\n' "${1#*|}"; else : > "$_f"; printf '%s\n' "${1%%|*}"; fi ;;
+        *) printf '%s\n' "$1" ;;
+    esac
+}
+_col() { printf '%s\n' "$_row" | awk -F'\t' -v c="$1" '{ print $c }'; }
+case $_field in
+    ppid) _out=$(_pick "$(_col 2)" ppid) ;;
+    uid) _out=$(_col 3) ;;
+    lstart) _out=$(_pick "$(_col 4)" lstart | tr '_' ' ') ;;
+    comm) _out=$(_col 6) ;;
+    args|command) _out=$(_col 8) ;;
+    user) _out=$(id -nu "$(_col 3)" 2>/dev/null || _col 3) ;;
+    *) echo "ps stub: field $_field is not in the table" >&2; exit 1 ;;
+esac
+if [ "$_w" = 2 ] && [ -z "${COLUMNS+x}" ]; then
+    printf '%s\n' "$_out"
+else
+    printf '%s\n' "$_out" | cut -c 1-79
+fi

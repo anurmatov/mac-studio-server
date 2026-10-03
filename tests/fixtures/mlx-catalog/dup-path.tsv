@@ -1,0 +1,4 @@
+# MX2: one path twice
+m	org/Model	0f0d9b8218915bc34d401e1a340b8c049d300d5e	config.json	100	5da91905efdfde905f566d76d4031e6ca7c4cb2a01dc4e3812a70b855188fc73	starter	apache-2.0
+m	org/Model	0f0d9b8218915bc34d401e1a340b8c049d300d5e	model.safetensors	100	5da91905efdfde905f566d76d4031e6ca7c4cb2a01dc4e3812a70b855188fc73	starter	apache-2.0
+m	org/Model	0f0d9b8218915bc34d401e1a340b8c049d300d5e	config.json	100	5da91905efdfde905f566d76d4031e6ca7c4cb2a01dc4e3812a70b855188fc73	starter	apache-2.0

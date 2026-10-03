@@ -1,0 +1,9 @@
+# MXN5: the test id with model.safetensors one byte too large
+smollm2-135m-8bit	mlx-community/SmolLM2-135M-Instruct-8bit	0f0d9b8218915bc34d401e1a340b8c049d300d5e	config.json	1097	5da91905efdfde905f566d76d4031e6ca7c4cb2a01dc4e3812a70b855188fc73	test	apache-2.0
+smollm2-135m-8bit	mlx-community/SmolLM2-135M-Instruct-8bit	0f0d9b8218915bc34d401e1a340b8c049d300d5e	merges.txt	466391	0b54e8aa4e53d5383e2e4bc635a56b43f9647f7b13832d5d9ecd8f82dac4f510	test	apache-2.0
+smollm2-135m-8bit	mlx-community/SmolLM2-135M-Instruct-8bit	0f0d9b8218915bc34d401e1a340b8c049d300d5e	model.safetensors	143030402	ec569c771e56424636be99625aba9031abc525a68a5f4ab16d678eca96fef12c	test	apache-2.0
+smollm2-135m-8bit	mlx-community/SmolLM2-135M-Instruct-8bit	0f0d9b8218915bc34d401e1a340b8c049d300d5e	model.safetensors.index.json	48979	d016e7514e8bfed162eb9d0716c73244c1b73792db3143e92e54138c1772db44	test	apache-2.0
+smollm2-135m-8bit	mlx-community/SmolLM2-135M-Instruct-8bit	0f0d9b8218915bc34d401e1a340b8c049d300d5e	special_tokens_map.json	655	2b7379f3ae813529281a5c602bc5a11c1d4e0a99107aaa597fe936c1e813ca52	test	apache-2.0
+smollm2-135m-8bit	mlx-community/SmolLM2-135M-Instruct-8bit	0f0d9b8218915bc34d401e1a340b8c049d300d5e	tokenizer.json	3522656	7d27c493c729a66ecefc837280b05d948b1ed50d130eebdbf911b1b36cf38ed7	test	apache-2.0
+smollm2-135m-8bit	mlx-community/SmolLM2-135M-Instruct-8bit	0f0d9b8218915bc34d401e1a340b8c049d300d5e	tokenizer_config.json	3764	a27f638bd2831f5c3dea654a75838930f2b11fbe550c4d4e1d5d7bd07157b2ee	test	apache-2.0
+smollm2-135m-8bit	mlx-community/SmolLM2-135M-Instruct-8bit	0f0d9b8218915bc34d401e1a340b8c049d300d5e	vocab.json	800662	82b84012e3add4d01d12ba14442026e49b8cbbaead1f79ecf3d919784f82dc79	test	apache-2.0

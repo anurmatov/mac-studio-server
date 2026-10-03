@@ -1,0 +1,16 @@
+#!/bin/sh
+# pgrep stub (#35 W1-W22): `pgrep -x <name>` lists the pids in $MSS_PROC_TABLE
+# (see ps) whose comm basename is <name>, and exits 1 when there are none, as
+# pgrep does. With no table, or any other form, the real pgrep answers.
+_self=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+if [ $# -eq 2 ] && [ "$1" = -x ] && [ -n "${MSS_PROC_TABLE:-}" ]; then
+    awk -F'\t' -v n="$2" '$0 !~ /^#/ && NF >= 8 { k = split($6, s, "/"); if (s[k] == n) { print $1; f = 1 } }
+        END { exit !f }' "$MSS_PROC_TABLE"
+    exit
+fi
+_ifs=$IFS; IFS=:
+for _d in $PATH; do
+    [ "$_d" != "$_self" ] && [ -x "$_d/pgrep" ] && { IFS=$_ifs; exec "$_d/pgrep" "$@"; }
+done
+echo "pgrep stub: no real pgrep" >&2
+exit 2

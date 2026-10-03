@@ -1,9 +1,12 @@
 #!/bin/sh
 # mv for MB27: a move to $MSS_STUB_SLOW_DEST waits 5 s first and logs the time
 # it finished to /tmp/mss-stub-mv-slow.log. Anything else is the real mv.
+# MX12 (#35): with MSS_STUB_SLOW_MKDIR set, that directory is created (with a
+# file named sentinel) during the wait, as if something made it mid-rename.
 for _last in "$@"; do :; done
 [ "${_last:-}" = "${MSS_STUB_SLOW_DEST:-}" ] || exec /bin/mv "$@"
 sleep 5
+[ -z "${MSS_STUB_SLOW_MKDIR:-}" ] || { mkdir -p "$MSS_STUB_SLOW_MKDIR" && echo keep > "$MSS_STUB_SLOW_MKDIR/sentinel"; }
 /bin/mv "$@"; _rc=$?
 date +%s >> /tmp/mss-stub-mv-slow.log
 exit "$_rc"
