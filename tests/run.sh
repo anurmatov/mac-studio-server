@@ -3448,8 +3448,10 @@ for _c in "dotdot|path \"../model.safetensors\" is not a relative name (no .., n
     if [ "$_cr" = 1 ] && printf '%s\n' "$_co" | grep -qF -- "$_ce; no download is offered"; then ok "MX2 $_cf is refused: $_ce"
     else fail "MX2 $_cf (rc $_cr): $_co"; fi
 done
+# A prefix assignment before a function call persists in a POSIX-mode shell
+# (macOS /bin/sh), so each override runs in a subshell.
 for _cf in bad-sha size-plus-one; do
-    MSS_MLX_CATALOG="$ROOT/tests/fixtures/mlx-catalog/$_cf.tsv" mss_mlx_catalog_check \
+    ( MSS_MLX_CATALOG="$ROOT/tests/fixtures/mlx-catalog/$_cf.tsv"; export MSS_MLX_CATALOG; mss_mlx_catalog_check ) \
         && ok "MX2 the MXN fixture $_cf is a valid catalogue" || fail "MX2 $_cf is refused"
 done
 # MX4: discovery by name. mlx-serve's <org>/<repo> and ~/models/<name>; three
@@ -3466,6 +3468,28 @@ mxmodel "$H4/.mlx-serve/models/.mss-staging/mlx-community/gamma"
 check "MX4 discovery: the two complete ones, once each, and 3 skipped" \
     "found $H4P/.mlx-serve/models/mlx-community/alpha $H4/.mlx-serve/models/mlx-community/alpha|found $H4P/.mlx-serve/models/mlx-community/beta $H4/.mlx-serve/models/mlx-community/beta|skipped 3" \
     "$(HOME=$H4 mss_mlx_find_models 2>&1 | LC_ALL=C sort | tr '\n' '|' | sed 's/|$//')"
+# MX4f: find is how discovery proves no download was left half-way, so a
+# missing or failing find lists nothing: a complete leaf and one with a
+# .partial file are both skipped. scanfail fails only that depth-limited scan,
+# the case that passed before this rule (an empty listing read as none).
+H4F=$MX/h4f; mxmodel "$H4F/models/clean"; mxmodel "$H4F/models/partial"; : > "$H4F/models/partial/model.safetensors.partial"
+H4FP=$(cd "$H4F" && pwd -P)
+mkdir -p "$MX/nofind" "$MX/failfind" "$MX/scanfail"
+for _t in readlink dirname basename grep sed awk sort tr head cat stat mktemp ls wc cut uname; do
+    _tp=$(command -v "$_t" 2>/dev/null) && case $_tp in /*) ln -sf "$_tp" "$MX/nofind/$_t" ;; esac
+done
+printf '#!/bin/sh\nexit 1\n' > "$MX/failfind/find"
+printf '#!/bin/sh\ncase " $* " in *" -maxdepth "*) exit 1 ;; esac\nexec %s "$@"\n' "$(command -v find)" > "$MX/scanfail/find"
+chmod +x "$MX/failfind/find" "$MX/scanfail/find"
+mx4f() { tr '\n' '|' | sed 's/|$//'; }
+check "MX4f control: real find lists the complete leaf, skips the .partial one" \
+    "found $H4FP/models/clean $H4F/models/clean|skipped 1" "$(HOME=$H4F mss_mlx_find_models 2>&1 | mx4f)"
+check "MX4f find missing: nothing listed, both skipped" "skipped 2" \
+    "$( PATH="$MX/nofind"; export PATH; HOME=$H4F mss_mlx_find_models 2>&1 | mx4f)"
+check "MX4f find exits 1 with no output: nothing listed, both skipped" "skipped 2" \
+    "$(PATH="$MX/failfind:$PATH" HOME=$H4F mss_mlx_find_models 2>&1 | mx4f)"
+check "MX4f only the .partial scan fails: nothing listed, both skipped" "skipped 2" \
+    "$(PATH="$MX/scanfail:$PATH" HOME=$H4F mss_mlx_find_models 2>&1 | mx4f)"
 
 if [ "$(id -u)" -eq 0 ] || ! command -v expect >/dev/null 2>&1; then
     echo "skip - the MLX chooser drives need expect and a non-root user"

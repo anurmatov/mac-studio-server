@@ -8,10 +8,10 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 - An MLX model chooser: keep the saved model, download a small pinned starter, pick one found on disk, or any directory
+- The starter download is size- and checksum-checked per file, resumes, and never writes into an existing model
 
 ### Fixed
 - Ollama's own embedding worker no longer stops an MLX, llama.cpp or ds4 install or start
-- The starter download is size- and checksum-checked per file, resumes, and never writes into an existing model
 
 ## [1.7.1] - 2026-10-02
 

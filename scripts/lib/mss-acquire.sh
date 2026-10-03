@@ -324,12 +324,15 @@ _mss_mlx_leaf() {
 # passes mss_mlx_check_dir; nothing at the top or one level down is an
 # interrupted or rejected download; and every shard model.safetensors.index.json
 # names exists at the top level. That index, at most 4 MiB, is the only file
-# read; weights are never opened.
+# read; weights are never opened. A missing or failing find rejects: an empty
+# listing proves nothing unless find ran and succeeded.
 _mss_mlx_complete() {
-    local d=$1 idx size name
+    local d=$1 idx size name left
     mss_mlx_check_dir "model directory" "$d" 2>/dev/null || return 1
-    [ -z "$(find -L "$d" -mindepth 1 -maxdepth 2 \( -name '*.partial' -o -name '*.part' -o -name '*.sha-mismatch' \) \
-        -print 2>/dev/null | head -n 1)" ] || return 1
+    command -v find >/dev/null 2>&1 || return 1
+    left=$(find -L "$d" -mindepth 1 -maxdepth 2 \( -name '*.partial' -o -name '*.part' -o -name '*.sha-mismatch' \) \
+        -print 2>/dev/null) || return 1
+    [ -z "$left" ] || return 1
     idx=$d/model.safetensors.index.json
     [ -e "$idx" ] || [ -L "$idx" ] || return 0
     size=$(stat -L -f %z "$idx" 2>/dev/null) || return 1
