@@ -47,8 +47,9 @@ ACTIVE=$(mss_conf_get MSS_GUARD_BACKEND)
 [ "$ACTIVE" = "$BACKEND" ] || refuse "$BACKEND is not the active backend (active: ${ACTIVE:-none})"
 
 # 3. No other model server, managed or not: the guard watches one process.
-_srv=$(mss_model_servers) || refuse "pgrep is missing; cannot check for other model servers"
-_srv=$(printf '%s\n' "$_srv" | head -n 1)
+# Ollama's verified embedding worker is part of Ollama, which runs beside any
+# backend (#35). This job runs as the service user, so the worker must too.
+_srv=$(mss_start_blocker "$(id -u)") || refuse "pgrep is missing; cannot check for other model servers"
 [ -z "$_srv" ] || refuse "model server already running (${_srv%% *} pid ${_srv#* })"
 
 # 4. The model directory is the one verified at install: names, sizes, inodes

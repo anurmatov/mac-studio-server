@@ -38,6 +38,72 @@ jobs:
       - name: System tests (launchd, stub servers)
         run: MSS_TEST_PHASE=B sh tests/run.sh
 
+      - name: Ollama's embedding worker on real processes (W15, W16, W16b)
+        # proc-stub plays `ollama serve` and its llama-server child. The runner user
+        # runs the tree, the helper and mlx-start.sh, so the start-time exemption is
+        # exercised as the wrapper sees it; W16b runs the tree as another user.
+        run: |
+          set -u
+          fail() { echo "FAIL: $*"; exit 1; }
+          REPO_DIR=$PWD; . scripts/lib/mss-common.sh
+          me=$(id -un)
+          # A long directory, so the worker's --embedding starts past column 200.
+          W=$RUNNER_TEMP/w15-$(printf '%060d' 0); mkdir -p "$W/D" "$W/other" "$W/stamps"
+          cc -o "$W/proc-stub" tests/stubs/proc-stub.c || fail "cc"
+          cp "$W/proc-stub" "$W/D/ollama"; cp "$W/proc-stub" "$W/D/llama-server"; cp "$W/proc-stub" "$W/other/llama-server"
+          printf 'MSS_GUARD_BACKEND=mlx\nMSS_SERVICE_USER=%s\nMLX_BIN=%s\nMLX_MODEL_DIR=%s\nMLX_PORT=18234\n' \
+            "$me" "$PWD/tests/stubs/fake-mlx-serve.sh" "$W/model" > "$W/mlx.conf"
+          argv() { printf '%s\n' "$1" --model "$2/blobs/sha256-$(printf '%064d' 0)" --port 51234 --host 127.0.0.1 \
+            --no-webui --offline -c 8192 -np 1 -b 512 -ub 512 --embedding; }
+          # serve <ollama> <child> <pid file> [sudo -u user]: start the tree; CP is the child, SP its parent.
+          serve() {
+            _o=$1; _c=$2; _pf=$3; shift 3; argv "$_c" "$W" > "$_pf.argv"; chmod 644 "$_pf.argv"; rm -f "$_pf"
+            "$@" env PROC_STUB_CHILD="$_pf.argv" PROC_STUB_PIDFILE="$_pf" "$_o" serve </dev/null >/dev/null 2>&1 &
+            for _i in $(seq 1 50); do [ -s "$_pf" ] && break; sleep 0.1; done
+            CP=$(cat "$_pf" 2>/dev/null); SP=$(ps -o ppid= -p "$CP" | tr -d ' ')
+            [ -n "$CP" ] && [ -n "$SP" ] || fail "the tree did not start"
+          }
+          # verify <pid> <uid>: the helper from a non-tty context with COLUMNS=80 exported.
+          verify() { COLUMNS=80 sh -c '. scripts/lib/mss-common.sh; mss_ollama_embed_worker "$1" "$2"; echo "rc=$? $MSS_WORKER_REASON"' \
+            sh "$1" "$2" </dev/null 2>&1 | cat; }
+          wrapper() { MSS_CONF="$W/mlx.conf" MSS_STAMP_DIR="$W/stamps" sh libexec/mlx-start.sh </dev/null 2>&1 | cat; }
+          # stop [sudo]: TERM to the parent takes the child; wait until both are gone.
+          stop() { "$@" kill "$SP" 2>/dev/null; [ $# -gt 0 ] || wait "$SP" 2>/dev/null
+            for _i in $(seq 1 50); do ps -p "$SP" >/dev/null || ps -p "$CP" >/dev/null || return 0; sleep 0.1; done
+            fail "the tree did not stop"; }
+
+          # W15: Ollama's own layout, as this user: verified; mlx-start.sh gets past step 3.
+          serve "$W/D/ollama" "$W/D/llama-server" "$W/w15.pid"
+          echo "W15 serve $SP ($(ps -o user= -p "$SP")) child $CP ($(ps -o user= -p "$CP")), wrapper as $me"
+          test "$(ps -o user= -p "$SP" | tr -d ' ')|$(ps -o user= -p "$CP" | tr -d ' ')" = "$me|$me" || fail "W15 the tree is not $me's"
+          col=$(ps -ww -o args= -p "$CP" | awk '{ print index($0, "--embedding") }')
+          [ "$col" -gt 200 ] || fail "W15 --embedding starts at column $col"
+          out=$(verify "$CP" "$(id -u)"); echo "W15 helper: $out"; test "$out" = "rc=0 " || fail "W15 not verified"
+          out=$(wrapper); echo "W15 mlx-start.sh: $out"
+          test "$out" = "REFUSE: model not verified (manifest missing)" || fail "W15 the wrapper stopped before step 4"
+          stop
+
+          # W16: the same, with the child outside Ollama's layout: refused as in 1.7.1.
+          serve "$W/D/ollama" "$W/other/llama-server" "$W/w16.pid"
+          out=$(verify "$CP" "$(id -u)"); echo "W16 helper: $out"
+          test "$out" = "rc=3 check 6: executable is not in Ollama's own layout" || fail "W16 helper"
+          out=$(wrapper); echo "W16 mlx-start.sh: $out"
+          test "$out" = "REFUSE: model server already running (llama-server pid $CP)" || fail "W16 the wrapper did not refuse"
+          stop
+
+          # W16b: the W15 tree run by nobody (binaries in a 0755 directory): unreadable
+          # without root, so refused as in 1.7.1, with check 2.
+          B=$(mktemp -d /tmp/w16b.XXXXXX); chmod 755 "$B"; mkdir -p "$B/D" "$B/run"; chmod 777 "$B/run"
+          cp "$W/proc-stub" "$B/D/ollama"; cp "$W/proc-stub" "$B/D/llama-server"; chmod 755 "$B/D" "$B/D/ollama" "$B/D/llama-server"
+          serve "$B/D/ollama" "$B/D/llama-server" "$B/run/w16b.pid" sudo -u nobody
+          test "$(ps -o user= -p "$CP" | tr -d ' ')" = nobody || fail "W16b the child is not nobody's"
+          out=$(verify "$CP" "$(id -u)"); echo "W16b helper: $out"
+          test "$out" = "rc=3 check 2: process not readable" || fail "W16b helper"
+          out=$(wrapper); echo "W16b mlx-start.sh: $out"
+          test "$out" = "REFUSE: model server already running (llama-server pid $CP)" || fail "W16b the wrapper did not refuse"
+          stop sudo
+          echo "W15, W16, W16b passed"
+
       - name: pf syntax check on rendered rules
         run: |
           mkdir -p /tmp/mss-pf
@@ -167,6 +233,84 @@ jobs:
           echo "$out"
           echo "$out" | grep -q 'needs: git' || { echo "the message does not name git"; exit 1; }
           test ! -e "$RUNNER_TEMP/ds4-nogit"
+
+      - name: The MLX starter download, pinned and checked (MXN1-MXN6)
+        # The catalogue's test id (148 MB), straight through mss_acquire_mlx_model, with
+        # a y at each consent. Runs before A4, which leaves a llama-server running, and a
+        # running model server stops the download, as it must.
+        run: |
+          set -u
+          fail() { echo "FAIL: $*"; exit 1; }
+          REPO_DIR=$PWD; . scripts/lib/mss-common.sh; . scripts/lib/mss-acquire.sh; . scripts/lib/mss-picker.sh
+          id=smollm2-135m-8bit; repo=$(mss_mlx_catalog_get "$id" repo)
+          # pick <home> [catalogue]: one starter choice, y at the consent; its output
+          # (curl's progress lines split at \r) in $OUT, its status in $RC.
+          pick() { OUT=$( { printf 'y\n' | HOME=$1 MSS_MLX_CATALOG=${2:-} mss_acquire_mlx_model "$id" 2>&1; echo "@RC=$?"; } \
+              | tr '\r' '\n' | grep -v '^[#[:space:]]*$'); RC=${OUT##*@RC=}; OUT=${OUT%@RC=*}; printf '%s\n' "$OUT"; }
+          files() { mss_mlx_catalog_files "$id" | awk '{ print $1 }' | LC_ALL=C sort; }
+          listing() { (cd "$1" && find . -type f | sed 's|^\./||' | LC_ALL=C sort); }
+          sizes_ok() { mss_mlx_catalog_files "$id" | while read -r p s h; do [ "$(stat -f %z "$1/$p")" = "$s" ] || echo "$p"; done; }
+
+          # MXN1: a full download: the exact files and sizes, staging gone, a valid directory.
+          H=$RUNNER_TEMP/mxn1; M=$H/.mlx-serve/models; mkdir -p "$H"; pick "$H"
+          test "$RC" = 0 || fail "MXN1 rc $RC"
+          test "$(listing "$M/$repo")" = "$(files)" || fail "MXN1 file set"
+          test -z "$(sizes_ok "$M/$repo")" || fail "MXN1 sizes"
+          test ! -e "$M/.mss-staging/$repo" && test ! -e "$M/.mss-staging/$repo.verified" || fail "MXN1 staging left behind"
+          mss_mlx_check_dir MXN1 "$M/$repo" || fail "MXN1 mss_mlx_check_dir"
+
+          # MXN2: resume. The MXN1 files go back to staging with their records, the
+          # weights as a 50,000,000-byte .part: only the weights are fetched and hashed.
+          S=$M/.mss-staging/$repo; mkdir -p "$(dirname "$S")"; mv "$M/$repo" "$S"
+          mss_mlx_catalog_files "$id" | while read -r p s h; do
+            [ "$p" = model.safetensors ] || printf '%s %s %s\n' "$p" "$(stat -f '%z %i %m' "$S/$p")" "$h" >> "$S.verified"; done
+          head -c 50000000 "$S/model.safetensors" > "$S/model.safetensors.part"; rm "$S/model.safetensors"
+          pick "$H"
+          test "$RC" = 0 || fail "MXN2 rc $RC"
+          printf '%s\n' "$OUT" | grep -q 'resuming model.safetensors at 50000000 bytes' || fail "MXN2 did not resume"
+          test "$(printf '%s\n' "$OUT" | grep -c '^verifying ')" = 1 && printf '%s\n' "$OUT" | grep -qx 'verifying model.safetensors' \
+            || fail "MXN2 hashed more than the weights"
+          test "$(printf '%s\n' "$OUT" | grep -c ': verified before; skipped$')" = 7 || fail "MXN2 skipped lines"
+          test "$(listing "$M/$repo")" = "$(files)" && test -z "$(sizes_ok "$M/$repo")" || fail "MXN2 result"
+
+          # MXN3: a wrong sha256 (config.json, the first file): quarantined outside the stage.
+          H=$RUNNER_TEMP/mxn3; M=$H/.mlx-serve/models; mkdir -p "$H"; pick "$H" "$PWD/tests/fixtures/mlx-catalog/bad-sha.tsv"
+          test "$RC" = 1 || fail "MXN3 rc $RC"
+          test -f "$M/.mss-staging/$repo.rejected/config.json.sha-mismatch" || fail "MXN3 not quarantined"
+          test ! -e "$M/.mss-staging/$repo/config.json" && test ! -e "$M/$repo" || fail "MXN3 left config.json or made a final directory"
+
+          # MXN4: a revision that does not exist.
+          sed "s/$(mss_mlx_catalog_get "$id" revision)/$(printf '%040d' 0)/" config/mlx.catalog > "$RUNNER_TEMP/badrev.tsv"
+          H=$RUNNER_TEMP/mxn4; mkdir -p "$H"; pick "$H" "$RUNNER_TEMP/badrev.tsv"
+          test "$RC" = 1 && printf '%s\n' "$OUT" | grep -q 'cannot reach the download' || fail "MXN4 rc $RC"
+
+          # MXN5: a size the server does not report: refused before the weights' .part exists.
+          H=$RUNNER_TEMP/mxn5; M=$H/.mlx-serve/models; mkdir -p "$H"; pick "$H" "$PWD/tests/fixtures/mlx-catalog/size-plus-one.tsv"
+          test "$RC" = 1 && printf '%s\n' "$OUT" | grep -q 'size mismatch: the server reports 143030401 bytes, the catalogue 143030402' \
+            || fail "MXN5 rc $RC"
+          test ! -e "$M/.mss-staging/$repo/model.safetensors.part" || fail "MXN5 a .part exists"
+
+          # MXN6: recovery after a mismatch. The final rename fails (a 0555 <org>
+          # parent), so staging and records stay; a changed vocab.json is then
+          # quarantined, and the next choice fetches only it and completes.
+          H=$RUNNER_TEMP/mxn6; M=$H/.mlx-serve/models; S=$M/.mss-staging/$repo; mkdir -p "$M/${repo%%/*}"; chmod 555 "$M/${repo%%/*}"
+          pick "$H"
+          test "$RC" = 1 && printf '%s\n' "$OUT" | grep -q '^cannot move the verified download to .*; it is kept in staging$' || fail "MXN6 rename rc $RC"
+          chmod 755 "$M/${repo%%/*}"
+          test "$(listing "$S")" = "$(files)" && test "$(grep -c . "$S.verified")" = 8 || fail "MXN6 staging"
+          vs=$(stat -f %z "$S/vocab.json"); rm "$S/vocab.json"; head -c "$vs" /dev/zero > "$S/vocab.json"
+          grep -v '^vocab\.json ' "$S.verified" > "$S.v"; mv "$S.v" "$S.verified"
+          pick "$H"
+          test "$RC" = 1 || fail "MXN6 second rc $RC"
+          test "$(printf '%s\n' "$OUT" | grep '^verifying ')" = "verifying vocab.json" || fail "MXN6 hashed more than vocab.json"
+          test -f "$S.rejected/vocab.json.sha-mismatch" && test ! -e "$S/vocab.json" || fail "MXN6 not quarantined"
+          pick "$H"
+          test "$RC" = 0 || fail "MXN6 third rc $RC"
+          test "$(printf '%s\n' "$OUT" | grep '^downloading ' | cut -d' ' -f2)" = vocab.json || fail "MXN6 downloaded more than vocab.json"
+          test "$(printf '%s\n' "$OUT" | grep -c ': verified before; skipped$')" = 7 || fail "MXN6 skipped lines"
+          test "$(listing "$M/$repo")" = "$(files)" && test -z "$(sizes_ok "$M/$repo")" || fail "MXN6 final directory"
+          test -f "$S.rejected/vocab.json.sha-mismatch" || fail "MXN6 .rejected/ is gone"
+          echo "MXN1-MXN6 passed"
 
       - name: llama.cpp through the picker, brew and a catalogue download (A4)
         run: |

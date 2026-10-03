@@ -160,6 +160,11 @@ if [ -n "$_all" ]; then
         _apid=$(printf '%s\n' "$_aprint" | sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\).*/\1/p' | head -n 1)
         printf '%s\n' "$_aprint" | grep -q '^[[:space:]]*state = running' && _arunning=1
     fi
+    # Ollama's own embedding worker is part of Ollama, not an unmanaged server
+    # (#35). It must run as the service user: the installed conf's under sudo,
+    # this user's otherwise. Another user's process is unreadable without root,
+    # so a non-root run by someone else shows it as unmanaged (check 2).
+    if [ "$(id -u)" -eq 0 ]; then _wuid=$(mss_conf_service_uid); else _wuid=$(id -u); fi
     if ! _servers=$(mss_model_servers); then
         echo "servers:"; unhealthy servers "pgrep is missing; cannot check for other model servers"
     else
@@ -167,9 +172,19 @@ if [ -n "$_all" ]; then
         while read -r _sn _sp; do
             [ -n "$_sp" ] || continue
             if [ -n "$_apid" ] && mss_pid_under "$_sp" "$_apid"; then continue; fi
+            _why=""
+            if [ "$_sn" = llama-server ]; then
+                mss_ollama_embed_worker "$_sp" "$_wuid"
+                case $? in
+                    0) [ "$_hdr" = 1 ] || { echo "servers:"; _hdr=1; }
+                       healthy worker "ollama embedding worker pid $_sp (part of Ollama)"
+                       continue ;;
+                    3) _why=" (not a verified Ollama embedding worker: $MSS_WORKER_REASON)" ;;
+                esac
+            fi
             if [ -z "$_apid" ] && [ "$_arunning" = 1 ]; then _hint=1; continue; fi
             [ "$_hdr" = 1 ] || { echo "servers:"; _hdr=1; }
-            unhealthy unmanaged "unmanaged $_sn pid $_sp (not guarded)"
+            unhealthy unmanaged "unmanaged $_sn pid $_sp (not guarded)$_why"
         done <<MSS_SERVERS_EOF
 $_servers
 MSS_SERVERS_EOF

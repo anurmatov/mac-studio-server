@@ -819,10 +819,15 @@ mss_label_pid() {
     launchctl print "system/$1" 2>/dev/null | sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\).*/\1/p' | head -n 1
 }
 
-# mss_unmanaged_server [extra names...]: the first "<name> <pid>" model server
-# that is not a managed backend job (its PID, or a descendant of it), or
-# nothing. Returns 2 when pgrep is missing. The job PIDs need root to read.
+# mss_unmanaged_server <expected uid> [extra names...]: the first model server
+# that is neither a managed backend job (its PID, or a descendant of it) nor a
+# verified Ollama embedding worker run as <expected uid>, as "<name> <pid>", or
+# nothing. A llama-server whose direct parent is named ollama but fails a check
+# gets the reason as well: "<name> <pid> check <n>: <reason>". Returns 2 when
+# pgrep is missing. The job PIDs need root to read.
 mss_unmanaged_server() {
+    _um_uid=${1:-}
+    [ $# -eq 0 ] || shift
     _um_owns=""
     for _um_b in llamacpp ds4 mlx; do
         _um_p=$(mss_label_pid "com.mac-studio-server.$_um_b")
@@ -835,10 +840,167 @@ mss_unmanaged_server() {
         for _um_o in $_um_owns; do
             if mss_pid_under "$_um_pid" "$_um_o"; then _um_mine=1; break; fi
         done
-        [ "$_um_mine" = 1 ] || { printf '%s %s\n' "$_um_n" "$_um_pid"; return 0; }
+        [ "$_um_mine" = 0 ] || continue
+        if [ "$_um_n" = llama-server ]; then
+            mss_ollama_embed_worker "$_um_pid" "$_um_uid"
+            case $? in
+                0) continue ;;
+                3) printf '%s %s %s\n' "$_um_n" "$_um_pid" "$MSS_WORKER_REASON"; return 0 ;;
+            esac
+        fi
+        printf '%s %s\n' "$_um_n" "$_um_pid"
+        return 0
     done <<MSS_SERVERS_EOF
 $_um_list
 MSS_SERVERS_EOF
+    return 0
+}
+
+# mss_unmanaged_refusal <mss_unmanaged_server line>: the install refusal, with
+# the reason a llama-server under ollama was not exempted.
+mss_unmanaged_refusal() {
+    _ur_n=${1%% *}; _ur_rest=${1#* }; _ur_pid=${_ur_rest%% *}
+    _ur_why=""; [ "$_ur_rest" = "$_ur_pid" ] || _ur_why=" (not a verified Ollama embedding worker: ${_ur_rest#* })"
+    printf 'unmanaged model server running (%s pid %s); stop it first%s\n' "$_ur_n" "$_ur_pid" "$_ur_why"
+}
+
+# mss_start_blocker <expected uid>: the first model server a backend may not
+# start beside, as "<name> <pid>", or nothing: any mss_model_servers entry but
+# a verified Ollama embedding worker run as <expected uid>. The wrappers pass
+# their own id -u. Returns 2 when pgrep is missing.
+mss_start_blocker() {
+    _sb_uid=${1:-}
+    _sb_list=$(mss_model_servers) || return 2
+    while read -r _sb_n _sb_pid; do
+        [ -n "$_sb_pid" ] || continue
+        if [ "$_sb_n" = llama-server ] && mss_ollama_embed_worker "$_sb_pid" "$_sb_uid"; then continue; fi
+        printf '%s %s\n' "$_sb_n" "$_sb_pid"
+        return 0
+    done <<MSS_SERVERS_EOF
+$_sb_list
+MSS_SERVERS_EOF
+    return 0
+}
+
+# mss_conf_service_uid: the uid of the installed conf's MSS_SERVICE_USER, or
+# nothing (no conf, no key, no such user). For the root callers that have no
+# input of their own: sudo status.sh and mss-lifecycle.sh.
+mss_conf_service_uid() {
+    _cs_u=$(mss_conf_get MSS_SERVICE_USER 2>/dev/null) || return 0
+    [ -n "$_cs_u" ] || return 0
+    id -u "$_cs_u" 2>/dev/null || true
+}
+
+# ── Ollama's own embedding worker (#35) ────────────────────────────────────────
+# Ollama 0.34.3 and later run a llama.cpp-engine model in a bundled
+# llama-server, exec'd directly by `ollama serve` from its own directory, with
+# --host 127.0.0.1 and, for an embedding model, --embedding. That worker is part
+# of Ollama, which may run beside the active backend (R-5). Every other
+# llama-server, an Ollama chat worker and the device-discovery probe included,
+# is still refused at install and start. The exemption is for start refusals
+# only: the worker still blocks every full model read.
+
+# _mss_ew_ps <field> <pid>: one ps column, trimmed. Without a tty (launchd, a
+# pipe) macOS ps cuts each line to the terminal width unless it is given -ww
+# with COLUMNS unset; the worker's argv starts with a long --model path and
+# ends with --embedding.
+_mss_ew_ps() {
+    mss_run_bounded 5 sh -c 'exec env -u COLUMNS LC_ALL=C ps -ww -o "$1=" -p "$2" 2>/dev/null' sh "$1" "$2" \
+        | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+# _mss_ew_exe <pid>: the first txt record lsof reports, the executable. 124 on
+# a timeout, 1 when lsof fails, prints none or annotates the record with an
+# error such as "(readlink: Permission denied)" (another user's process,
+# without root).
+_mss_ew_exe() {
+    _ee_out=$(mss_run_bounded 5 sh -c 'exec lsof -a -p "$1" -d txt -Fn 2>/dev/null' sh "$1")
+    _ee_rc=$?
+    [ "$_ee_rc" = 0 ] || return "$_ee_rc"
+    _ee_n=$(printf '%s\n' "$_ee_out" | sed -n 's/^n//p' | head -n 1)
+    case $_ee_n in ''|*' ('*')') return 1 ;; esac
+    printf '%s\n' "$_ee_n"
+}
+
+# _mss_ew_file <path> <name>: the resolved path when it is a regular file
+# named <name>, with nothing in its path that the installer would refuse.
+_mss_ew_file() {
+    mss_validate_path_chars executable "$1" 2>/dev/null || return 1
+    _ef_r=$(mss_resolve_path "$1" 2>/dev/null) || return 1
+    mss_validate_path_chars executable "$_ef_r" 2>/dev/null || return 1
+    [ -f "$_ef_r" ] && [ "${_ef_r##*/}" = "$2" ] || return 1
+    printf '%s\n' "$_ef_r"
+}
+
+_mss_ew_fail() { MSS_WORKER_REASON="check $1: $2"; return 3; }
+
+# mss_ollama_embed_worker <pid> <expected uid>: is this llama-server Ollama's own
+# embedding worker? All nine checks must hold, in this order:
+#   1 its process name is llama-server
+#   2 its executable is a regular file named llama-server
+#   3 its direct parent P is above 1
+#   4 P's argv is exactly "<…/ollama> serve"
+#   5 P's executable is a regular file named ollama, in directory D
+#   6 the worker's executable is D/llama-server, D/lib/ollama/llama-server or
+#     D/../lib/ollama/llama-server (Ollama's packaged layouts; no build trees)
+#   7 the worker and P run as one uid, the expected one (the service user's)
+#   8 its argv has "--host 127.0.0.1" and "--embedding"
+#   9 its parent and both start times are unchanged at the end (no PID reuse)
+# Returns 0 when verified; 1 when its direct parent is not named ollama (read
+# by ps, which works for any user); 3 when it is but a check failed, with
+# MSS_WORKER_REASON "check <n>: <reason>" for the first one. Any error, timeout,
+# unreadable process (another user's, without root) or odd output fails closed.
+# Each read is bounded by 5 s.
+mss_ollama_embed_worker() {
+    _ew_w=$1; _ew_uid=${2:-}
+    MSS_WORKER_REASON=""
+    _ew_p=$(_mss_ew_ps ppid "$_ew_w")
+    mss_match "$_ew_p" '^[0-9]+$' && [ "$_ew_p" -gt 1 ] || return 1
+    _ew_pc=$(_mss_ew_ps comm "$_ew_p")
+    [ "${_ew_pc##*/}" = ollama ] || return 1
+    _ew_ws=$(_mss_ew_ps lstart "$_ew_w"); _ew_pst=$(_mss_ew_ps lstart "$_ew_p")
+
+    _ew_c=$(_mss_ew_ps comm "$_ew_w")
+    [ "${_ew_c##*/}" = llama-server ] || { _mss_ew_fail 1 "not named llama-server"; return 3; }
+    _ew_e=$(_mss_ew_exe "$_ew_w")
+    case $? in
+        0) ;;
+        124) _mss_ew_fail 2 "lsof timed out"; return 3 ;;
+        *) _mss_ew_fail 2 "process not readable"; return 3 ;;
+    esac
+    _ew_e=$(_mss_ew_file "$_ew_e" llama-server) || { _mss_ew_fail 2 "executable is not a regular file named llama-server"; return 3; }
+    # 3 holds: P was read above, and a parent of 1 or less is not ollama.
+    _ew_pa=$(_mss_ew_ps args "$_ew_p")
+    _ew_a=$(printf '%s\n' "$_ew_pa" | awk '{ n++; if (NF == 2 && $2 == "serve") { k = split($1, s, "/"); b = s[k] } }
+        END { if (n == 1) print b }')
+    [ "$_ew_a" = ollama ] || { _mss_ew_fail 4 "parent is not exactly 'ollama serve'"; return 3; }
+    _ew_pe=$(_mss_ew_exe "$_ew_p")
+    case $? in
+        0) ;;
+        124) _mss_ew_fail 5 "lsof timed out"; return 3 ;;
+        *) _mss_ew_fail 5 "process not readable"; return 3 ;;
+    esac
+    _ew_pe=$(_mss_ew_file "$_ew_pe" ollama) || { _mss_ew_fail 5 "parent executable is not a regular file named ollama"; return 3; }
+    _ew_d=${_ew_pe%/*}
+    _ew_lay=0
+    for _ew_cand in "$_ew_d/llama-server" "$_ew_d/lib/ollama/llama-server" "$_ew_d/../lib/ollama/llama-server"; do
+        [ -e "$_ew_cand" ] || continue
+        [ "$(mss_resolve_path "$_ew_cand" 2>/dev/null)" = "$_ew_e" ] && { _ew_lay=1; break; }
+    done
+    [ "$_ew_lay" = 1 ] || { _mss_ew_fail 6 "executable is not in Ollama's own layout"; return 3; }
+    [ -n "$_ew_uid" ] || { _mss_ew_fail 7 "service user unknown"; return 3; }
+    _ew_wu=$(_mss_ew_ps uid "$_ew_w"); _ew_pu=$(_mss_ew_ps uid "$_ew_p")
+    mss_match "$_ew_wu" '^-?[0-9]+$' && [ "$_ew_wu" = "$_ew_pu" ] \
+        || { _mss_ew_fail 7 "worker and ollama serve run as different users"; return 3; }
+    [ "$_ew_wu" = "$_ew_uid" ] || { _mss_ew_fail 7 "not owned by the service user"; return 3; }
+    _ew_wa=$(_mss_ew_ps args "$_ew_w")
+    printf '%s\n' "$_ew_wa" | awk 'NR == 1 { for (i = 1; i <= NF; i++) if ($i == "--embedding") e = 1 }
+        END { exit !(NR == 1 && e) }' || { _mss_ew_fail 8 "not an embedding worker (no --embedding)"; return 3; }
+    printf '%s\n' "$_ew_wa" | awk 'NR == 1 { for (i = 1; i < NF; i++) if ($i == "--host" && $(i + 1) == "127.0.0.1") h = 1 }
+        END { exit !(NR == 1 && h) }' || { _mss_ew_fail 8 "not bound to 127.0.0.1"; return 3; }
+    [ -n "$_ew_ws" ] && [ -n "$_ew_pst" ] && [ "$(_mss_ew_ps ppid "$_ew_w")" = "$_ew_p" ] \
+        && [ "$(_mss_ew_ps lstart "$_ew_w")" = "$_ew_ws" ] && [ "$(_mss_ew_ps lstart "$_ew_p")" = "$_ew_pst" ] \
+        || { _mss_ew_fail 9 "the process changed during the check"; return 3; }
     return 0
 }
 

@@ -1,0 +1,37 @@
+#!/bin/sh
+# lsof stub (#35 W1-W22): `lsof -a -p <pid> -d txt -Fn` for a pid in
+# $MSS_PROC_TABLE (see ps) prints its executable as lsof does ("p<pid>",
+# "ftxt", "n<exe>"), by the row's mode: ok; fail (exit 1, nothing); empty
+# (exit 0, nothing); sleep (10 s first). As on macOS without root, another
+# uid's process is not readable: exit 1 and nothing, unless the checker is
+# root. The checker's uid is MSS_PROC_AS_UID, or id -u. Anything else goes to
+# the real lsof.
+_self=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+_pid=""; _prev=""; _txt=0; _fn=0; _and=0; _other=0
+for _a in "$@"; do
+    case $_prev in -p) _pid=$_a; _prev=""; continue ;; -d) [ "$_a" = txt ] && _txt=1; _prev=""; continue ;; esac
+    case $_a in -a) _and=1 ;; -p|-d) _prev=$_a ;; -Fn) _fn=1 ;; *) _other=1 ;; esac
+done
+_row=""
+if [ "$_and$_txt$_fn$_other" = 1110 ] && [ -n "$_pid" ] && [ -n "${MSS_PROC_TABLE:-}" ]; then
+    _row=$(awk -F'\t' -v p="$_pid" '$0 !~ /^#/ && $1 == p { print; exit }' "$MSS_PROC_TABLE")
+fi
+if [ -z "$_row" ]; then
+    _ifs=$IFS; IFS=:
+    for _d in $PATH; do
+        [ "$_d" != "$_self" ] && [ -x "$_d/lsof" ] && { IFS=$_ifs; exec "$_d/lsof" "$@"; }
+    done
+    echo "lsof stub: no real lsof" >&2
+    exit 1
+fi
+_uid=$(printf '%s\n' "$_row" | awk -F'\t' '{ print $3 }')
+_mode=$(printf '%s\n' "$_row" | awk -F'\t' '{ print $5 }')
+_exe=$(printf '%s\n' "$_row" | awk -F'\t' '{ print $7 }')
+_me=${MSS_PROC_AS_UID:-$(id -u)}
+[ "$_me" = 0 ] || [ "$_me" = "${_uid%%|*}" ] || exit 1
+case $_mode in
+    fail) exit 1 ;;
+    empty) exit 0 ;;
+    sleep) sleep 10 ;;
+esac
+printf 'p%s\nftxt\nn%s\n' "$_pid" "$_exe"

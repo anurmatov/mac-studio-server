@@ -1,7 +1,7 @@
 #!/bin/sh
 # bootstrap.sh — one-line installer for mac-studio-server (#15).
 #
-#   curl -fsSL https://raw.githubusercontent.com/anurmatov/mac-studio-server/v1.7.1/bootstrap.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/anurmatov/mac-studio-server/v1.7.2/bootstrap.sh | sh
 #   ... | sh -s -- --ref <40-hex commit>        (testing a specific commit)
 #
 # Clones or updates ~/mac-studio-server (MSS_DIR) at the release tag, checks the
@@ -10,7 +10,7 @@
 # main, so a truncated download does nothing. Prompts are read from /dev/tty,
 # never from the pipe.
 
-MSS_TAG=v1.7.1
+MSS_TAG=v1.7.2
 MSSB_REMOTE=https://github.com/anurmatov/mac-studio-server.git
 MSSB_RAW=https://raw.githubusercontent.com/anurmatov/mac-studio-server
 

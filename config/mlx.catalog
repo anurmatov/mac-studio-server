@@ -1,0 +1,23 @@
+# MLX model catalogue (#35). Tab-separated, parsed with awk -F'\t', never sourced.
+# One row per file. Columns: id repo revision path size sha256 role license
+# role: starter (offered by the MLX model chooser, at most one), test (never shown in menus).
+# URL: https://huggingface.co/<repo>/resolve/<revision>/<path>. Each file is size- and
+# sha256-checked at the pinned revision: the LFS oid for LFS files, the bytes for the rest.
+qwen3.5-0.8b-4bit	mlx-community/Qwen3.5-0.8B-MLX-4bit	5d894f8cc4ef3e6c88537bf3746ed262f549da6a	chat_template.jinja	7755	273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80	starter	apache-2.0
+qwen3.5-0.8b-4bit	mlx-community/Qwen3.5-0.8B-MLX-4bit	5d894f8cc4ef3e6c88537bf3746ed262f549da6a	config.json	3112	ba7770da23eae5ebd6827571f086e331956b33f4442a9e876fb4aa10969a6772	starter	apache-2.0
+qwen3.5-0.8b-4bit	mlx-community/Qwen3.5-0.8B-MLX-4bit	5d894f8cc4ef3e6c88537bf3746ed262f549da6a	model.safetensors	625229487	f5a0d9dd3efa73510542a8023d610ff26be2b4b020d181cfc4bedaa1fcc5dd9e	starter	apache-2.0
+qwen3.5-0.8b-4bit	mlx-community/Qwen3.5-0.8B-MLX-4bit	5d894f8cc4ef3e6c88537bf3746ed262f549da6a	model.safetensors.index.json	71473	6e48f2fa5d6f033a6d77bf833abfa9698ca24d1715ecea4c67447bcfaee44650	starter	apache-2.0
+qwen3.5-0.8b-4bit	mlx-community/Qwen3.5-0.8B-MLX-4bit	5d894f8cc4ef3e6c88537bf3746ed262f549da6a	preprocessor_config.json	390	27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516	starter	apache-2.0
+qwen3.5-0.8b-4bit	mlx-community/Qwen3.5-0.8B-MLX-4bit	5d894f8cc4ef3e6c88537bf3746ed262f549da6a	processor_config.json	1300	14932921ca485d458a04dafd8069fbb0a4505622a48208d19ed247115801385b	starter	apache-2.0
+qwen3.5-0.8b-4bit	mlx-community/Qwen3.5-0.8B-MLX-4bit	5d894f8cc4ef3e6c88537bf3746ed262f549da6a	tokenizer.json	19989343	87a7830d63fcf43bf241c3c5242e96e62dd3fdc29224ca26fed8ea333db72de4	starter	apache-2.0
+qwen3.5-0.8b-4bit	mlx-community/Qwen3.5-0.8B-MLX-4bit	5d894f8cc4ef3e6c88537bf3746ed262f549da6a	tokenizer_config.json	1139	e98f1901ac6f0adff67b1d540bfa0c36ac1a0cf59eb72ed78146ef89aafa1182	starter	apache-2.0
+qwen3.5-0.8b-4bit	mlx-community/Qwen3.5-0.8B-MLX-4bit	5d894f8cc4ef3e6c88537bf3746ed262f549da6a	video_preprocessor_config.json	385	7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13	starter	apache-2.0
+qwen3.5-0.8b-4bit	mlx-community/Qwen3.5-0.8B-MLX-4bit	5d894f8cc4ef3e6c88537bf3746ed262f549da6a	vocab.json	6722759	ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003	starter	apache-2.0
+smollm2-135m-8bit	mlx-community/SmolLM2-135M-Instruct-8bit	0f0d9b8218915bc34d401e1a340b8c049d300d5e	config.json	1097	5da91905efdfde905f566d76d4031e6ca7c4cb2a01dc4e3812a70b855188fc73	test	apache-2.0
+smollm2-135m-8bit	mlx-community/SmolLM2-135M-Instruct-8bit	0f0d9b8218915bc34d401e1a340b8c049d300d5e	merges.txt	466391	0b54e8aa4e53d5383e2e4bc635a56b43f9647f7b13832d5d9ecd8f82dac4f510	test	apache-2.0
+smollm2-135m-8bit	mlx-community/SmolLM2-135M-Instruct-8bit	0f0d9b8218915bc34d401e1a340b8c049d300d5e	model.safetensors	143030401	ec569c771e56424636be99625aba9031abc525a68a5f4ab16d678eca96fef12c	test	apache-2.0
+smollm2-135m-8bit	mlx-community/SmolLM2-135M-Instruct-8bit	0f0d9b8218915bc34d401e1a340b8c049d300d5e	model.safetensors.index.json	48979	d016e7514e8bfed162eb9d0716c73244c1b73792db3143e92e54138c1772db44	test	apache-2.0
+smollm2-135m-8bit	mlx-community/SmolLM2-135M-Instruct-8bit	0f0d9b8218915bc34d401e1a340b8c049d300d5e	special_tokens_map.json	655	2b7379f3ae813529281a5c602bc5a11c1d4e0a99107aaa597fe936c1e813ca52	test	apache-2.0
+smollm2-135m-8bit	mlx-community/SmolLM2-135M-Instruct-8bit	0f0d9b8218915bc34d401e1a340b8c049d300d5e	tokenizer.json	3522656	7d27c493c729a66ecefc837280b05d948b1ed50d130eebdbf911b1b36cf38ed7	test	apache-2.0
+smollm2-135m-8bit	mlx-community/SmolLM2-135M-Instruct-8bit	0f0d9b8218915bc34d401e1a340b8c049d300d5e	tokenizer_config.json	3764	a27f638bd2831f5c3dea654a75838930f2b11fbe550c4d4e1d5d7bd07157b2ee	test	apache-2.0
+smollm2-135m-8bit	mlx-community/SmolLM2-135M-Instruct-8bit	0f0d9b8218915bc34d401e1a340b8c049d300d5e	vocab.json	800662	82b84012e3add4d01d12ba14442026e49b8cbbaead1f79ecf3d919784f82dc79	test	apache-2.0

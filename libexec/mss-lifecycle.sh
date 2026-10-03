@@ -57,8 +57,10 @@ fi
 [ ! -e "$TRIP_MARKER" ] \
     || mss_die "the guard tripped ($(head -n 1 "$TRIP_MARKER" 2>/dev/null)); recover with sudo /usr/local/libexec/mac-studio-server/mss-enable.sh"
 ! loaded || mss_die "$LABEL is already loaded"
-_us=$(mss_unmanaged_server) || mss_die "pgrep is missing; cannot check for other model servers"
-[ -z "$_us" ] || mss_die "unmanaged model server running (${_us% *} pid ${_us#* }); stop it first"
+# Ollama's verified embedding worker may run (#35), as the installed service
+# user: this command has no input, so the installed conf names it.
+_us=$(mss_unmanaged_server "$(mss_conf_service_uid)") || mss_die "pgrep is missing; cannot check for other model servers"
+[ -z "$_us" ] || mss_die "$(mss_unmanaged_refusal "$_us")"
 [ -e "$PLIST" ] || mss_die "$PLIST is missing; re-run the install"
 
 mss_lock_check
