@@ -29,8 +29,9 @@ ACTIVE=$(mss_conf_get MSS_GUARD_BACKEND)
 
 # No other model server, managed or not: this runs before our own exec, so any
 # match is another server, and the guard watches only one process.
-_srv=$(mss_model_servers) || refuse "pgrep is missing; cannot check for other model servers"
-_srv=$(printf '%s\n' "$_srv" | head -n 1)
+# Ollama's verified embedding worker is part of Ollama, which runs beside any
+# backend (#35). This job runs as the service user, so the worker must too.
+_srv=$(mss_start_blocker "$(id -u)") || refuse "pgrep is missing; cannot check for other model servers"
 [ -z "$_srv" ] || refuse "model server already running (${_srv%% *} pid ${_srv#* })"
 BIN=$(mss_conf_get LLAMACPP_BIN)
 [ -n "$BIN" ] || refuse "conf missing LLAMACPP_BIN"

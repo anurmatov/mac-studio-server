@@ -607,14 +607,19 @@ active_will_start() {
 
 # unmanaged_server_check (D5.7): a backend starts only when no other model
 # server runs, managed or not. Only a root pass can see the managed jobs' PIDs.
+# Ollama's verified embedding worker is part of Ollama and may run (#35). It
+# must run as the user this run installs the jobs for: this run's validated
+# input, never the installed conf, which a fresh install lacks and a changed
+# OLLAMA_USER makes stale.
 unmanaged_server_check() {
     _us_extra=""
     for _us_v in "$LLAMACPP_BIN_RESOLVED" "$DS4_BIN_RESOLVED" "$MLX_BIN_RESOLVED"; do
         [ -z "$_us_v" ] || _us_extra="$_us_extra $(basename "$_us_v")"
     done
+    _us_uid=$(id -u "$MSS_SERVICE_USER" 2>/dev/null)
     # shellcheck disable=SC2086  # a list of names
-    _us=$(MSS_CONF=$I_CONF mss_unmanaged_server $_us_extra) || mss_die "pgrep is missing; cannot check for other model servers"
-    [ -z "$_us" ] || mss_die "unmanaged model server running (${_us% *} pid ${_us#* }); stop it first"
+    _us=$(MSS_CONF=$I_CONF mss_unmanaged_server "$_us_uid" $_us_extra) || mss_die "pgrep is missing; cannot check for other model servers"
+    [ -z "$_us" ] || mss_die "$(mss_unmanaged_refusal "$_us")"
 }
 
 if [ "$IS_ROOT" = 1 ] && active_will_start; then unmanaged_server_check; fi
