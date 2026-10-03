@@ -7,7 +7,7 @@ a memory guard, and firewalled LAN access.
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/anurmatov/mac-studio-server/v1.7.1/bootstrap.sh | sh
+curl -fsSL https://raw.githubusercontent.com/anurmatov/mac-studio-server/v1.7.2/bootstrap.sh | sh
 ```
 
 Or clone it yourself: `git clone https://github.com/anurmatov/mac-studio-server.git && cd mac-studio-server && ./scripts/install.sh`.
@@ -20,7 +20,7 @@ Every question has a default; press Enter to take it. Installs and downloads hap
 2. Your password, once for the whole run.
 3. Which backends (several numbers, e.g. `1,3`), whether to remove one you left out, and which runs now.
 4. Missing Homebrew, Ollama, `llama-server`, `ds4-server` or `mlx-serve`: install or build it? (default no)
-5. A model: the starter (the default, downloaded right away), another one, your own file or URL, or later.
+5. A model: the starter (the default; MLX asks y/N first), another one, one found on disk (MLX), your own file or URL, or later.
 6. LAN access for llama.cpp, ds4 or MLX (default no; yes asks for an address and allowed clients).
 7. Headless macOS tweaks: no sleep, Spotlight, Time Machine or auto-updates (default no).
 8. GPU memory percent for every backend (1-100 or system), restart after a power failure
@@ -65,12 +65,12 @@ Ollama listens on all interfaces (0.0.0.0) by default and has no password; set O
 
 ## Updates
 
-- **1.7.0, 1.7.1** MLX-Serve (LAN access in 1.7.1), several backends at once (one running), `backend.sh`.
+- **1.7.0-1.7.2** MLX-Serve (LAN access in 1.7.1, a model chooser in 1.7.2), several backends at once, `backend.sh`.
 - **1.6.0** GPU memory, Docker and restart-after-power-failure choices in the installer.
 - **1.5.0** One-line install, guided downloads and builds, and `model.sh`.
 - **1.3.0, 1.4.0** Optional llama.cpp and DwarfStar backends; the interactive picker and saved answers.
 
-Current version: 1.7.1 (semver). History: [CHANGELOG.md](CHANGELOG.md).
+Current version: 1.7.2 (semver). History: [CHANGELOG.md](CHANGELOG.md).
 
 ## Contributing
 

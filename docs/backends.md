@@ -1,7 +1,8 @@
 # Inference Backends
 
 Reference for the optional inference backends added in 1.3.0, for 1.7.0's
-MLX-Serve backend and standby backends, and for 1.7.1's MLX LAN access. The README has the short version;
+MLX-Serve backend and standby backends, for 1.7.1's MLX LAN access, and for
+1.7.2's MLX model chooser and Ollama embedding worker. The README has the short version;
 `config/backends.env.example` lists every variable.
 
 Ollama stays the zero-config default: with `MSS_BACKENDS` unset or `ollama`,
@@ -147,7 +148,7 @@ saved file never removes a backend, and an installed backend missing from
 ## One-line install, model.sh and acquisition variables (1.5.0)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/anurmatov/mac-studio-server/v1.7.1/bootstrap.sh | sh
+curl -fsSL https://raw.githubusercontent.com/anurmatov/mac-studio-server/v1.7.2/bootstrap.sh | sh
 ./scripts/model.sh                                        # menu: starter, more, own file/URL
 ./scripts/model.sh --catalog qwen3-4b                     # or --path FILE --sha256 HEX
 ./scripts/model.sh --url https://… --sha256 HEX [--dest FILE]
@@ -158,7 +159,7 @@ The one-liner trusts GitHub and this repo's protected release tags; it checks th
 `bootstrap.sh` clones `~/mac-studio-server` (`MSS_DIR`) at the release tag, or at a full
 40-hex commit with `sh -s -- --ref <sha>`, then runs `install.sh` on the terminal.
 `model.sh` needs a terminal and a `backends.env` with llama.cpp or ds4 (`--backend llamacpp|ds4`
-when both are selected; mlx models are directories, set with `install.sh --configure`); it never touches Ollama.
+when both are selected; mlx models are directories, chosen in `install.sh --configure`); it never touches Ollama.
 Models come from `config/models.catalog` (pinned revisions and sha256), download to
 `~/models/<file>.part` and resume on a re-run.
 
@@ -256,7 +257,8 @@ scripts/backend.sh activate <b>)` for a standby one, or what is wrong
 (`standby plist missing`, `standby stamp missing`, `standby but loaded` with
 the bootout command), `no optional backend active`, `interrupted install`, and
 any model server outside the guard's view (`unmanaged <name> pid N (not
-guarded)`).
+guarded)`). Ollama's own embedding worker is part of Ollama, not an unmanaged
+server: `ollama embedding worker pid N (part of Ollama)` (1.7.2, below).
 
 ## MLX-Serve (1.7.0)
 
@@ -297,6 +299,72 @@ as the service user, as
 `mlx-serve --serve --model <dir> --host <MLX_HOST> --port <port> --max-resident-models 1 --log-file off [--ctx-size <n>] [extra args]`,
 with its output in `/var/log/mac-studio-server/mlx.log`. `MSS_DEFER_MODEL` does
 not apply to mlx. `mlx.distributed` is out of scope.
+
+**The MLX model chooser (1.7.2).** After the binary, the picker offers: the
+saved directory (`keep`, the default while it is still usable); a small pinned
+starter, `qwen3.5-0.8b-4bit` (652 MB, 10 files: it checks the install, it is not
+for production use); complete checkpoints found in mlx-serve's own
+`~/.mlx-serve/models/<org>/<repo>` and in `~/models/<name>` (up to 8 rows); or
+another directory, with the question 1.7.1 asked. With nothing saved and
+nothing found the starter is the default; with checkpoints found there is no
+default, so Enter never downloads. "found" means complete by name: a top-level
+`config.json` and `*.safetensors`, no `.gguf`, no `*.partial`, `*.part` or
+`*.sha-mismatch` file, and every shard `model.safetensors.index.json` lists (the
+only file read, at most 4 MiB). The install check and mlx-serve still decide.
+Non-interactive and saved-answer runs never see the chooser or download.
+
+The starter comes from `config/mlx.catalog` (one row per file: repository,
+revision, path, size, sha256), never from `mlx-serve pull` (it fetches `main`
+unpinned, checks no hash and passes `HF_TOKEN` in argv). After a `y` (Enter is
+no), each file is fetched in turn to
+`~/.mlx-serve/models/.mss-staging/<repo>/`, resumably, size-checked, and hashed
+as soon as it is complete; a verified file is recorded in
+`.mss-staging/<repo>.verified` and never hashed again. Only a complete stage
+is renamed, once, to `~/.mlx-serve/models/<repo>` (so `mlx-serve list` shows
+it). An existing directory is never written into, merged or replaced.
+
+**Nothing is downloaded while Ollama or a model server runs**, an idle
+`ollama serve` and Ollama's embedding worker included: a download is checked
+by reading it, and paging it in beside a resident model can freeze the Mac.
+Stop Ollama for the download, or choose "another directory".
+
+| case | the chooser | left behind |
+|---|---|---|
+| `n` at the consent | back to the menu | nothing |
+| Ollama or a model server runs | names it, back to the menu | staging, if any |
+| offline, DNS, TLS, HTTP error | the download's message, back to the menu | `.part` |
+| the server's size differs from the catalogue | `size mismatch`, nothing downloaded | nothing new |
+| disk full mid-file | `download failed (curl exit N)` | `.part` |
+| a staged file's sha256 or size is wrong | moved to `.mss-staging/<repo>.rejected/<file>.sha-mismatch` (or `.size-mismatch`, never overwritten) | staging without it; choosing the starter again fetches only that file |
+| the destination exists or appears | refused | the existing directory, untouched |
+| Ctrl-C | exits, nothing saved | staging and `.part` |
+
+Choosing the starter again resumes. `rm -rf ~/.mlx-serve/models/.mss-staging`
+removes an interrupted download and any rejected files; a finished one is an
+ordinary directory, kept by `uninstall.sh`.
+
+**Ollama's embedding worker (1.7.2).** Ollama 0.34.3 and later run a model of
+its llama.cpp engine in a bundled `llama-server`, started directly by
+`ollama serve`. With an embedding model loaded, 1.7.1 refused that worker as an
+unmanaged server at install and at every start. Now a `llama-server` is
+Ollama's embedding worker when all nine checks hold: its name; its executable
+a regular file named `llama-server`; its direct parent is `ollama serve`
+exactly (two words), with a regular `ollama` executable in directory `D`; the
+worker's executable is `D/llama-server`, `D/lib/ollama/llama-server` or
+`D/../lib/ollama/llama-server` (no build trees); both run as the service user;
+its arguments carry `--host 127.0.0.1` and `--embedding`; and nothing changed
+during the check. Every read is bounded (5 s); any error fails closed, as in
+1.7.1. The install check, the three wrappers, `backend.sh start` and
+`status.sh` accept it; it still blocks every full model read and hash, and the
+guard ignores it, as it ignores Ollama. A chat worker, the discovery probe and
+any other `llama-server` are refused as before.
+
+The service user decides: the root install check uses this run's `OLLAMA_USER`
+(the user it installs for), `sudo status.sh` and `backend.sh start` the
+installed conf's, the wrappers and a non-root `status.sh` their own. Without
+root, `lsof` reads only the same user's processes, so the worker is accepted
+only when Ollama runs as the service user, as `config/com.ollama.service.plist`
+runs it.
 
 Checked against upstream v26.10.1 (commit `02bee553`) source: the defaults
 (`0.0.0.0:11234`), `--version`, one model with `--model <dir> --serve`, the
@@ -358,6 +426,20 @@ Placeholders: `<checkout>`, `<user>`, `<mlx-serve>`, `<model-dir>`, `<prior vars
 - **R9 Bumping `mlx-serve`.** In the same PR as the version pin, re-audit the
   upstream route table and the providers and `--lan-share` behaviour, and
   update R-1 below.
+- **R10 Install refused beside Ollama (1.7.2).** `unmanaged model server
+  running (llama-server pid N); stop it first (not a verified Ollama embedding
+  worker: check <n>: <reason>)` names the first check that failed, and
+  `sudo ./scripts/status.sh` shows the same reason. `check 2: process not
+  readable` or `check 7: not owned by the service user`: Ollama runs as
+  another user (R-15); run it as the service user, or set `OLLAMA_USER` to
+  Ollama's user. `check 7: service user unknown`: `sudo status.sh` found no
+  `MSS_SERVICE_USER` in the installed conf; re-run the install. A non-root
+  `status.sh` run by someone other than the service user shows `check 2` for a
+  good worker; install and start are not affected, `sudo status.sh` shows the
+  truth. `check 8: not an embedding worker`: a chat model is loaded (R-14);
+  unload it (`ollama stop <model>`). Do not kill Ollama's worker to get past
+  the check. A starter download that stopped half-way: choose it again, or
+  `rm -rf ~/.mlx-serve/models/.mss-staging`.
 
 ## Residual risks (1.7.0)
 
@@ -388,6 +470,12 @@ Placeholders: `<checkout>`, `<user>`, `<mlx-serve>`, `<model-dir>`, `<prior vars
 - **R-12** A save to `backends.env` orphaned by a `SIGKILL` of `sudo` can rename
   between its conf check and its move; a stale write needs the conf to change
   in that moment.
+- **R-13** (1.7.2) The worker check stops accidental misclassification, not a
+  determined local user who arranges `ollama serve` and a matching child.
+- **R-14** (1.7.2) Ollama's chat workers and its device-discovery probe still
+  refuse a start, as in 1.7.1.
+- **R-15** (1.7.2) An Ollama whose `serve` and worker run as a user other than
+  the service user is still refused at install and start, as in 1.7.1 (R10).
 
 ## Migration
 
@@ -410,6 +498,11 @@ Placeholders: `<checkout>`, `<user>`, `<mlx-serve>`, `<model-dir>`, `<prior vars
 - **From 1.7.0 to 1.7.1:** a 1.7.0 `backends.env` has no `MLX_HOST`, so mlx
   stays on loopback; a plain re-install asks nothing new, renders the same
   files and restarts nothing. Going back: runbook R8.
+- **From 1.7.1 to 1.7.2:** no new saved key; a plain re-install asks nothing,
+  downloads nothing and restarts only what changed. Going back to 1.7.1 with
+  the same answers works, but 1.7.1 again refuses beside Ollama's embedding
+  worker. Downloaded models stay; `rm -rf ~/.mlx-serve/models/.mss-staging`
+  removes an unfinished download.
 - **`OLLAMA_GPU_PERCENT` and `DOCKER_AUTOSTART` (1.5.0 names):** deprecated but
   still read; the installer migrates them and prints a notice. See
   `docs/options.md`.
