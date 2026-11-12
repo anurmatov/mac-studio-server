@@ -15,14 +15,14 @@ else
     . "$_self_dir/../scripts/lib/mss-common.sh"
 fi
 
-# MSS_STAMP_DIR, MSS_BOOT_MARKER, MSS_MARKER_WAIT and MSS_HOST_WAIT are test
-# hooks: launchd starts this job with no environment.
+# MSS_STAMP_DIR, MSS_BOOT_MARKER and MSS_MARKER_WAIT are test hooks (and
+# MSS_HOST_WAIT and MSS_LAN_RETRY_PAUSE, read by mss_lan_ready_or_reexec):
+# launchd starts this job with no environment.
 DB_DIR=${MSS_STAMP_DIR:-/var/db/mac-studio-server}
 TRIP_MARKER="$DB_DIR/guard.tripped"
 STAMP="$DB_DIR/$BACKEND.model.verified"
 BOOT_MARKER=${MSS_BOOT_MARKER:-/var/run/com.mac-studio-server.boot.ok}
 MARKER_WAIT=${MSS_MARKER_WAIT:-120}
-HOST_WAIT=${MSS_HOST_WAIT:-120}
 
 refuse() { echo "REFUSE: $1"; exit 78; }
 
@@ -100,18 +100,13 @@ if [ -n "$WIRED_LIMIT" ]; then
     done
 fi
 
-# 10. The selected address is on an interface (#33). At boot this job can run
-#     before the network has configured MLX_HOST, and mlx-serve would exit
-#     with AddressUnavailable. Wait for it, bounded, then refuse.
-if ! mss_is_loopback_host "$HOST" && ! mss_host_is_local "$HOST"; then
-    echo "WAIT: $HOST is not on any interface yet (up to ${HOST_WAIT}s)"
-    _waited=0
-    until mss_host_is_local "$HOST"; do
-        [ "$_waited" -ge "$HOST_WAIT" ] && refuse "address $HOST is not on any interface after ${_waited}s"
-        sleep 1
-        _waited=$((_waited + 1))
-    done
-fi
+# 10. The selected address is on an interface (#33, #39). At boot this job can
+#     run before the network has configured MLX_HOST, and mlx-serve would exit
+#     with AddressUnavailable. The helper waits for it in this process and then
+#     runs this script again in the same PID, so checks 1-9 and this one are
+#     fresh at the exec below; an address still missing after its window is
+#     deferred and retried, never refused. A failed interface query refuses.
+mss_lan_ready_or_reexec "$HOST" "$0" "$@" || refuse "$MSS_LAN_REASON"
 
 set -- "$BIN" --serve --model "$MODEL_DIR" --host "$HOST" --port "$PORT" --max-resident-models 1 --log-file off
 [ -n "$CTX" ] && set -- "$@" --ctx-size "$CTX"

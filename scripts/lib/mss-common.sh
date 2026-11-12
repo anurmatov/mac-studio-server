@@ -147,12 +147,17 @@ mss_validate_allowlist() {
 }
 
 # Is HOST an address assigned to a local interface? (ifconfig parse; override
-# the binary via MSS_IFCONFIG in render-only tests.)
+# the binary via MSS_IFCONFIG in render-only tests.) 0: yes; 1: the query
+# worked and HOST is not in it; 2: the query failed or printed nothing (#39).
+# The output and status are taken before matching: through a pipe the status
+# would be grep's, and a failed ifconfig would read as an absent address.
 mss_host_is_local() {
     _host=${1:-127.0.0.1}
     mss_is_loopback_host "$_host" && return 0
     _ifconfig=${MSS_IFCONFIG:-/sbin/ifconfig}
-    "$_ifconfig" 2>/dev/null | grep -Eq "inet[[:space:]]+$_host([[:space:]]|\$)"
+    _ifout=$("$_ifconfig" 2>/dev/null) || return 2
+    [ -n "$_ifout" ] || return 2
+    printf '%s\n' "$_ifout" | grep -Eq "inet[[:space:]]+$_host([[:space:]]|\$)"
 }
 
 mss_is_loopback_host() {
@@ -170,6 +175,79 @@ mss_validate_host() {
     mss_validate_ipv4 "$_host" || { mss_error "$_var: '$_host' must be a single IPv4 address"; return 1; }
     return 0
 }
+
+# ── LAN readiness (#39) ────────────────────────────────────────────────────────
+# mss_lan_ready_or_reexec HOST ENTRYPOINT [ARG...]: for a start wrapper, called
+# in its own shell (never inside $(...)) after its other checks and before it
+# builds the engine's argv. ENTRYPOINT is the wrapper's absolute path ("$0"),
+# the ARGs its own arguments ("$@").
+#   0  HOST is loopback or on an interface now: go on to the exec.
+#   1  refuse, with the reason in MSS_LAN_REASON: an interface query that
+#      failed or printed nothing, a bad hook, an ENTRYPOINT that is not an
+#      absolute executable, a failed sleep.
+# Otherwise it does not return. One WAIT: line, then a probe a second for up to
+# MSS_HOST_WAIT seconds (default 120): once HOST appears it execs ENTRYPOINT, so
+# every check runs again in the same PID before the engine starts. Still absent
+# after the window: one DEFER: line, MSS_LAN_RETRY_PAUSE seconds (default 30,
+# 1..300), then the same exec, as often as it takes. No state is kept between
+# attempts and the job's launchd policy is not touched. TERM, INT or HUP ends
+# the invocation, its sleep too. Both hooks are for tests: launchd starts the
+# job with no environment.
+# shellcheck disable=SC2034  # MSS_LAN_REASON is the caller's
+mss_lan_ready_or_reexec() {
+    MSS_LAN_REASON=""
+    _lr_host=$1; _lr_entry=$2; shift 2
+    mss_is_loopback_host "$_lr_host" && return 0
+    _lr_wait=${MSS_HOST_WAIT:-120}; _lr_pause=${MSS_LAN_RETRY_PAUSE:-30}
+    mss_validate_uint MSS_HOST_WAIT "$_lr_wait" 1 2>/dev/null \
+        || { MSS_LAN_REASON="MSS_HOST_WAIT '$_lr_wait' is not a positive integer"; return 1; }
+    mss_validate_uint MSS_LAN_RETRY_PAUSE "$_lr_pause" 1 300 2>/dev/null \
+        || { MSS_LAN_REASON="MSS_LAN_RETRY_PAUSE '$_lr_pause' is not an integer from 1 to 300"; return 1; }
+    case $_lr_entry in
+        /*) [ -f "$_lr_entry" ] && [ -x "$_lr_entry" ] ;;
+        *) false ;;
+    esac || { MSS_LAN_REASON="cannot re-run '$_lr_entry': not an absolute path to an executable"; return 1; }
+    _lr_probe_failed="cannot read the interface addresses (ifconfig failed or printed nothing)"
+    _lr_rc=0; mss_host_is_local "$_lr_host" || _lr_rc=$?
+    case $_lr_rc in
+        0) return 0 ;;
+        1) ;;
+        *) MSS_LAN_REASON=$_lr_probe_failed; return 1 ;;
+    esac
+    echo "WAIT: $_lr_host is not on any interface yet (up to ${_lr_wait}s)"
+    _lr_child=""
+    trap '_mss_lr_stop 143' TERM
+    trap '_mss_lr_stop 130' INT
+    trap '_mss_lr_stop 129' HUP
+    _lr_waited=0
+    while [ "$_lr_waited" -lt "$_lr_wait" ]; do
+        _mss_lr_sleep 1 || { _mss_lr_untrap; MSS_LAN_REASON="sleep failed while waiting for $_lr_host"; return 1; }
+        _lr_waited=$((_lr_waited + 1))
+        _lr_rc=0; mss_host_is_local "$_lr_host" || _lr_rc=$?
+        case $_lr_rc in
+            0) exec "$_lr_entry" "$@" ;;
+            1) ;;
+            *) _mss_lr_untrap; MSS_LAN_REASON=$_lr_probe_failed; return 1 ;;
+        esac
+    done
+    echo "DEFER: lan_address_unavailable retry_in=${_lr_pause}s"
+    _mss_lr_sleep "$_lr_pause" || { _mss_lr_untrap; MSS_LAN_REASON="sleep failed while waiting for $_lr_host"; return 1; }
+    exec "$_lr_entry" "$@"
+}
+# The sleep runs as a child so that a stop can end it with the invocation.
+_mss_lr_sleep() {
+    sleep "$1" &
+    _lr_child=$!
+    wait "$_lr_child"
+    _lr_src=$?
+    _lr_child=""
+    return "$_lr_src"
+}
+_mss_lr_stop() {
+    [ -z "$_lr_child" ] || kill "$_lr_child" 2>/dev/null
+    exit "$1"
+}
+_mss_lr_untrap() { trap - TERM INT HUP; }
 
 # ── ports and integers ─────────────────────────────────────────────────────────
 mss_validate_port() {

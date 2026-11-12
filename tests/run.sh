@@ -2127,8 +2127,9 @@ for f in README.md docs/backends.md bootstrap.sh; do
             '{ n++; if ($0 != t) bad = 1 } END { print (n && !bad) ? "ok" : "missing or other tag" }')"
 done
 check "CHANGELOG has a dated section for $RVER" 1 "$(grep -c "^## \[$RVER\] - [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\$" "$ROOT/CHANGELOG.md")"
-check "CHANGELOG [Unreleased] comes first and is empty" "## [Unreleased]|## [$RVER]" \
-    "$(grep -m 1 '^## \[' "$ROOT/CHANGELOG.md")|$(grep -v '^[[:space:]]*$' "$ROOT/CHANGELOG.md" | grep -A1 -m 1 '^## \[Unreleased\]$' | tail -n 1 | sed 's/ - .*//')"
+# Unreleased fixes may sit under [Unreleased] between releases (#39).
+check "CHANGELOG [Unreleased] comes first, then $RVER" "## [Unreleased]|## [$RVER]" \
+    "$(grep -m 1 '^## \[' "$ROOT/CHANGELOG.md")|$(grep '^## \[' "$ROOT/CHANGELOG.md" | sed -n 2p | sed 's/ - .*//')"
 S3=$(awk '/^## One-line install/{f=1} /^## Status/{f=0} f' "$ROOT/docs/backends.md" | wc -l)
 [ "$S3" -le 30 ] && ok "docs/backends.md new section ≤ 30 lines ($S3) (S3)" || fail "docs/backends.md section is $S3 lines"
 grep -q "configure-only.*may leave a verification stamp" "$ROOT/docs/backends.md" && ok "backends.md --configure-only wording (S3)" || fail "S3 wording"
@@ -3366,9 +3367,22 @@ check "AC4 a late LAN address delays the start, then it starts" 0 \
 EL=$(( $(date +%s) - T0 ))
 check "AC4 late: WAIT, then START with --host 192.0.2.10, after about 2 s" "WAIT: 192.0.2.10 is not on any interface yet (up to 10s)|--host 192.0.2.10|yes" \
     "$(sed -n 1p "$T3/late.out")|$(grep -o -- '--host [0-9.]*' "$T3/late.argv" 2>/dev/null)|$([ "$EL" -ge 2 ] && [ "$EL" -le 9 ] && echo yes || echo "no (${EL}s)")"
-check "AC4 an address that never appears refuses within the bound; nothing started" \
-    "78 REFUSE: address 192.0.2.10 is not on any interface after 2s no-exec" \
-    "$(w33 noaddr 192.0.2.10 MSS_BOOT_MARKER="$T3/marker" MSS_IFCONFIG="$T3/ifconfig-none.sh") $(tail -n 1 "$T3/noaddr.out") $([ -e "$T3/noaddr.argv" ] && echo exec || echo no-exec)"
+# An address that never appears is deferred, not refused (#39): the row lets
+# one window, a pause and the next window run, then stops the wrapper rather
+# than waiting for an exit that no longer comes.
+printf 'MSS_GUARD_BACKEND=mlx\nMLX_BIN=%s\nMLX_MODEL_DIR=%s\nMLX_PORT=18235\nMLX_HOST=192.0.2.10\n' "$T3/mlx-serve" "$TMP/fix/mlx/model" \
+    > "$T3/noaddr.conf"
+rm -f "${T3:?}/noaddr.argv"
+env PATH="$SYSBIN33:$PATH" MSS_STUB_BOOTID=$BOOTID33 MSS_IFCONFIG="$T3/ifconfig-none.sh" MSS_HOST_WAIT=1 MSS_LAN_RETRY_PAUSE=1 \
+    MSS_CONF="$T3/noaddr.conf" MSS_STAMP_DIR="$T3/w" MSS_STUB_ARGV="$T3/noaddr.argv" HOME="$T3/home" MSS_BOOT_MARKER="$T3/marker" \
+    sh "$ROOT/libexec/mlx-start.sh" >"$T3/noaddr.out" 2>&1 </dev/null &
+NOADDR=$!
+_i=0; while [ "$(grep -c '^WAIT:' "$T3/noaddr.out")" -lt 2 ] && [ "$_i" -lt 100 ]; do sleep 0.2; _i=$((_i + 1)); done
+kill "$NOADDR" 2>/dev/null; wait "$NOADDR"; RC=$?
+check "AC4 an address that never appears: WAIT, DEFER, WAIT again; stopped by TERM; nothing started" \
+    "143 WAIT: 192.0.2.10 is not on any interface yet (up to 1s)|DEFER: lan_address_unavailable retry_in=1s|WAIT: 192.0.2.10 is not on any interface yet (up to 1s) no-exec" \
+    "$RC $(head -n 3 "$T3/noaddr.out" | tr '\n' '|' | sed 's/|$//') $([ -e "$T3/noaddr.argv" ] && echo exec || echo no-exec)"
+grep -q '^REFUSE:' "$T3/noaddr.out" && fail "AC4 an absent address was refused: $(cat "$T3/noaddr.out")" || ok "AC4 an absent address is never refused"
 mkdir -p "$T3/home/.mlx-serve"; : > "$T3/home/.mlx-serve/providers.json"
 check "AC4 LAN with providers.json under HOME refuses; nothing started" \
     "78 REFUSE: providers file present ($T3/home/.mlx-serve/providers.json); a LAN bind would share its credentials no-exec" \
@@ -3427,6 +3441,258 @@ check "AC5 no request to 127.0.0.1; /health and /v1/models on 192.0.2.10" "0 2" 
 : > "$AC5/down"; ac5 down; rm -f "${AC5:?}/down"
 check "AC5 a failed probe exits 1" "rc=1" "$(tail -n 1 "$AC5/down.out")"
 grep -q '^  health  *no response on /health$' "$AC5/down.out" && ok "AC5 names the failed probe" || fail "AC5 down: $(cat "$AC5/down.out")"
+
+echo "== phase A: #39 LAN readiness retry (A2, A6, A7) =="
+# The rendered wrapper and helper (install-backends.sh --render-only) on a
+# virtual clock: the sleep stub advances $T39/clock by the wrapper's own waits
+# (1, 2 and the retry pause) at once and logs them, and the ifconfig stub
+# answers by that clock. Every other sleep is real.
+T39=$TMP/i39; mkdir -p "$T39/vbin" "$T39/bin" "$T39/home" "$T39/w" "$T39/unmanaged" "$T39/model"
+if render mlx "$T39/r" MLX_HOST=192.0.2.10 MLX_ALLOW_FROM=192.0.2.0/24 MSS_IFCONFIG="$LANIF33" >"$T39/r.out" 2>&1; then
+    check "A2 the rendered wrapper and helper are the checkout's, executable" "same same yes" \
+        "$(cmp -s "$T39/r/mlx-start.sh" "$ROOT/libexec/mlx-start.sh" && echo same || echo differs) $(cmp -s "$T39/r/mss-common.sh" "$ROOT/scripts/lib/mss-common.sh" && echo same || echo differs) $([ -x "$T39/r/mlx-start.sh" ] && echo yes || echo no)"
+else
+    fail "A2 render: $(cat "$T39/r.out")"
+fi
+R39=$T39/r
+cp "$TMP/fix/mlx/model/config.json" "$TMP/fix/mlx/model/model.safetensors" "$T39/model/"
+mss_mlx_manifest "$T39/model" > "$T39/w/mlx.model.verified"
+printf '%s\n' "$BOOTID33" > "$T39/marker"; echo 8192 > "$T39/wired"; echo 0 > "$T39/clock"
+cp "$(command -v sleep)" "$T39/unmanaged/mlx-serve"
+REAL_SLEEP=$(command -v sleep)
+cat > "$T39/vbin/sleep" <<STUB
+#!/bin/sh
+case \$1 in 1|2|"\${MSS_LAN_RETRY_PAUSE:-30}") ;; *) exec '$REAL_SLEEP' "\$@" ;; esac
+echo \$(( \$(cat '$T39/clock') + \$1 )) > '$T39/clock'
+echo "\$1" >> "\${T39_SLEEPS:?}"
+if [ -n "\${T39_ON:-}" ] && [ "\$(cat '$T39/clock')" -ge "\$T39_ON_AT" ] && [ ! -e '$T39/applied' ]; then
+    : > '$T39/applied'; sh '$T39/cause.sh' apply "\$T39_ON" "\$MSS_CONF"
+fi
+[ ! -e '$T39/sleep-fails' ]
+STUB
+# T39_APPEAR: 192.0.2.10 is local from that virtual second on (unset: never).
+# T39_IF=fail|empty: the query exits 1 or prints nothing, from T39_IF_AT on.
+cat > "$T39/bin/ifconfig" <<STUB
+#!/bin/sh
+_v=\$(cat '$T39/clock')
+if [ -n "\${T39_IF:-}" ] && [ "\$_v" -ge "\${T39_IF_AT:-0}" ]; then
+    case \$T39_IF in fail) exit 1 ;; empty) exit 0 ;; esac
+fi
+if [ -n "\${T39_APPEAR:-}" ] && [ "\$_v" -ge "\$T39_APPEAR" ]; then exec '$LANIF33'; fi
+cat '$T3/ifconfig-none.txt'
+STUB
+cat > "$T39/bin/sysctl" <<STUB
+#!/bin/sh
+case "\$*" in "-n iogpu.wired_limit_mb") cat '$T39/wired'; exit 0 ;; esac
+exec '$SYSBIN33/sysctl' "\$@"
+STUB
+cat > "$T39/mlx-serve" <<STUB
+#!/bin/sh
+if [ "\${1:-}" = --version ]; then echo "mlx-serve 26.10.1"; exit 0; fi
+printf '%s %s %s\n' "\$\$" "\$(cat '$T39/clock')" "\$*" >> "\${MSS_STUB_ARGV:?}"
+STUB
+# cause.sh apply|clear <cause> <conf>: one start refusal (A7).
+cat > "$T39/cause.sh" <<STUB
+#!/bin/sh
+_until() { _n=0; until "\$@" >/dev/null 2>&1; do [ "\$_n" -lt 50 ] || return 1; sleep 0.1; _n=\$((_n + 1)); done; }
+case \$1:\$2 in
+    apply:model) printf x > '$T39/model/extra.safetensors' ;;
+    clear:model) rm -f '${T39:?}/model/extra.safetensors' ;;
+    apply:binary) mv '$T39/mlx-serve' '$T39/mlx-serve.off' ;;
+    clear:binary) mv '$T39/mlx-serve.off' '$T39/mlx-serve' ;;
+    apply:provider) mkdir -p '$T39/home/.mlx-serve'; : > '$T39/home/.mlx-serve/providers.json' ;;
+    clear:provider) rm -rf '${T39:?}/home/.mlx-serve' ;;
+    apply:process) '$T39/unmanaged/mlx-serve' 60 </dev/null >/dev/null 2>&1 & echo \$! > '$T39/process.pid'
+                   _until pgrep -x mlx-serve ;;
+    clear:process) kill "\$(cat '$T39/process.pid')" ;;
+    apply:port) perl -MIO::Socket::INET -e 'my \$s = IO::Socket::INET->new(LocalAddr => "127.0.0.1", LocalPort => 18239, Listen => 1, ReuseAddr => 1) or exit 1; sleep 60' \
+                    </dev/null >/dev/null 2>&1 & echo \$! > '$T39/port.pid'
+                _until lsof -nP -iTCP:18239 -sTCP:LISTEN -t ;;
+    clear:port) kill "\$(cat '$T39/port.pid')" ;;
+    apply:inactive) sed 's/^MSS_GUARD_BACKEND=mlx\$/MSS_GUARD_BACKEND=ds4/' "\$3" > "\$3.new" && mv "\$3.new" "\$3" ;;
+    clear:inactive) ;;
+    apply:pf) echo stale > '$T39/marker' ;;
+    clear:pf) echo '$BOOTID33' > '$T39/marker' ;;
+    apply:gpu) echo 1024 > '$T39/wired' ;;
+    clear:gpu) echo 8192 > '$T39/wired' ;;
+    apply:trip) : > '$T39/w/guard.tripped' ;;
+    clear:trip) rm -f '${T39:?}/w/guard.tripped' ;;
+    *) exit 2 ;;
+esac
+STUB
+chmod +x "$T39/vbin/sleep" "$T39/bin/ifconfig" "$T39/bin/sysctl" "$T39/mlx-serve" "$T39/cause.sh"
+# w39 <name> <host|-> [env...]: the rendered wrapper from virtual second 0, with
+# T39_PRE's cause applied first, or T39_ON's once the clock reaches T39_ON_AT;
+# prints "<rc> <pid>". Output in $T39/<name>.out,
+# the wrapper's sleeps in .sleeps, the engine's "<pid> <clock> <argv>" in .argv.
+# W39_SH/W39_ENTRY run another entry point.
+w39() {
+    _wn=$1; _wh=$2; shift 2
+    { printf 'MSS_GUARD_BACKEND=mlx\nMLX_BIN=%s\nMLX_MODEL_DIR=%s\nMLX_PORT=18239\nMSS_WIRED_LIMIT_MB=4096\n' "$T39/mlx-serve" "$T39/model"
+      [ "$_wh" = - ] || echo "MLX_HOST=$_wh"; } > "$T39/$_wn.conf"
+    echo 0 > "$T39/clock"; : > "$T39/$_wn.sleeps"; rm -f "${T39:?}/${_wn:?}.argv" "${T39:?}/applied"
+    [ -z "${T39_PRE:-}" ] || sh "$T39/cause.sh" apply "$T39_PRE" "$T39/$_wn.conf"
+    # shellcheck disable=SC2086  # W39_SH is empty or one word
+    env PATH="$T39/vbin:$T39/bin:$SYSBIN33:$PATH" MSS_STUB_BOOTID=$BOOTID33 MSS_IFCONFIG="$T39/bin/ifconfig" \
+        MSS_BOOT_MARKER="$T39/marker" MSS_CONF="$T39/$_wn.conf" MSS_STAMP_DIR="$T39/w" MSS_STUB_ARGV="$T39/$_wn.argv" \
+        HOME="$T39/home" T39_SLEEPS="$T39/$_wn.sleeps" "$@" ${W39_SH:-} "${W39_ENTRY:-$R39/mlx-start.sh}" >"$T39/$_wn.out" 2>&1 </dev/null &
+    _wp=$!
+    wait "$_wp"
+    echo "$? $_wp"
+}
+# s39 <name>: the logged sleeps, run-length coded ("1x120 30").
+s39() { awk 'function out() { printf "%s%s", sep, (n > 1 ? p "x" n : p); sep = " " }
+             NR > 1 && $0 != p { out(); n = 0 } { p = $0; n++ } END { if (NR) out(); print "" }' "$T39/$1.sleeps"; }
+a39() { if [ -e "$T39/$1.argv" ]; then wc -l < "$T39/$1.argv" | tr -d ' '; else echo 0; fi; }   # engine execs
+l39() { tr '\n' '|' < "$T39/$1.out" | sed 's/|$//'; }                                           # output lines
+W39="WAIT: 192.0.2.10 is not on any interface yet"
+
+# mss_host_is_local: 0 local, 1 a working query without it, 2 a failed or empty query.
+printf '#!/bin/sh\nexit 1\n' > "$T39/if-fail"; printf '#!/bin/sh\nexit 0\n' > "$T39/if-empty"; chmod +x "$T39/if-fail" "$T39/if-empty"
+check "A2 mss_host_is_local: local, absent, failed, empty, missing, loopback beside a failed query" "0 1 2 2 2 0" \
+    "$(for _i in "$LANIF33 192.0.2.10" "$T3/ifconfig-none.sh 192.0.2.10" "$T39/if-fail 192.0.2.10" "$T39/if-empty 192.0.2.10" \
+        "$T39/missing 192.0.2.10" "$T39/if-fail 127.0.0.1"; do
+        ( MSS_IFCONFIG=${_i% *}; mss_host_is_local "${_i#* }"; printf '%s ' "$?" ); done | sed 's/ $//')"
+# Its boolean callers still refuse a failed or empty query.
+for _q in fail empty; do
+    render mlx "$T39/rq-$_q" MLX_HOST=192.0.2.10 MLX_ALLOW_FROM=192.0.2.0/24 MSS_IFCONFIG="$T39/if-$_q" >"$T39/rq-$_q.out" 2>&1
+    check "A2 install-backends.sh refuses MLX_HOST on a $_q interface query" \
+        "1 ERROR: MLX_HOST: '192.0.2.10' is neither loopback nor assigned to a local interface" "$? $(tail -n 1 "$T39/rq-$_q.out")"
+    render ds4 "$T39/rqd-$_q" DS4_HOST=192.0.2.10 DS4_ALLOW_FROM=192.0.2.99 MSS_IFCONFIG="$T39/if-$_q" >"$T39/rqd-$_q.out" 2>&1
+    check "A2 install-backends.sh refuses DS4_HOST on a $_q interface query" \
+        "1 ERROR: DS4_HOST: '192.0.2.10' is neither loopback nor assigned to a local interface" "$? $(tail -n 1 "$T39/rqd-$_q.out")"
+    check "A2 the picker's address check refuses on a $_q interface query" "ERROR: 192.0.2.10 is not assigned to a local interface|rc=1" \
+        "$( ( export MSS_IFCONFIG="$T39/if-$_q"
+              . "$ROOT/scripts/lib/mss-common.sh"; . "$ROOT/scripts/lib/mss-acquire.sh"
+              . "$ROOT/scripts/lib/mss-run.sh"; . "$ROOT/scripts/lib/mss-host.sh"
+              . "$ROOT/scripts/lib/mss-picker.sh"
+              _mss_pick_host_valid 192.0.2.10; echo "rc=$?" ) 2>&1 | tr '\n' '|' | sed 's/|$//')"
+done
+
+# A2: loopback and a ready address start at once: no probe wait, no sleep.
+RP=$(T39_IF=fail w39 lo -)
+check "A2 loopback starts at once, without an interface query" "0 1 0|" "${RP%% *} $(a39 lo) $(grep -c '^WAIT:' "$T39/lo.out")|$(s39 lo)"
+check "A2 loopback: the engine has the wrapper's PID and --host 127.0.0.1" "${RP#* } 0 --host 127.0.0.1" \
+    "$(cut -d' ' -f1,2 "$T39/lo.argv" 2>/dev/null) $(grep -o -- '--host [0-9.]*' "$T39/lo.argv" 2>/dev/null)"
+RP=$(T39_APPEAR=0 w39 ready 192.0.2.10)
+check "A2 an address that is already local starts at once" "0 1 0|" "${RP%% *} $(a39 ready) $(grep -c '^WAIT:' "$T39/ready.out")|$(s39 ready)"
+check "A2 ready: the START line, the wrapper's PID, --host 192.0.2.10" "1 ${RP#* } --host 192.0.2.10" \
+    "$(grep -c '^START: ' "$T39/ready.out") $(cut -d' ' -f1 "$T39/ready.argv" 2>/dev/null) $(grep -o -- '--host [0-9.]*' "$T39/ready.argv" 2>/dev/null)"
+
+# A2: the defaults (120 s window, 30 s pause). The address appears at virtual
+# 460 s, in the fourth window: three absent windows start nothing, then one
+# engine exec, in the wrapper's PID.
+: > "$SYSLOG33"
+RP=$(T39_APPEAR=460 w39 late 192.0.2.10)
+check "A2 late: windows of 120 one-second probes, each followed by exactly 30 s" "1x120 30 1x120 30 1x120 30 1x10" "$(s39 late)"
+check "A2 late: four WAIT lines (up to 120s), three DEFER lines (retry_in=30s), one START" "4 4 3 3 1" \
+    "$(grep -c '^WAIT:' "$T39/late.out") $(grep -c "^$W39 (up to 120s)\$" "$T39/late.out") $(grep -c '^DEFER: ' "$T39/late.out") $(grep -c '^DEFER: lan_address_unavailable retry_in=30s$' "$T39/late.out") $(grep -c '^START: ' "$T39/late.out")"
+check "A2 late: the lines run WAIT, DEFER three times, then WAIT, START" "W D W D W D W S" \
+    "$(cut -c1 "$T39/late.out" | tr '\n' ' ' | sed 's/ $//')"
+check "A2 late: exits 0 with one engine exec, at virtual 460 s, in the wrapper's PID" "0 1 ${RP#* } 460" \
+    "${RP%% *} $(a39 late) $(cut -d' ' -f1,2 "$T39/late.argv" 2>/dev/null)"
+# Every attempt read this boot's session id again; none read kern.boottime.
+check "A2 late: each of the five runs checked the boot session id, never kern.boottime" "yes 0" \
+    "$([ "$(grep -c 'kern.bootsessionuuid' "$SYSLOG33")" -ge 5 ] && echo yes || echo no) $(grep -c 'kern.boottime' "$SYSLOG33")"
+
+# A2: a failed or empty interface query refuses: at the start, inside a window,
+# and on the run after a pause. Nothing is retried and nothing starts.
+QF="REFUSE: cannot read the interface addresses (ifconfig failed or printed nothing)"
+check "A2 a failed query at the start refuses at once" "78 $QF| 0" "$(T39_IF=fail w39 qf 192.0.2.10 | cut -d' ' -f1) $(l39 qf)|$(s39 qf) $(a39 qf)"
+check "A2 an empty query at the start refuses at once" "78 $QF| 0" "$(T39_IF=empty w39 qe 192.0.2.10 | cut -d' ' -f1) $(l39 qe)|$(s39 qe) $(a39 qe)"
+check "A2 a query that fails inside the window refuses there" "78 $W39 (up to 120s)|$QF|1x5 0" \
+    "$(T39_IF=fail T39_IF_AT=5 w39 qw 192.0.2.10 | cut -d' ' -f1) $(l39 qw)|$(s39 qw) $(a39 qw)"
+check "A2 a query that is empty after a pause refuses; no second window" \
+    "78 $W39 (up to 120s)|DEFER: lan_address_unavailable retry_in=30s|$QF|1x120 30 0" \
+    "$(T39_IF=empty T39_IF_AT=150 w39 qp 192.0.2.10 | cut -d' ' -f1) $(l39 qp)|$(s39 qp) $(a39 qp)"
+
+# A2: bad hooks, a failed sleep and an entry point that cannot be re-run refuse.
+for _p in 0 301 abc; do
+    check "A2 MSS_LAN_RETRY_PAUSE=$_p refuses" "78 REFUSE: MSS_LAN_RETRY_PAUSE '$_p' is not an integer from 1 to 300| 0" \
+        "$(w39 "p$_p" 192.0.2.10 MSS_LAN_RETRY_PAUSE="$_p" | cut -d' ' -f1) $(l39 "p$_p")|$(s39 "p$_p") $(a39 "p$_p")"
+done
+check "A2 MSS_HOST_WAIT=0 refuses" "78 REFUSE: MSS_HOST_WAIT '0' is not a positive integer 0" \
+    "$(w39 hw0 192.0.2.10 MSS_HOST_WAIT=0 | cut -d' ' -f1) $(l39 hw0) $(a39 hw0)"
+: > "$T39/sleep-fails"
+check "A2 a failed sleep refuses" "78 $W39 (up to 120s)|REFUSE: sleep failed while waiting for 192.0.2.10 0" \
+    "$(w39 sf 192.0.2.10 | cut -d' ' -f1) $(l39 sf) $(a39 sf)"
+rm -f "${T39:?}/sleep-fails"
+check "A2 a relative entry point refuses" "78 REFUSE: cannot re-run './mlx-start.sh': not an absolute path to an executable 0" \
+    "$( (cd "$R39" && W39_SH=sh W39_ENTRY=./mlx-start.sh w39 rel 192.0.2.10) | cut -d' ' -f1) $(l39 rel) $(a39 rel)"
+mkdir -p "$T39/noexec"; cp "$R39/mlx-start.sh" "$R39/mss-common.sh" "$T39/noexec/"; chmod 0644 "$T39/noexec/mlx-start.sh"
+check "A2 an entry point that is not executable refuses" \
+    "78 REFUSE: cannot re-run '$T39/noexec/mlx-start.sh': not an absolute path to an executable 0" \
+    "$(W39_SH=sh W39_ENTRY="$T39/noexec/mlx-start.sh" w39 noexec 192.0.2.10 | cut -d' ' -f1) $(l39 noexec) $(a39 noexec)"
+
+# A7: each start refusal, present before the first run, arriving in the
+# window before the address does, or arriving during the pause, stops the
+# start: the run after the wait checks everything again, and the helper never
+# re-runs a refused start. From virtual 20 s the query fails, so a cause that
+# does not refuse ends its row with that refusal instead of deferring for ever.
+for _c in model binary provider process port inactive pf gpu trip; do
+    for _when in before wait pause; do
+        case $_when in
+            before)
+                RP=$(T39_PRE=$_c w39 "c-$_c-$_when" 192.0.2.10 T39_IF=fail T39_IF_AT=20 MSS_HOST_WAIT=2 MSS_LAN_RETRY_PAUSE=5 MSS_MARKER_WAIT=1)
+                _lead=""; _sl="" ;;
+            wait)
+                RP=$(w39 "c-$_c-$_when" 192.0.2.10 T39_IF=fail T39_IF_AT=20 MSS_HOST_WAIT=2 MSS_LAN_RETRY_PAUSE=5 MSS_MARKER_WAIT=1 \
+                    T39_ON="$_c" T39_ON_AT=1 T39_APPEAR=2)
+                _lead="$W39 (up to 2s)|"; _sl="1x2" ;;
+            pause)
+                RP=$(w39 "c-$_c-$_when" 192.0.2.10 T39_IF=fail T39_IF_AT=20 MSS_HOST_WAIT=2 MSS_LAN_RETRY_PAUSE=5 MSS_MARKER_WAIT=1 \
+                    T39_ON="$_c" T39_ON_AT=7)
+                _lead="$W39 (up to 2s)|DEFER: lan_address_unavailable retry_in=5s|"; _sl="1x2 5" ;;
+        esac
+        case $_c in
+            model) _r="model changed since verification (manifest differs)" ;;
+            binary) _r="binary missing" ;;
+            provider) _r="providers file present ($T39/home/.mlx-serve/providers.json); a LAN bind would share its credentials" ;;
+            process) _r="model server already running (mlx-serve pid $(cat "$T39/process.pid" 2>/dev/null))" ;;
+            port) _r="port 18239 already bound by pid(s) $(cat "$T39/port.pid" 2>/dev/null) " ;;
+            inactive) _r="mlx is not the active backend (active: ds4)" ;;
+            pf) _r="pf (no boot marker for this boot session after 1s)"
+                if [ "$_when" = wait ]; then _sl="1x3"; else _sl="${_sl:+$_sl }1"; fi ;;
+            gpu) _r="wired limit 1024 < expected 4096"; _sl="${_sl:+$_sl }2x60" ;;
+            trip) _r="guard tripped (sudo /usr/local/libexec/mac-studio-server/mss-enable.sh)" ;;
+        esac
+        check "A7 $_c refusal ($_when): exit 78, nothing started, no retry" "78 ${_lead}REFUSE: $_r|$_sl 0" \
+            "${RP%% *} $(l39 "c-$_c-$_when")|$(s39 "c-$_c-$_when") $(a39 "c-$_c-$_when")"
+        sh "$T39/cause.sh" clear "$_c" "$T39/c-$_c-$_when.conf"
+    done
+done
+# With every cause cleared the same wrapper starts again (the fixtures are sound).
+RP=$(T39_APPEAR=0 w39 c-clear 192.0.2.10)
+check "A7 after the causes are cleared the wrapper starts" "0 1" "${RP%% *} $(a39 c-clear)"
+
+# A6, the process side: TERM in the window and HUP in the pause end this
+# invocation and its sleep, with no retry. Real sleeps here.
+s39bg() { # s39bg <name> [env...]: the rendered wrapper in the background, real sleeps; its PID in S39P
+    _sn=$1; shift
+    printf 'MSS_GUARD_BACKEND=mlx\nMLX_BIN=%s\nMLX_MODEL_DIR=%s\nMLX_PORT=18239\nMLX_HOST=192.0.2.10\n' "$T39/mlx-serve" "$T39/model" > "$T39/$_sn.conf"
+    rm -f "${T39:?}/${_sn:?}.argv"
+    env PATH="$T39/bin:$SYSBIN33:$PATH" MSS_STUB_BOOTID=$BOOTID33 MSS_IFCONFIG="$T39/bin/ifconfig" MSS_BOOT_MARKER="$T39/marker" \
+        MSS_CONF="$T39/$_sn.conf" MSS_STAMP_DIR="$T39/w" MSS_STUB_ARGV="$T39/$_sn.argv" HOME="$T39/home" "$@" \
+        "$R39/mlx-start.sh" >"$T39/$_sn.out" 2>&1 </dev/null &
+    S39P=$!
+}
+# sig39 <name> <signal> <line> [env...]: once <line> is out and its sleep runs, send <signal>.
+sig39() {
+    _gn=$1; _gs=$2; _gl=$3; shift 3
+    s39bg "$_gn" "$@"
+    _gc=""; _i=0
+    until grep -q "^$_gl" "$T39/$_gn.out" && _gc=$(pgrep -P "$S39P" -x sleep); do
+        [ "$_i" -lt 100 ] || break; sleep 0.1; _i=$((_i + 1))
+    done
+    kill "-$_gs" "$S39P" 2>/dev/null; wait "$S39P"; _grc=$?
+    sleep 0.3
+    echo "$_grc $(kill -0 "${_gc:-0}" 2>/dev/null && echo child-alive || echo child-gone) $(a39 "$_gn")"
+}
+check "A6 TERM during the window: exit 143, its sleep gone, nothing started, no DEFER" "143 child-gone 0 $W39 (up to 60s)" \
+    "$(sig39 st TERM WAIT: MSS_HOST_WAIT=60) $(l39 st)"
+check "A6 HUP during the pause: exit 129, its sleep gone, nothing started, no second window" \
+    "129 child-gone 0 $W39 (up to 1s)|DEFER: lan_address_unavailable retry_in=60s" \
+    "$(sig39 sh HUP DEFER: MSS_HOST_WAIT=1 MSS_LAN_RETRY_PAUSE=60) $(l39 sh)"
 
 echo "== phase A: #35 MLX model chooser (MX1-MX12) =="
 MX=$TMP/mx35; mkdir -p "$MX"
@@ -5151,6 +5417,328 @@ check "MB12 --all removes everything" "" "$(daemons | tr ' ' '\n' | grep mac-stu
 sudo sh "$ROOT/scripts/uninstall.sh" --all >/dev/null 2>&1
 check "MB12 a second --all exits 0" 0 $?
 sudo rm -f /tmp/mss-stub-mlx-argv /tmp/mss-stub-mv-killed /tmp/mss-stub-mv-slow.log
+
+echo "== phase B: #39 LAN readiness retry on real launchd (A3-A10) =="
+# The stock job is the one the installer emits, running the installed wrapper
+# and helper; launchd starts it with no environment, so A3 sees the real 120 s
+# window and 30 s pause. The custom jobs are inline fixtures: KeepAlive=false,
+# a wrapper, engine and argv of their own, the installed helper, and the 1/1
+# test timings in their plists. Each custom fixture that runs beside A3 has a
+# TEST-NET address and a label of its own, so those rows run while A3 waits;
+# the guard and the lifecycle act on com.mac-studio-server.mlx, so the A5 and
+# A6 fixture ("cm") carries that label and runs after A3. The stock retry after
+# a refusal is MB7, unchanged.
+T39B=$(date +%s)
+C39="$TMP/c39"; P39="$TMP/p39"; mkdir -p "$C39"
+sudo mkdir -p "$P39"; sudo chown root:wheel "$P39"; sudo chmod 0755 "$P39"
+LIBX=/usr/local/libexec/mac-studio-server; ME=$(id -un)
+A39=198.51.100.21; B39=198.51.100.22
+alias39() { sudo /sbin/ifconfig lo0 alias "$1" netmask 255.255.255.255; }
+unalias39() { sudo /sbin/ifconfig lo0 -alias "$1" 2>/dev/null || true; }
+unalias39 "$A39"; unalias39 "$B39"; lan_unalias
+sudo rm -f /tmp/mss-stub-mlx-argv /tmp/mss-stub-pf.rules /tmp/mss-stub-pfctl-fail
+# until39 <seconds> <cmd...>: poll every 0.2 s until <cmd> succeeds.
+until39() { _ut=$(( $1 * 5 )); shift; _ui=0; until "$@" >/dev/null 2>&1; do [ "$_ui" -lt "$_ut" ] || return 1; sleep 0.2; _ui=$((_ui + 1)); done; }
+cnt39() { _c=$(sudo grep -c -- "$1" "$2" 2>/dev/null); echo "${_c:-0}"; }   # cnt39 <regex> <log>
+more39() { [ "$(cnt39 "$1" "$2")" -gt "$3" ]; }                             # more39 <regex> <log> <n>
+gone39() { ! launchctl print "system/$1" >/dev/null 2>&1; }
+runs39() { launchctl print "system/$1" 2>/dev/null | sed -n 's/^[[:space:]]*runs = \([0-9][0-9]*\).*/\1/p' | head -n 1; }
+alive39() { [ -n "$1" ] && kill -0 "$1" 2>/dev/null && echo alive || echo gone; }
+open39() { nc -z "$1" "$2" >/dev/null 2>&1; }
+closed39() { ! nc -z "$1" "$2" >/dev/null 2>&1; }
+argv39() { if [ -e "$C39/$1.argv" ]; then wc -l < "$C39/$1.argv" | tr -d ' '; else echo 0; fi; }
+DUR39=""   # "<row>=<seconds>" for every accelerated case (A10)
+dur39() { DUR39="$DUR39 $1=$(( $(date +%s) - $2 ))"; }
+
+# The custom wrapper: its own trip and port checks, the helper at its readiness
+# point with its own arguments, then its own engine and argv.
+# custom.sh <tag> <host> <port> <engine> [engine arg...]
+cat > "$C39/custom.sh" <<STUB
+#!/bin/sh
+set -u
+. $LIBX/mss-common.sh
+echo "RUN: pid=\$\$"
+_tag=\$1; _host=\$2; _port=\$3
+[ ! -e /var/db/mac-studio-server/guard.tripped ] || { echo "REFUSE: guard tripped"; exit 78; }
+if _p=\$(lsof -nP -iTCP:"\$_port" -sTCP:LISTEN -t 2>/dev/null) && [ -n "\$_p" ]; then echo "REFUSE: port \$_port already bound"; exit 78; fi
+mss_lan_ready_or_reexec "\$_host" "\$0" "\$@" || { echo "REFUSE: \$MSS_LAN_REASON"; exit 78; }
+shift 3
+echo "START: \$_tag"
+MSS_STUB_ARGV=$C39/\$_tag.argv; export MSS_STUB_ARGV
+exec "\$@"
+STUB
+cp "$C39/custom.sh" "$C39/custom-b.sh"; mv "$C39/custom.sh" "$C39/custom-a.sh"
+cp "$ROOT/tests/stubs/fake-mlx-serve.sh" "$C39/engine-a"; cp "$ROOT/tests/stubs/fake-server.sh" "$C39/engine-b"
+chmod 0755 "$C39/custom-a.sh" "$C39/custom-b.sh" "$C39/engine-a" "$C39/engine-b"
+# plist39 <name> <label> <arg...>: a KeepAlive=false job as this user, with the
+# 1/1 test timings, logging to $C39/<name>.log; root:wheel 0644 in $P39.
+plist39() {
+    _pn=$1; _pl=$2; shift 2
+    : > "$C39/$_pn.log"
+    {   printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        printf '<plist version="1.0">\n<dict>\n    <key>Label</key>\n    <string>%s</string>\n    <key>ProgramArguments</key>\n    <array>\n' "$_pl"
+        for _pa in "$@"; do printf '        <string>%s</string>\n' "$_pa"; done
+        printf '    </array>\n    <key>UserName</key>\n    <string>%s</string>\n' "$ME"
+        printf '    <key>EnvironmentVariables</key>\n    <dict>\n        <key>MSS_HOST_WAIT</key>\n        <string>1</string>\n'
+        printf '        <key>MSS_LAN_RETRY_PAUSE</key>\n        <string>1</string>\n    </dict>\n'
+        printf '    <key>RunAtLoad</key>\n    <true/>\n    <key>KeepAlive</key>\n    <false/>\n'
+        printf '    <key>StandardOutPath</key>\n    <string>%s</string>\n    <key>StandardErrorPath</key>\n    <string>%s</string>\n' "$C39/$_pn.log" "$C39/$_pn.log"
+        printf '</dict>\n</plist>\n'
+    } > "$C39/$_pn.plist"
+    plutil -lint "$C39/$_pn.plist" >/dev/null || fail "plist39 $_pn does not lint"
+    sudo install -o root -g wheel -m 0644 "$C39/$_pn.plist" "$P39/$_pn.plist"
+}
+plist39 a org.example.mss39.a "$C39/custom-a.sh" a "$A39" 18241 "$C39/engine-a" \
+    --serve --model "$C39/model-a" --host "$A39" --port 18241 --tag a
+plist39 b org.example.mss39.b "$C39/custom-b.sh" b "$B39" 18242 "$C39/engine-b" \
+    -m "$C39/model-b.gguf" --host "$B39" --port 18242 --ctx 4096
+plist39 e org.example.mss39.e "$C39/custom-a.sh" e 127.0.0.1 18243 "$C39/engine-a" --serve --host 127.0.0.1 --port 18243
+plist39 r org.example.mss39.r "$C39/custom-a.sh" r 127.0.0.1 18244 "$C39/engine-a" --serve --host 127.0.0.1 --port 18244
+plist39 cm "$ML" "$C39/custom-b.sh" cm "$LAN33" 18245 "$C39/engine-a" --serve --host "$LAN33" --port 18245
+
+# A8: 1.7.2 installed, then this checkout over it with the same answers: a
+# script-only update. Every rendered file and stamp is kept, nothing restarts,
+# and a second identical install changes nothing either.
+V172=d14ed6fb2f2be0a5a1a42d9f46f2013af395ad05
+i39() { # i39 <tree> <log> [env...]: that tree's root installer, mlx on $LAN33, pf through the stub
+    _it=$1; _il=$2; shift 2
+    sudo env OLLAMA_USER="$ME" MSS_BACKENDS=mlx MLX_BIN="$MLXB" MLX_MODEL_DIR="$MLXM" MLX_PORT=18234 \
+        MLX_HOST="$LAN33" MLX_ALLOW_FROM=192.0.2.99 MSS_PFCTL="$PFMB" "$@" sh "$_it/scripts/install-backends.sh" >"$_il" 2>&1
+}
+lan_alias
+if git -C "$ROOT" cat-file -e "$V172^{commit}" 2>/dev/null; then
+    mkdir -p "$TMP/v172"; git -C "$ROOT" archive "$V172" | tar -x -C "$TMP/v172"
+    i39 "$TMP/v172" "$C39/a8-old.log"
+    check "A8 the 1.7.2 install exits 0" 0 $?
+    wait_open_on "$LAN33" 18234 && ok "A8 1.7.2 serves on $LAN33" || fail "A8 1.7.2 not serving: $(tail -3 "$C39/a8-old.log")"
+    check "A8 the 1.7.2 wrapper and helper are installed" "same same" \
+        "$(cmp -s "$LIBX/mlx-start.sh" "$TMP/v172/libexec/mlx-start.sh" && echo same || echo differs) $(cmp -s "$LIBX/mss-common.sh" "$TMP/v172/scripts/lib/mss-common.sh" && echo same || echo differs)"
+else
+    fail "A8 needs commit $V172 (fetch full history)"
+fi
+P8=$(jobpid "$ML"); mbsnap > "$C39/a8.before"
+i39 "$ROOT" "$C39/a8-new.log"
+check "A8 the update exits 0, restarts nothing, lists mlx unchanged" "0 restarted: none yes" \
+    "$? $(grep '^restarted:' "$C39/a8-new.log") $(grep -q "^unchanged: .*$ML" "$C39/a8-new.log" && echo yes || echo no)"
+check "A8 the new wrapper and helper are installed" "same same" \
+    "$(cmp -s "$LIBX/mlx-start.sh" "$ROOT/libexec/mlx-start.sh" && echo same || echo differs) $(cmp -s "$LIBX/mss-common.sh" "$ROOT/scripts/lib/mss-common.sh" && echo same || echo differs)"
+mbsnap > "$C39/a8.after"
+cmp -s "$C39/a8.before" "$C39/a8.after" && ok "A8 conf, pf rules, plists and stamps are unchanged" \
+    || fail "A8 files changed: $(diff "$C39/a8.before" "$C39/a8.after" | head -4)"
+check "A8 the running mlx keeps its PID" "$P8" "$(jobpid "$ML")"
+grep -q '^hashing' "$C39/a8-new.log" && fail "A8 the update hashed something" || ok "A8 the update reads no model"
+i39 "$ROOT" "$C39/a8-again.log"
+check "A8 a second identical install: exit 0, restarts nothing, same PID" "0 restarted: none $P8" \
+    "$? $(grep '^restarted:' "$C39/a8-again.log") $(jobpid "$ML")"
+mbsnap > "$C39/a8.again"
+cmp -s "$C39/a8.before" "$C39/a8.again" && ok "A8 the second install changes no file" || fail "A8 second install changed files"
+# A custom job in place of the installed plist is refused and left as it is.
+sudo cp "/Library/LaunchDaemons/$ML.plist" "$C39/mlx.plist.orig"
+sudo install -o root -g wheel -m 0644 "$P39/cm.plist" "/Library/LaunchDaemons/$ML.plist"
+i39 "$ROOT" "$C39/a8-custom.log"
+check "A8 a custom mlx plist: exit 1, named, file unchanged" \
+    "1 ERROR: /Library/LaunchDaemons/$ML.plist was changed outside this installer; copy it aside, remove it, then re-run same" \
+    "$? $(grep '^ERROR:' "$C39/a8-custom.log" | head -n 1) $(sudo cmp -s "$P39/cm.plist" "/Library/LaunchDaemons/$ML.plist" && echo same || echo differs)"
+sudo install -o root -g wheel -m 0644 "$C39/mlx.plist.orig" "/Library/LaunchDaemons/$ML.plist"
+check "A8 restored, the job still runs as before" "$P8" "$(jobpid "$ML")"
+
+# A3: the emitted stock job loaded as at boot with its address missing. The
+# address appears 135 s after the first WAIT. In the background, so that A4,
+# A7 and A9's custom rows run meanwhile; it writes what it saw to $C39/a3.*.
+PL3="/Library/LaunchDaemons/$ML.plist"
+check "A3 the emitted plist: RunAtLoad, KeepAlive, ThrottleInterval, the installed wrapper" \
+    "true true 30 $LIBX/mlx-start.sh" \
+    "$(for _k in RunAtLoad KeepAlive ThrottleInterval ProgramArguments:0; do sudo /usr/libexec/PlistBuddy -c "Print :$_k" "$PL3"; done | tr '\n' ' ' | sed 's/ $//')"
+check "A3 the installed wrapper and helper are this checkout's" "same same" \
+    "$(cmp -s "$LIBX/mlx-start.sh" "$ROOT/libexec/mlx-start.sh" && echo same || echo differs) $(cmp -s "$LIBX/mss-common.sh" "$ROOT/scripts/lib/mss-common.sh" && echo same || echo differs)"
+sudo "$LIFE" stop mlx >/dev/null 2>&1
+lan_unalias
+WX3="^WAIT: $LAN33 is not on any interface yet (up to 120s)\$"
+N3=$(mlx_argv_lines); W3=$(cnt39 '^WAIT: ' "$LOGB/mlx.log"); WE3=$(cnt39 "$WX3" "$LOGB/mlx.log"); D3=$(cnt39 '^DEFER: ' "$LOGB/mlx.log"); S3=$(cnt39 '^START: ' "$LOGB/mlx.log")
+sudo rm -f "$C39"/a3.*
+sudo launchctl bootstrap system "$PL3"
+(
+    until39 15 more39 '^WAIT: ' "$LOGB/mlx.log" "$W3" || { echo none > "$C39/a3.t0"; exit 0; }
+    _t0=$(date +%s); echo "$_t0" > "$C39/a3.t0"
+    jobpid "$ML" > "$C39/a3.pid0"; runs39 "$ML" > "$C39/a3.runs0"
+    while [ $(( $(date +%s) - _t0 )) -lt 135 ]; do
+        [ -e "$C39/a3.defer" ] || ! more39 '^DEFER: ' "$LOGB/mlx.log" "$D3" || echo $(( $(date +%s) - _t0 )) > "$C39/a3.defer"
+        [ -e "$C39/a3.early" ] || [ "$(mlx_argv_lines)" -le "$N3" ] || echo $(( $(date +%s) - _t0 )) > "$C39/a3.early"
+        sleep 0.5
+    done
+    lan_alias; echo $(( $(date +%s) - _t0 )) > "$C39/a3.alias"
+    until [ "$(mlx_argv_lines)" -gt "$N3" ] || [ $(( $(date +%s) - _t0 )) -ge 180 ]; do sleep 0.5; done
+    echo $(( $(date +%s) - _t0 )) > "$C39/a3.exec"
+    while [ $(( $(date +%s) - _t0 )) -lt 180 ]; do sleep 1; done
+    echo "$(jobpid "$ML") $(runs39 "$ML")" > "$C39/a3.end"
+) &
+A3BG=$!
+
+# A4: two custom KeepAlive=false jobs, different wrappers, engines and argv.
+# Each defers while its address is missing, then starts once it appears, in the
+# PID launchd started, with its own argv. Nothing edits either plist.
+for _f in a b; do
+    _t=$(date +%s)
+    if [ "$_f" = a ]; then _ad=$A39; _po=18241; else _ad=$B39; _po=18242; fi
+    _sha=$(shasum -a 256 < "$P39/$_f.plist")
+    sudo launchctl bootstrap system "$P39/$_f.plist"
+    until39 5 more39 '^WAIT: ' "$C39/$_f.log" 0; _p0=$(jobpid "org.example.mss39.$_f")
+    until39 8 more39 '^WAIT: ' "$C39/$_f.log" 2
+    check "A4 $_f: deferring, nothing started" "0 yes" "$(argv39 "$_f") $(more39 '^DEFER: lan_address_unavailable retry_in=1s$' "$C39/$_f.log" 1 && echo yes || echo no)"
+    alias39 "$_ad"
+    until39 8 test -s "$C39/$_f.argv"
+    until39 5 open39 "$_ad" "$_po"
+    _runs=$(sed -n 's/^RUN: pid=//p' "$C39/$_f.log" | sort -u | tr '\n' ' ' | sed 's/ $//')
+    # The engine's PID: a logs its own; b's is the job's, running engine-b.
+    if [ "$_f" = a ]; then
+        _ep=$(cut -d' ' -f1 "$C39/a.argv" 2>/dev/null)
+        check "A4 a: its own argv" "--serve --model $C39/model-a --host $A39 --port 18241 --tag a" "$(cut -d' ' -f2- "$C39/a.argv" 2>/dev/null)"
+    else
+        _ep=$(jobpid org.example.mss39.b)
+        ps -o command= -p "${_ep:-0}" 2>/dev/null | grep -q "$C39/engine-b -m " || _ep="not-engine-b"
+        check "A4 b: its own argv" "-m $C39/model-b.gguf --host $B39 --port 18242 --ctx 4096" "$(cat "$C39/b.argv" 2>/dev/null)"
+    fi
+    check "A4 $_f: one engine, in the PID launchd started, one launchd run, serving" "1 $_p0 $_p0 $_p0 1 yes" \
+        "$(argv39 "$_f") $_ep $(jobpid "org.example.mss39.$_f") $_runs $(runs39 "org.example.mss39.$_f") $(open39 "$_ad" "$_po" && echo yes || echo no)"
+    check "A4 $_f: re-run at least three times, START once, no REFUSE" "yes 1 0" \
+        "$([ "$(cnt39 '^RUN: ' "$C39/$_f.log")" -ge 3 ] && echo yes || echo no) $(cnt39 "^START: $_f\$" "$C39/$_f.log") $(cnt39 '^REFUSE:' "$C39/$_f.log")"
+    check "A4 $_f: the plist is as written (KeepAlive false)" "$_sha false" \
+        "$(shasum -a 256 < "$P39/$_f.plist") $(/usr/libexec/PlistBuddy -c 'Print :KeepAlive' "$P39/$_f.plist")"
+    sudo launchctl bootout "system/org.example.mss39.$_f" 2>/dev/null; unalias39 "$_ad"
+    dur39 "A4$_f" "$_t"
+done
+
+# A9 and A7 for the custom policy, side by side: a forced engine exit (e) and
+# a refusal whose cause then goes away (r). KeepAlive=false: neither runs again
+# in 45 s. (The stock job's restart after a refusal is MB7.)
+perl -MIO::Socket::INET -e 'my $s = IO::Socket::INET->new(LocalAddr => "127.0.0.1", LocalPort => 18244, Listen => 1, ReuseAddr => 1) or exit 1; sleep 120' \
+    </dev/null >/dev/null 2>&1 &
+L39=$!
+until39 5 sh -c 'lsof -nP -iTCP:18244 -sTCP:LISTEN -t'
+sudo launchctl bootstrap system "$P39/e.plist"
+sudo launchctl bootstrap system "$P39/r.plist"
+until39 8 open39 127.0.0.1 18243; _pe=$(jobpid org.example.mss39.e)
+until39 8 more39 '^REFUSE: port 18244 already bound$' "$C39/r.log" 0
+kill "$L39"; wait "$L39" 2>/dev/null
+check "A9 custom: serving in the PID launchd started" "1 $_pe" "$(argv39 e) $(cut -d' ' -f1 "$C39/e.argv" 2>/dev/null)"
+sudo kill -KILL "$_pe"
+sleep 45
+check "A9 custom (KeepAlive=false): after a killed engine, 45 s with no restart" "1 1 none closed" \
+    "$(argv39 e) $(runs39 org.example.mss39.e) $(jobpid org.example.mss39.e | grep . || echo none) $(closed39 127.0.0.1 18243 && echo closed || echo open)"
+check "A7 custom (KeepAlive=false): refused, the cause gone, 45 s with no restart" "1 1 none 0" \
+    "$(cnt39 '^REFUSE:' "$C39/r.log") $(runs39 org.example.mss39.r) $(jobpid org.example.mss39.r | grep . || echo none) $(argv39 r)"
+sudo launchctl bootout system/org.example.mss39.e 2>/dev/null; sudo launchctl bootout system/org.example.mss39.r 2>/dev/null
+
+wait "$A3BG"
+_t0=$(cat "$C39/a3.t0" 2>/dev/null); _d=$(cat "$C39/a3.defer" 2>/dev/null); _a=$(cat "$C39/a3.alias" 2>/dev/null); _e=$(cat "$C39/a3.exec" 2>/dev/null)
+check "A3 the job waited after its bootstrap: one WAIT for $LAN33, up to 120s" "1" \
+    "$([ "${_t0:-none}" = none ] && echo "no WAIT" || echo $(( $(cnt39 "$WX3" "$LOGB/mlx.log") - WE3 )))"
+check "A3 no engine before the address appeared" "" "$(cat "$C39/a3.early" 2>/dev/null)"
+check "A3 DEFER after the 120 s window (s), the address at 135 s, the exec 30 s after DEFER, within 180 s" "yes yes yes" \
+    "$([ "${_d:-0}" -ge 119 ] && [ "${_d:-0}" -le 130 ] && echo yes || echo "no(${_d:-})") $([ "${_a:-0}" -ge 135 ] && [ "${_a:-0}" -le 137 ] && echo yes || echo "no(${_a:-})") $([ "${_e:-999}" -ge $(( ${_d:-0} + 29 )) ] && [ "${_e:-999}" -le $(( ${_d:-0} + 36 )) ] && [ "${_e:-999}" -lt 180 ] && echo yes || echo "no(${_e:-})")"
+check "A3 one WAIT, one DEFER (retry_in=30s), one START, one engine exec" "1 1 1 1" \
+    "$(( $(cnt39 '^WAIT: ' "$LOGB/mlx.log") - W3 )) $(( $(cnt39 '^DEFER: lan_address_unavailable retry_in=30s$' "$LOGB/mlx.log") - D3 )) $(( $(cnt39 '^START: ' "$LOGB/mlx.log") - S3 )) $(( $(mlx_argv_lines) - N3 ))"
+_p3=$(cat "$C39/a3.pid0" 2>/dev/null); _r3=$(cat "$C39/a3.runs0" 2>/dev/null)
+check "A3 the engine has the PID launchd started; no respawn" "$_p3 $_p3 $_r3" \
+    "$(tail -n 1 /tmp/mss-stub-mlx-argv 2>/dev/null | cut -d' ' -f1) $(cat "$C39/a3.end" 2>/dev/null)"
+check "A3 the engine binds the conf host" "--host $LAN33" "$(tail -n 1 /tmp/mss-stub-mlx-argv | grep -o -- '--host [0-9.]*')"
+wait_open_on "$LAN33" 18234 && ok "A3 mlx serves on $LAN33:18234" || fail "A3 not serving: $(sudo tail -n 3 "$LOGB/mlx.log")"
+
+# A9 stock (KeepAlive=true): a killed engine is restarted, guarded, within 45 s.
+_t=$(date +%s); N9=$(mlx_argv_lines); P9=$(jobpid "$ML")
+sudo kill -KILL "$P9"
+P9N=$(wait_newpid "$ML" "$P9" 45); wait_open_on "$LAN33" 18234; _e9=$(( $(date +%s) - _t ))
+[ -n "$P9N" ] && open39 "$LAN33" 18234 && [ "$_e9" -le 45 ] \
+    && ok "A9 stock: a killed engine is restarted and serves within 45 s ($P9 -> $P9N, ${_e9}s)" \
+    || fail "A9 stock: no restart in 45 s (${_e9}s): $(sudo tail -n 3 "$LOGB/mlx.log")"
+check "A9 stock: one new exec, in the restarted job's PID" "$(( N9 + 1 )) ${P9N:-}" \
+    "$(mlx_argv_lines) $(tail -n 1 /tmp/mss-stub-mlx-argv | cut -d' ' -f1)"
+
+# A5: a guard trip, while serving and while waiting, for the stock job and
+# the custom one: the guard's own path writes the marker and boots the label
+# out; nothing starts when the address is there, and only mss-enable recovers.
+# t39 <row> <job> <wait|serve>: start <job> (stock or cm) in that state.
+t39() {
+    _tj=$2; _ts=$3
+    if [ "$_ts" = wait ]; then lan_unalias; else lan_alias; fi
+    if [ "$_tj" = stock ]; then _tl="$LOGB/mlx.log"; else _tl="$C39/cm.log"; fi
+    _tw=$(cnt39 '^WAIT: ' "$_tl"); _tn=$(cnt39 '^START: ' "$_tl")
+    gone39 "$ML" || sudo "$LIFE" stop mlx >/dev/null 2>&1
+    if [ "$_tj" = stock ]; then sudo "$LIFE" start mlx >/dev/null 2>&1; else sudo launchctl bootstrap system "$P39/cm.plist"; fi
+    if [ "$_ts" = wait ]; then until39 8 more39 '^WAIT: ' "$_tl" "$_tw" || fail "$1 $_tj: no WAIT"
+    else until39 8 more39 '^START: ' "$_tl" "$_tn" || fail "$1 $_tj: no START"; fi
+    T39P=$(jobpid "$ML"); T39C=$(pgrep -P "${T39P:-0}" sleep 2>/dev/null | head -n 1)
+    T39N=$(mlx_argv_lines); T39A=$(argv39 cm)
+}
+# after39 <row> <job> <state>: once stopped, the address back, two retry chances later.
+after39() {
+    until39 10 gone39 "$ML"
+    _gw=$(alive39 "$T39P") _gc=$(alive39 "$T39C")
+    lan_alias; sleep 5
+    check "$1 $2 ($3): label gone, process and its sleep gone, nothing started with the address back" \
+        "yes gone gone 0 0 closed closed" \
+        "$(gone39 "$ML" && echo yes || echo no) $_gw $_gc $(( $(mlx_argv_lines) - T39N )) $(( $(argv39 cm) - T39A )) $(closed39 "$LAN33" 18234 && echo closed || echo open) $(closed39 "$LAN33" 18245 && echo closed || echo open)"
+}
+for _j in stock cm; do
+    for _s in serve wait; do
+        _t=$(date +%s)
+        t39 A5 "$_j" "$_s"
+        sudo "$GUARD" --simulate-trip >/dev/null 2>&1
+        after39 A5 "$_j" "$_s"
+        check "A5 $_j ($_s): the marker names the label and the PID" "simulate-trip (operator drill); label=$ML pid=$T39P" \
+            "$(cat "$DBB/guard.tripped" 2>/dev/null)"
+        dur39 "A5$_j$_s" "$_t"
+        # No automatic recovery: loading the job again by hand refuses.
+        if [ "$_j" = stock ]; then _pp=$PL3; _tl="$LOGB/mlx.log"; else _pp="$P39/cm.plist"; _tl="$C39/cm.log"; fi
+        _rf=$(cnt39 '^REFUSE: guard tripped' "$_tl")
+        sudo launchctl bootstrap system "$_pp" 2>/dev/null
+        until39 5 more39 '^REFUSE: guard tripped' "$_tl" "$_rf"
+        check "A5 $_j ($_s): a hand bootstrap refuses; nothing serves" "1 0 0" \
+            "$(( $(cnt39 '^REFUSE: guard tripped' "$_tl") - _rf )) $(( $(mlx_argv_lines) - T39N )) $(( $(argv39 cm) - T39A ))"
+        sudo "$ENABLE" >/dev/null 2>&1
+        wait_open_on "$LAN33" 18234 && [ ! -e "$DBB/guard.tripped" ] && ok "A5 $_j ($_s): mss-enable clears the marker and the stock job serves" \
+            || fail "A5 $_j ($_s): no recovery: $(sudo tail -n 3 "$LOGB/mlx.log")"
+    done
+done
+
+# A6: the lifecycle stop (bootout), while serving and while waiting, for both
+# jobs: no retry of either kind, and no other backend starts.
+for _j in stock cm; do
+    for _s in serve wait; do
+        _t=$(date +%s)
+        t39 A6 "$_j" "$_s"
+        sudo "$LIFE" stop mlx >"$C39/a6-$_j-$_s.log" 2>&1
+        check "A6 $_j ($_s): the lifecycle stop exits 0" 0 $?
+        after39 A6 "$_j" "$_s"
+        ! loaded "$DL" && ! loaded "$LL" && ok "A6 $_j ($_s): no standby backend started" || fail "A6 $_j ($_s): $(daemons)"
+        dur39 "A6$_j$_s" "$_t"
+    done
+done
+# Stopped across boots: disabled and booted out, neither plist loads again.
+_t=$(date +%s); _n=$(mlx_argv_lines)
+sudo launchctl disable "system/$ML"
+for _pp in "$PL3" "$P39/cm.plist"; do
+    sudo launchctl bootstrap system "$_pp" >/dev/null 2>&1; _rc=$?
+    check "A6 disabled: bootstrapping $(basename "$_pp") fails; the label stays absent" "failed yes" \
+        "$([ "$_rc" -ne 0 ] && echo failed || echo loaded) $(gone39 "$ML" && echo yes || echo no)"
+done
+sleep 2
+check "A6 disabled: nothing started" 0 "$(( $(mlx_argv_lines) - _n + $(argv39 cm) - T39A ))"
+sudo launchctl enable "system/$ML"
+dur39 A6disabled "$_t"
+
+# Cleanup, then A10: the block's time, and each accelerated case's.
+for _l in "$ML" org.example.mss39.a org.example.mss39.b org.example.mss39.e org.example.mss39.r; do
+    sudo launchctl bootout "system/$_l" 2>/dev/null
+done
+sudo sh "$ROOT/scripts/uninstall.sh" --all >/dev/null 2>&1
+lan_unalias; unalias39 "$A39"; unalias39 "$B39"
+sudo rm -rf "$P39"; sudo rm -f /tmp/mss-stub-mlx-argv
+E39=$(( $(date +%s) - T39B ))
+[ "$E39" -le 480 ] && ok "A10 the #39 phase B block took ${E39}s (at most 480)" || fail "A10 the #39 phase B block took ${E39}s (more than 480)"
+check "A10 each accelerated case took at most 15 s" "" \
+    "$(for _dd in $DUR39; do [ "${_dd#*=}" -le 15 ] || printf '%s ' "$_dd"; done)"
+echo "note - #39 case times:$DUR39"
 
 echo "== phase B: #27 B1 GPU boot job, B2 Colima boot job (real launchd) =="
 # These rows run against the real launchd and the real kernel key. A row that
