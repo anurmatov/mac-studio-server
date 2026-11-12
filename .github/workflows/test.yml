@@ -9,7 +9,7 @@ on:
 jobs:
   tests:
     # macOS arm64: BSD userland, launchd, pfctl and plutil are all real here.
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -134,7 +134,7 @@ jobs:
           sudo sh -c 'tail -n 50 /var/log/mac-studio-server/*.log /var/log/mac-studio-server/mlx.log /var/log/mac-studio-server/guard.jsonl' || true
 
   real-llama-server:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -368,7 +368,7 @@ jobs:
 
   bootstrap:
     # The one-liner on clean runners (B1b-B4), through the real raw URL of this commit.
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 45
     env:
       REF: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -465,7 +465,7 @@ jobs:
   release-bootstrap:
     # B6: on a v* tag, the README one-liner verbatim, after checking the tag ruleset exists.
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
