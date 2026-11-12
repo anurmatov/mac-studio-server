@@ -300,6 +300,41 @@ as the service user, as
 with its output in `/var/log/mac-studio-server/mlx.log`. `MSS_DEFER_MODEL` does
 not apply to mlx. `mlx.distributed` is out of scope.
 
+**A late LAN address (#39).** At boot the network can configure `MLX_HOST`
+after launchd starts mlx. The wrapper runs its other checks, then waits: one
+`WAIT:` line and a probe a second for up to 120 s. Once the address is there
+it runs itself again in the same process (same PID for launchd and the guard),
+so every check is fresh before `mlx-serve` starts. Still missing after 120 s:
+one `DEFER: lan_address_unavailable retry_in=30s` line, a 30 s pause, then the
+same re-run, as long as the job stays loaded. Nothing starts and nothing
+listens while it waits. An interface query that fails or prints nothing
+refuses (exit 78) instead. Every other refusal is unchanged, and so is the
+stock job's launchd policy: `KeepAlive` still restarts a crashed `mlx-serve`
+and retries a refusal every 30 s. `scripts/backend.sh stop mlx` (a bootout)
+ends a wait at once and nothing retries; it lasts until `start` or the next
+boot. To keep it stopped across boots, also
+`sudo launchctl disable system/com.mac-studio-server.mlx`.
+
+**A custom wrapper (opt-in).** A hand-made job with its own wrapper, engine,
+arguments and `KeepAlive` can use the same wait. In the wrapper's own shell,
+after its checks and before it builds the engine's argv:
+`mss_lan_ready_or_reexec "$HOST" "$0" "$@" || { echo "REFUSE: $MSS_LAN_REASON"; exit 78; }`,
+having sourced `/usr/local/libexec/mac-studio-server/mss-common.sh`. Its
+`ProgramArguments[0]` must be the wrapper's absolute, executable path, and
+every safety check must sit before the call, because each re-run repeats them.
+Wrappers that cannot meet this stay as they are. Nothing else changes: its
+plist, engine, model, config, arguments and `KeepAlive` stay its own, and a
+`KeepAlive=false` job still stays stopped after a refusal or an engine exit.
+The installer never replaces a custom job: it refuses a changed plist. To
+apply it, one Mac at a time: back up the helper, the wrapper and the plist
+with owner and mode; check each file still matches the backup; edit;
+`sh -n` and `plutil -lint`; then a separately approved restart, and read back
+the loaded `KeepAlive`, the entrypoint, the PID and argv. A script-only
+update does not restart a running job. To roll back: `launchctl bootout`,
+wait for the label to go, restore the whole backed-up set, then bootstrap.
+Never clear a guard trip marker to do this. Reading the source proves nothing
+about a reboot: only a reboot window shows it.
+
 **The MLX model chooser (1.7.2).** After the binary, the picker offers: the
 saved directory (`keep`, the default while it is still usable); a small pinned
 starter, `qwen3.5-0.8b-4bit` (652 MB, 10 files: it checks the install, it is not
@@ -416,9 +451,11 @@ Placeholders: `<checkout>`, `<user>`, `<mlx-serve>`, `<model-dir>`, `<prior vars
 - **R7 After a `REFUSE:` line in `/var/log/mac-studio-server/mlx.log`.**
   `pf (no boot marker …)`: `sudo /usr/local/libexec/mac-studio-server/mss-boot.sh`
   names the pf problem; fix it and re-run the install. `providers file
-  present`: remove that file or go back to loopback (R6). `address <ip> is not
-  on any interface`: the network did not configure `MLX_HOST` within 120 s
-  (a `WAIT:` line comes first); fix the network or the address. launchd retries.
+  present`: remove that file or go back to loopback (R6). `cannot read the
+  interface addresses`: `/sbin/ifconfig` failed or printed nothing; launchd
+  retries. A missing address is not a refusal (#39): `WAIT:` and
+  `DEFER: lan_address_unavailable` lines repeat until the network configures
+  `MLX_HOST`; fix the network or the address, and mlx starts by itself.
 - **R8 Back to 1.7.0.** `--configure` with LAN no; delete the `MLX_HOST` and
   `MLX_ALLOW_FROM` lines from `backends.env` (1.7.0 refuses them); run the
   1.7.0 installer; `sudo pfctl -a com.apple/250.mac-studio-server -sr` shows no
@@ -452,6 +489,8 @@ Placeholders: `<checkout>`, `<user>`, `<mlx-serve>`, `<model-dir>`, `<prior vars
   allowed clients by guessable ids. Binding an address advertises nothing:
   Bonjour is `--lan-share` only, which stays refused.
 - **R-2** KeepAlive retries a crashing or refusing server every 30 s (existing).
+  A missing LAN address is waited for inside the wrapper instead (#39), with no
+  attempt limit while the job stays loaded.
 - **R-3** The mlx manifest misses an in-place write that keeps a file's size,
   inode and mtime.
 - **R-4** Model-server detection is by process name (`pgrep -x`, 15
