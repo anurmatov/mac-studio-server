@@ -2127,9 +2127,8 @@ for f in README.md docs/backends.md bootstrap.sh; do
             '{ n++; if ($0 != t) bad = 1 } END { print (n && !bad) ? "ok" : "missing or other tag" }')"
 done
 check "CHANGELOG has a dated section for $RVER" 1 "$(grep -c "^## \[$RVER\] - [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\$" "$ROOT/CHANGELOG.md")"
-# Unreleased fixes may sit under [Unreleased] between releases (#39).
-check "CHANGELOG [Unreleased] comes first, then $RVER" "## [Unreleased]|## [$RVER]" \
-    "$(grep -m 1 '^## \[' "$ROOT/CHANGELOG.md")|$(grep '^## \[' "$ROOT/CHANGELOG.md" | sed -n 2p | sed 's/ - .*//')"
+check "CHANGELOG [Unreleased] comes first and is empty" "## [Unreleased]|## [$RVER]" \
+    "$(grep -m 1 '^## \[' "$ROOT/CHANGELOG.md")|$(grep -v '^[[:space:]]*$' "$ROOT/CHANGELOG.md" | grep -A1 -m 1 '^## \[Unreleased\]$' | tail -n 1 | sed 's/ - .*//')"
 S3=$(awk '/^## One-line install/{f=1} /^## Status/{f=0} f' "$ROOT/docs/backends.md" | wc -l)
 [ "$S3" -le 30 ] && ok "docs/backends.md new section ≤ 30 lines ($S3) (S3)" || fail "docs/backends.md section is $S3 lines"
 grep -q "configure-only.*may leave a verification stamp" "$ROOT/docs/backends.md" && ok "backends.md --configure-only wording (S3)" || fail "S3 wording"

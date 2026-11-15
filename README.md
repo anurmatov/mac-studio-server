@@ -7,7 +7,7 @@ a memory guard, and firewalled LAN access.
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/anurmatov/mac-studio-server/v1.7.2/bootstrap.sh | sh
+curl -fsSL https://raw.githubusercontent.com/anurmatov/mac-studio-server/v1.7.3/bootstrap.sh | sh
 ```
 
 Or clone it yourself: `git clone https://github.com/anurmatov/mac-studio-server.git && cd mac-studio-server && ./scripts/install.sh`.
@@ -66,12 +66,12 @@ Ollama listens on all interfaces (0.0.0.0) by default and has no password; set O
 
 ## Updates
 
-- **1.7.0-1.7.2** MLX-Serve (LAN access in 1.7.1, a model chooser in 1.7.2), several backends at once, `backend.sh`.
+- **1.7.0-1.7.3** MLX-Serve (LAN access in 1.7.1, a model chooser in 1.7.2, a late LAN address retried in 1.7.3), several backends at once, `backend.sh`.
 - **1.6.0** GPU memory, Docker and restart-after-power-failure choices in the installer.
 - **1.5.0** One-line install, guided downloads and builds, and `model.sh`.
 - **1.3.0, 1.4.0** Optional llama.cpp and DwarfStar backends; the interactive picker and saved answers.
 
-Current version: 1.7.2 (semver). History: [CHANGELOG.md](CHANGELOG.md).
+Current version: 1.7.3 (semver). History: [CHANGELOG.md](CHANGELOG.md).
 
 ## Contributing
 

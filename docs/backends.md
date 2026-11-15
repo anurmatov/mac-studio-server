@@ -1,8 +1,9 @@
 # Inference Backends
 
 Reference for the optional inference backends added in 1.3.0, for 1.7.0's
-MLX-Serve backend and standby backends, for 1.7.1's MLX LAN access, and for
-1.7.2's MLX model chooser and Ollama embedding worker. The README has the short version;
+MLX-Serve backend and standby backends, for 1.7.1's MLX LAN access, for
+1.7.2's MLX model chooser and Ollama embedding worker, and for 1.7.3's wait
+for a late MLX LAN address. The README has the short version;
 `config/backends.env.example` lists every variable.
 
 Ollama stays the zero-config default: with `MSS_BACKENDS` unset or `ollama`,
@@ -148,7 +149,7 @@ saved file never removes a backend, and an installed backend missing from
 ## One-line install, model.sh and acquisition variables (1.5.0)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/anurmatov/mac-studio-server/v1.7.2/bootstrap.sh | sh
+curl -fsSL https://raw.githubusercontent.com/anurmatov/mac-studio-server/v1.7.3/bootstrap.sh | sh
 ./scripts/model.sh                                        # menu: starter, more, own file/URL
 ./scripts/model.sh --catalog qwen3-4b                     # or --path FILE --sha256 HEX
 ./scripts/model.sh --url https://… --sha256 HEX [--dest FILE]
@@ -300,7 +301,7 @@ as the service user, as
 with its output in `/var/log/mac-studio-server/mlx.log`. `MSS_DEFER_MODEL` does
 not apply to mlx. `mlx.distributed` is out of scope.
 
-**A late LAN address (#39).** At boot the network can configure `MLX_HOST`
+**A late LAN address (1.7.3).** At boot the network can configure `MLX_HOST`
 after launchd starts mlx. The wrapper runs its other checks, then waits: one
 `WAIT:` line and a probe a second for up to 120 s. Once the address is there
 it runs itself again in the same process (same PID for launchd and the guard),
@@ -542,6 +543,10 @@ Placeholders: `<checkout>`, `<user>`, `<mlx-serve>`, `<model-dir>`, `<prior vars
   the same answers works, but 1.7.1 again refuses beside Ollama's embedding
   worker. Downloaded models stay; `rm -rf ~/.mlx-serve/models/.mss-staging`
   removes an unfinished download.
+- **From 1.7.2 to 1.7.3:** no new saved key; a plain re-install copies the new
+  mlx wrapper and helper and restarts nothing, so a running mlx uses them from
+  its next start. Going back to 1.7.2 with the same answers works, but 1.7.2
+  again refuses (exit 78) an address still missing after 120 s.
 - **`OLLAMA_GPU_PERCENT` and `DOCKER_AUTOSTART` (1.5.0 names):** deprecated but
   still read; the installer migrates them and prints a notice. See
   `docs/options.md`.
