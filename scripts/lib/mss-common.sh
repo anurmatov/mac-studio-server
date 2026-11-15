@@ -184,12 +184,15 @@ mss_validate_host() {
 #   0  HOST is loopback or on an interface now: go on to the exec.
 #   1  refuse, with the reason in MSS_LAN_REASON: an interface query that
 #      failed or printed nothing, a bad hook, an ENTRYPOINT that is not an
-#      absolute executable, a failed sleep.
+#      absolute executable, a failed sleep, a clock that cannot be read.
 # Otherwise it does not return. One WAIT: line, then a probe a second for up to
 # MSS_HOST_WAIT seconds (default 120): once HOST appears it execs ENTRYPOINT, so
-# every check runs again in the same PID before the engine starts. Still absent
-# after the window: one DEFER: line, MSS_LAN_RETRY_PAUSE seconds (default 30,
-# 1..300), then the same exec, as often as it takes. No state is kept between
+# every check runs again in the same PID before the engine starts. The window
+# ends on the clock, because each probe takes time too (on a busy Mac 120 of
+# them took 134 s), and after MSS_HOST_WAIT probes at the latest, should the
+# clock be set back meanwhile. Still absent after the window: one DEFER: line,
+# MSS_LAN_RETRY_PAUSE seconds (default 30, 1..300), then the same exec, as
+# often as it takes. No state is kept between
 # attempts and the job's launchd policy is not touched. TERM, INT or HUP ends
 # the invocation, its sleep too. Both hooks are for tests: launchd starts the
 # job with no environment.
@@ -215,6 +218,9 @@ mss_lan_ready_or_reexec() {
         *) MSS_LAN_REASON=$_lr_probe_failed; return 1 ;;
     esac
     echo "WAIT: $_lr_host is not on any interface yet (up to ${_lr_wait}s)"
+    _lr_no_clock="cannot read the clock while waiting for $_lr_host"
+    _lr_end=$(_mss_lr_clock) || { MSS_LAN_REASON=$_lr_no_clock; return 1; }
+    _lr_end=$((_lr_end + _lr_wait))
     _lr_child=""
     trap '_mss_lr_stop 143' TERM
     trap '_mss_lr_stop 130' INT
@@ -229,10 +235,18 @@ mss_lan_ready_or_reexec() {
             1) ;;
             *) _mss_lr_untrap; MSS_LAN_REASON=$_lr_probe_failed; return 1 ;;
         esac
+        _lr_now=$(_mss_lr_clock) || { _mss_lr_untrap; MSS_LAN_REASON=$_lr_no_clock; return 1; }
+        [ "$_lr_now" -lt "$_lr_end" ] || break
     done
     echo "DEFER: lan_address_unavailable retry_in=${_lr_pause}s"
     _mss_lr_sleep "$_lr_pause" || { _mss_lr_untrap; MSS_LAN_REASON="sleep failed while waiting for $_lr_host"; return 1; }
     exec "$_lr_entry" "$@"
+}
+# The clock in whole seconds; nonzero if date fails or prints anything else.
+_mss_lr_clock() {
+    _lr_t=$(date +%s 2>/dev/null) || return 1
+    case $_lr_t in ''|*[!0-9]*) return 1 ;; esac
+    echo "$_lr_t"
 }
 # The sleep runs as a child so that a stop can end it with the invocation.
 _mss_lr_sleep() {

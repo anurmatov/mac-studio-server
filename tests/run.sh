@@ -3445,8 +3445,8 @@ grep -q '^  health  *no response on /health$' "$AC5/down.out" && ok "AC5 names t
 echo "== phase A: #39 LAN readiness retry (A2, A6, A7) =="
 # The rendered wrapper and helper (install-backends.sh --render-only) on a
 # virtual clock: the sleep stub advances $T39/clock by the wrapper's own waits
-# (1, 2 and the retry pause) at once and logs them, and the ifconfig stub
-# answers by that clock. Every other sleep is real.
+# (1, 2 and the retry pause) at once and logs them, the ifconfig stub answers
+# by that clock, and date +%s reads it. Every other sleep and date is real.
 T39=$TMP/i39; mkdir -p "$T39/vbin" "$T39/bin" "$T39/home" "$T39/w" "$T39/unmanaged" "$T39/model"
 if render mlx "$T39/r" MLX_HOST=192.0.2.10 MLX_ALLOW_FROM=192.0.2.0/24 MSS_IFCONFIG="$LANIF33" >"$T39/r.out" 2>&1; then
     check "A2 the rendered wrapper and helper are the checkout's, executable" "same same yes" \
@@ -3470,11 +3470,25 @@ if [ -n "\${T39_ON:-}" ] && [ "\$(cat '$T39/clock')" -ge "\$T39_ON_AT" ] && [ ! 
 fi
 [ ! -e '$T39/sleep-fails' ]
 STUB
+# T39_DATE=stuck: date +%s stays at 0; =fail: it exits 1, from T39_DATE_AT on.
+REAL_DATE=$(command -v date)
+cat > "$T39/vbin/date" <<STUB
+#!/bin/sh
+[ "\$*" = +%s ] || exec '$REAL_DATE' "\$@"
+_v=\$(cat '$T39/clock')
+case \${T39_DATE:-} in
+    stuck) echo 0 ;;
+    fail) [ "\$_v" -ge "\${T39_DATE_AT:-0}" ] && exit 1; echo "\$_v" ;;
+    *) echo "\$_v" ;;
+esac
+STUB
 # T39_APPEAR: 192.0.2.10 is local from that virtual second on (unset: never).
 # T39_IF=fail|empty: the query exits 1 or prints nothing, from T39_IF_AT on.
+# T39_PROBE: each query takes that many virtual seconds.
 cat > "$T39/bin/ifconfig" <<STUB
 #!/bin/sh
 _v=\$(cat '$T39/clock')
+[ -z "\${T39_PROBE:-}" ] || echo \$(( _v + T39_PROBE )) > '$T39/clock'
 if [ -n "\${T39_IF:-}" ] && [ "\$_v" -ge "\${T39_IF_AT:-0}" ]; then
     case \$T39_IF in fail) exit 1 ;; empty) exit 0 ;; esac
 fi
@@ -3520,7 +3534,7 @@ case \$1:\$2 in
     *) exit 2 ;;
 esac
 STUB
-chmod +x "$T39/vbin/sleep" "$T39/bin/ifconfig" "$T39/bin/sysctl" "$T39/mlx-serve" "$T39/cause.sh"
+chmod +x "$T39/vbin/sleep" "$T39/vbin/date" "$T39/bin/ifconfig" "$T39/bin/sysctl" "$T39/mlx-serve" "$T39/cause.sh"
 # w39 <name> <host|-> [env...]: the rendered wrapper from virtual second 0, with
 # T39_PRE's cause applied first, or T39_ON's once the clock reaches T39_ON_AT;
 # prints "<rc> <pid>". Output in $T39/<name>.out,
@@ -3594,6 +3608,26 @@ check "A2 late: exits 0 with one engine exec, at virtual 460 s, in the wrapper's
 # Every attempt read this boot's session id again; none read kern.boottime.
 check "A2 late: each of the five runs checked the boot session id, never kern.boottime" "yes 0" \
     "$([ "$(grep -c 'kern.bootsessionuuid' "$SYSLOG33")" -ge 5 ] && echo yes || echo no) $(grep -c 'kern.boottime' "$SYSLOG33")"
+
+# A2: the window is 120 s of the clock, not 120 probes. Each query takes a
+# second here, so the window ends after 60 probes, at virtual 121 (the first
+# query took one too); the address appears in the pause, and the run after it
+# starts at once, as in A3. Counted in probes, the window would last 240 s.
+RP=$(T39_PROBE=1 T39_APPEAR=140 w39 slow 192.0.2.10)
+check "A2 slow probes: the window ends on the clock (60 probes, 120 s), then exactly 30 s" "1x60 30" "$(s39 slow)"
+check "A2 slow probes: WAIT, DEFER, START; one engine exec, at virtual 152, in the wrapper's PID" "W D S 0 1 ${RP#* } 152" \
+    "$(cut -c1 "$T39/slow.out" | tr '\n' ' ' | sed 's/ $//') ${RP%% *} $(a39 slow) $(cut -d' ' -f1,2 "$T39/slow.argv" 2>/dev/null)"
+# A clock set back meanwhile (here: one that stands still) cannot stretch the
+# window past 120 probes.
+RP=$(T39_DATE=stuck T39_APPEAR=140 w39 stuck 192.0.2.10)
+check "A2 a clock that does not move: still 120 probes, then 30 s, then one engine exec" "1x120 30|W D S 0 1 150" \
+    "$(s39 stuck)|$(cut -c1 "$T39/stuck.out" | tr '\n' ' ' | sed 's/ $//') ${RP%% *} $(a39 stuck) $(cut -d' ' -f2 "$T39/stuck.argv" 2>/dev/null)"
+# A clock that cannot be read refuses, at the window's start or inside it.
+QC="REFUSE: cannot read the clock while waiting for 192.0.2.10"
+check "A2 a clock that cannot be read at the window's start refuses" "78 $W39 (up to 120s)|$QC| 0" \
+    "$(T39_DATE=fail w39 cf 192.0.2.10 | cut -d' ' -f1) $(l39 cf)|$(s39 cf) $(a39 cf)"
+check "A2 a clock that cannot be read inside the window refuses there" "78 $W39 (up to 120s)|$QC|1x5 0" \
+    "$(T39_DATE=fail T39_DATE_AT=5 w39 cw 192.0.2.10 | cut -d' ' -f1) $(l39 cw)|$(s39 cw) $(a39 cw)"
 
 # A2: a failed or empty interface query refuses: at the start, inside a window,
 # and on the run after a pause. Nothing is retried and nothing starts.
