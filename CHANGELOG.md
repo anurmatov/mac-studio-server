@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.7.3] - 2026-11-15
+
+### Fixed
+- A LAN-bound mlx waits for a late address and starts when it appears; restart policy unchanged
+
 ## [1.7.2] - 2026-10-03
 
 ### Added
